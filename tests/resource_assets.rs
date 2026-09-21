@@ -119,14 +119,21 @@ fn every_declared_icon_source_has_exact_dimensions_and_alpha() {
                 .unwrap_or_else(|error| panic!("invalid PNG {}: {error}", source.path.display()));
             assert_eq!((image.width(), image.height()), (source.size, source.size));
             assert!(
-                image.rgba_data().chunks_exact(4).any(|pixel| pixel[3] != 0),
+                image
+                    .rgba_data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] != 0),
                 "{} has no visible pixels",
                 source.path.display()
             );
             assert!(
                 image
                     .rgba_data()
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|pixel| pixel[3] != u8::MAX),
                 "{} has no transparent pixels",
                 source.path.display()

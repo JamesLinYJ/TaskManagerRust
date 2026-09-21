@@ -8,26 +8,18 @@
 //   作者:       OpenAI Codex
 // --------------------------------------------------------------------------
 
-//! Contains privilege, elevation, and process-machine checks with explicit Win32 failures.
+//! Contains privilege and elevation checks with explicit Win32 failures.
 
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{
-    ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_NOT_ALL_ASSIGNED,
-    GetLastError, HANDLE, SetLastError,
-};
+use windows_sys::Win32::Foundation::{ERROR_NOT_ALL_ASSIGNED, GetLastError, SetLastError};
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
     SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION,
     TOKEN_PRIVILEGES, TOKEN_QUERY, TokenElevation,
 };
-use windows_sys::Win32::System::SystemInformation::{
-    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM, IMAGE_FILE_MACHINE_ARM64,
-    IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_IA64,
-    IMAGE_FILE_MACHINE_THUMB, IMAGE_FILE_MACHINE_UNKNOWN,
-};
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::handles::OwnedHandle;
 
@@ -109,89 +101,5 @@ pub fn process_is_elevated() -> Result<bool, u32> {
         }
 
         Ok(elevation.TokenIsElevated != 0)
-    }
-}
-pub fn process_needs_32_bit_suffix_handle(handle: HANDLE) -> Result<bool, u32> {
-    if handle.is_null() {
-        return Err(ERROR_INVALID_HANDLE);
-    }
-
-    let mut process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
-    let mut native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
-    // 安全性: `handle` is checked non-null and both machine values are valid out parameters.
-    if unsafe { IsWow64Process2(handle, &mut process_machine, &mut native_machine) } == 0 {
-        let error = unsafe { GetLastError() };
-        Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
-    } else {
-        process_machine_needs_32_bit_suffix(process_machine, native_machine)
-            .ok_or(ERROR_INVALID_DATA)
-    }
-}
-
-fn process_machine_needs_32_bit_suffix(process_machine: u16, native_machine: u16) -> Option<bool> {
-    let effective_machine = if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
-        native_machine
-    } else {
-        process_machine
-    };
-    let process_is_32_bit = match effective_machine {
-        IMAGE_FILE_MACHINE_I386
-        | IMAGE_FILE_MACHINE_ARM
-        | IMAGE_FILE_MACHINE_ARMNT
-        | IMAGE_FILE_MACHINE_THUMB => true,
-        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 | IMAGE_FILE_MACHINE_IA64 => false,
-        _ => return None,
-    };
-    let native_is_64_bit = match native_machine {
-        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 | IMAGE_FILE_MACHINE_IA64 => true,
-        IMAGE_FILE_MACHINE_I386
-        | IMAGE_FILE_MACHINE_ARM
-        | IMAGE_FILE_MACHINE_ARMNT
-        | IMAGE_FILE_MACHINE_THUMB => false,
-        _ => return None,
-    };
-    Some(process_is_32_bit && native_is_64_bit)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::process_machine_needs_32_bit_suffix;
-    use windows_sys::Win32::System::SystemInformation::{
-        IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARMNT,
-        IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN,
-    };
-
-    #[test]
-    fn suffix_is_only_needed_for_a_32_bit_process_on_a_64_bit_machine() {
-        assert_eq!(
-            process_machine_needs_32_bit_suffix(IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64),
-            Some(true)
-        );
-        assert_eq!(
-            process_machine_needs_32_bit_suffix(IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64),
-            Some(false)
-        );
-        assert_eq!(
-            process_machine_needs_32_bit_suffix(
-                IMAGE_FILE_MACHINE_UNKNOWN,
-                IMAGE_FILE_MACHINE_ARM64
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            process_machine_needs_32_bit_suffix(IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_ARM64),
-            Some(true)
-        );
-        assert_eq!(
-            process_machine_needs_32_bit_suffix(
-                IMAGE_FILE_MACHINE_UNKNOWN,
-                IMAGE_FILE_MACHINE_I386
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            process_machine_needs_32_bit_suffix(0xffff, IMAGE_FILE_MACHINE_ARM64),
-            None
-        );
     }
 }

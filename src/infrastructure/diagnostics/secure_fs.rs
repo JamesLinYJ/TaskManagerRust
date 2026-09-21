@@ -619,7 +619,9 @@ fn parse_directory_entries(
 
         let name_end = fixed + name_bytes;
         let name_units = remaining[fixed..name_end]
-            .chunks_exact(size_of::<u16>())
+            .as_chunks::<{ size_of::<u16>() }>()
+            .0
+            .iter()
             .map(|bytes| u16::from_ne_bytes([bytes[0], bytes[1]]))
             .collect::<Vec<_>>();
         let name = OsString::from_wide(&name_units);

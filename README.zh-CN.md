@@ -37,7 +37,9 @@
 
 GPU 页面依赖系统和显卡驱动公开的 `GPU Engine` 与 `GPU Adapter Memory` 性能计数器。计数器不存在或驱动没有返回数据时，页面会说明具体状态，不会把查询失败画成 0%。
 
-ARM64 版本已经通过交叉编译、全目标检查和 PE 架构检查，但目前没有在 ARM64 实机上跑过。
+2026-09-21 已在 Windows ARM64 虚拟机（Insider 构建 29671.1000）构建并运行 ARM64、
+x86-64 和 x86 版本。具体验证范围见[兼容性矩阵](docs/compatibility-matrix.md)；
+这不代表稳定版 Windows 或所有 ARM64 设备均已验证。
 
 ## 从源码编译
 
@@ -55,8 +57,10 @@ cargo build --release --target i686-pc-windows-msvc
 # 也可以运行：.\scripts\release-clean.ps1 -Target i686-pc-windows-msvc
 ```
 
-x86 构建仍会同时查询进程机器类型和系统原生机器类型：在 64 位 Windows 的 WOW64 下
-继续标注“(32位)”，只有在原生 32 位 Windows 上才省略该后缀。
+两个页面共用主程序架构标识：ARM64 上的 x86 / x86-64 程序分别标注“（x86 仿真）”和
+“（x86-64 仿真）”，ARM64EC 主程序标注“（ARM64EC）”，原生 ARM64 保持原名。
+普通 32 位兼容程序保留“(32位)”后缀；无法可靠查询时保留原名并报告行级错误。
+详见[架构判定与验证](docs/process-architecture.md)。
 
 需要路径重映射的发布构建时运行：
 

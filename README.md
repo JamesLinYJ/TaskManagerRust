@@ -37,7 +37,9 @@ without treating a cross-build or an unrecorded development machine as hardware 
 
 The GPU page needs the `GPU Engine` and `GPU Adapter Memory` performance counters exposed by Windows and the display driver. When those counters are missing, the page reports that state instead of drawing a flat 0% graph.
 
-The ARM64 release passes cross-compilation, all-target checks, and PE architecture checks. It has not yet been run on ARM64 hardware.
+ARM64, x86-64 and x86 release builds were compiled and exercised on a Windows ARM64 virtual
+machine (Insider build 29671.1000) on 2026-09-21. See the [compatibility matrix](docs/compatibility-matrix.md)
+for the exact test scope; this is not blanket verification of stable Windows or all ARM64 devices.
 
 ## Building
 
@@ -55,8 +57,10 @@ cargo build --release --target i686-pc-windows-msvc
 # Or use: .\scripts\release-clean.ps1 -Target i686-pc-windows-msvc
 ```
 
-The x86 build still queries both the process and native machine types. It keeps the `(32-bit)`
-suffix when running under WOW64 on 64-bit Windows, and omits it only on native 32-bit Windows.
+Both pages label the main executable consistently: on ARM64, x86 and x86-64 processes receive
+`(x86 emulated)` and `(x86-64 emulated)` suffixes; ARM64EC receives `(ARM64EC)`, and native
+ARM64 keeps its name. Ordinary 32-bit compatibility processes retain `(32-bit)`. Failed queries
+keep the original name and report a row error. See [architecture detection and validation](docs/process-architecture.md).
 
 For a release build with local paths remapped:
 

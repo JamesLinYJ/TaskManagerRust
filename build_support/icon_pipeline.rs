@@ -81,7 +81,7 @@ pub(crate) fn generate_icon(out_dir: &Path, spec: &IconSpec) -> Result<PathBuf, 
 
         let mut has_visible_pixel = false;
         let mut has_transparent_pixel = false;
-        for pixel in image.rgba_data().chunks_exact(4) {
+        for pixel in image.rgba_data().as_chunks::<4>().0 {
             has_visible_pixel |= pixel[3] != 0;
             has_transparent_pixel |= pixel[3] != u8::MAX;
         }

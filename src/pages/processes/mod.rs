@@ -1358,10 +1358,10 @@ mod tests {
         prepare_process_tree_termination, terminate_prepared_process_tree,
         validate_snapshot_root_identity,
     };
-    use super::model::{DirtyColumns, ProcEntry};
+    use super::model::{DirtyColumns, ProcEntry, update_process_entry};
     use super::sampler::{
-        WtsProcessIdentity, cpu_percent_from_delta, merge_wts_process_identity, signed_kb_delta,
-        system_time_delta, wts_identity_matches,
+        ProcWorkerRequest, ProcWorkerState, WtsProcessIdentity, cpu_percent_from_delta,
+        merge_wts_process_identity, signed_kb_delta, system_time_delta, wts_identity_matches,
     };
     use super::{
         ProcIdentity, ProcessPageState, SelectionScrollPolicy, refresh_selection_scroll_policy,
@@ -1410,7 +1410,7 @@ mod tests {
             pid: 1234,
             image_name: image_name.to_string(),
             image_name_lower: image_name.to_lowercase(),
-            show_32_bit_suffix: None,
+            architecture: None,
             user_name: String::new(),
             user_name_lower: String::new(),
             session_id: None,
@@ -1430,6 +1430,127 @@ mod tests {
             display_text: std::array::from_fn(|_| String::new()),
             pass_count: 0,
             dirty_columns: DirtyColumns::default(),
+        }
+    }
+
+    #[test]
+    fn architecture_updates_only_the_display_name_and_its_dirty_column() {
+        use crate::infrastructure::native::{ExecutionMode, ProcessArchitecture};
+        let mut entry = empty_process_entry("Editor.exe");
+        let mut next = entry.clone();
+        next.architecture = Some(ProcessArchitecture {
+            process_machine: 0x8664,
+            native_machine: 0xaa64,
+            mode: ExecutionMode::EmulatedX64,
+        });
+        let changed = update_process_entry(
+            &mut entry,
+            &next,
+            2,
+            DirtyColumns::from_column(ColumnId::ImageName),
+        );
+        assert!(changed.contains(ColumnId::ImageName));
+        assert_eq!(entry.image_name, "Editor.exe");
+        assert_eq!(entry.image_name_lower, "editor.exe");
+        assert!(entry.display_text[ColumnId::ImageName as usize].contains("x86-64"));
+        assert!(
+            !update_process_entry(
+                &mut entry,
+                &next,
+                3,
+                DirtyColumns::from_column(ColumnId::ImageName)
+            )
+            .any()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Windows ARM64 and TASKMGR_ARCH_FIXTURES containing the four prebuilt GUI fixtures"]
+    fn live_architecture_fixtures_use_the_real_process_sampler() {
+        use crate::infrastructure::native::{ExecutionMode, query_process_architecture_handle};
+        use crate::system::process_identity::query_process_architecture;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, WaitForInputIdle};
+        // SAFETY: this pseudo handle is borrowed for the current process lifetime.
+        let observer = query_process_architecture_handle(unsafe { GetCurrentProcess() }).unwrap();
+        assert_eq!(
+            observer.native_machine, 0xaa64,
+            "this acceptance test requires an ARM64 host"
+        );
+        let directory =
+            PathBuf::from(env::var_os("TASKMGR_ARCH_FIXTURES").expect("fixture directory"));
+        struct Fixture(Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let fixtures: Vec<_> = [
+            ("arm64", ExecutionMode::Native),
+            ("x86", ExecutionMode::EmulatedX86),
+            ("x64", ExecutionMode::EmulatedX64),
+            ("arm64ec", ExecutionMode::Arm64Ec),
+        ]
+        .into_iter()
+        .map(|(name, mode)| {
+            let child = Fixture(
+                Command::new(directory.join(format!("fixture-{name}.exe")))
+                    .spawn()
+                    .unwrap(),
+            );
+            // SAFETY: the child owns a live process handle. Waiting for its GUI input queue
+            // establishes readiness without a timing-based sleep or a production test hook.
+            assert_eq!(
+                unsafe { WaitForInputIdle(child.0.as_raw_handle().cast(), 10_000) },
+                0
+            );
+            let identity = query_process_identity_for_pid(child.0.id()).unwrap();
+            assert_eq!(
+                query_process_architecture(identity).unwrap().mode,
+                mode,
+                "{name}"
+            );
+            assert!(
+                query_process_architecture(ProcIdentity::new(
+                    identity.pid,
+                    identity.creation_time_100ns + 1
+                ))
+                .is_err()
+            );
+            (child, identity, mode)
+        })
+        .collect();
+        let mut worker = ProcWorkerState::default();
+        for pass in 0..2 {
+            let snapshot = worker
+                .collect(ProcWorkerRequest { processor_count: 1 })
+                .unwrap();
+            for (_, identity, mode) in &fixtures {
+                let entry = snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.identity == *identity)
+                    .expect("fixture in process snapshot");
+                assert_eq!(entry.architecture.unwrap().mode, *mode);
+                println!(
+                    "observer={:?} pass={pass} pid={} name={} architecture={:?}",
+                    observer.mode, identity.pid, entry.image_name, entry.architecture
+                );
+            }
+        }
+        let identities: Vec<_> = fixtures.iter().map(|(_, identity, _)| *identity).collect();
+        drop(fixtures);
+        let snapshot = worker
+            .collect(ProcWorkerRequest { processor_count: 1 })
+            .unwrap();
+        for identity in identities {
+            assert!(
+                snapshot
+                    .entries
+                    .iter()
+                    .all(|entry| entry.identity != identity)
+            );
+            assert!(query_process_architecture(identity).is_err());
         }
     }
 

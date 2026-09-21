@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::ProcessStrings;
 use crate::config::options::ColumnId;
-use crate::infrastructure::native::append_32_bit_suffix;
+use crate::infrastructure::native::{ProcessArchitecture, append_architecture_suffix};
 use crate::system::process_identity::ProcIdentity;
 use crate::ui::resource_ids::NUM_COLUMN;
 
@@ -62,7 +62,7 @@ pub struct ProcEntry {
     pub(super) pid: u32,
     pub(super) image_name: String,
     pub(super) image_name_lower: String,
-    pub(super) show_32_bit_suffix: Option<bool>,
+    pub(super) architecture: Option<ProcessArchitecture>,
     pub(super) user_name: String,
     pub(super) user_name_lower: String,
     pub(super) session_id: Option<u32>,
@@ -86,7 +86,7 @@ pub struct ProcEntry {
 
 #[derive(Clone)]
 pub(super) struct ProcStaticMetadata {
-    pub(super) show_32_bit_suffix: Option<bool>,
+    pub(super) architecture: Option<ProcessArchitecture>,
     pub(super) user_name: String,
     pub(super) user_name_lower: String,
     pub(super) session_id: Option<u32>,
@@ -195,8 +195,7 @@ impl ProcEntry {
     fn rebuild_display_column(&mut self, column_id: ColumnId) {
         let text = match column_id {
             ColumnId::ImageName => {
-                append_32_bit_suffix(&self.image_name, self.show_32_bit_suffix == Some(true))
-                    .into_owned()
+                append_architecture_suffix(&self.image_name, self.architecture).into_owned()
             }
             ColumnId::Pid => self.pid.to_string(),
             ColumnId::Username => self.user_name.clone(),
@@ -221,7 +220,7 @@ impl ProcEntry {
     }
 
     pub(super) fn apply_static_metadata(&mut self, metadata: &ProcStaticMetadata) {
-        self.show_32_bit_suffix = metadata.show_32_bit_suffix;
+        self.architecture = metadata.architecture;
         self.user_name.clone_from(&metadata.user_name);
         self.user_name_lower.clone_from(&metadata.user_name_lower);
         self.session_id = metadata.session_id;
@@ -252,15 +251,15 @@ pub(super) fn update_process_entry(
     let mut changed = DirtyColumns::default();
 
     let image_name_changed = entry.image_name != snapshot.image_name;
-    let bitness_changed = entry.show_32_bit_suffix != snapshot.show_32_bit_suffix;
+    let architecture_changed = entry.architecture != snapshot.architecture;
     if image_name_changed {
         entry.image_name.clone_from(&snapshot.image_name);
         entry.image_name_lower = snapshot.image_name_lower.clone();
     }
-    if bitness_changed {
-        entry.show_32_bit_suffix = snapshot.show_32_bit_suffix;
+    if architecture_changed {
+        entry.architecture = snapshot.architecture;
     }
-    if image_name_changed || bitness_changed {
+    if image_name_changed || architecture_changed {
         mark_process_column_changed(entry, &mut changed, ColumnId::ImageName, visible_columns);
     }
     if entry.pid != snapshot.pid {

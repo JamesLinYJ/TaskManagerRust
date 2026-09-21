@@ -27,6 +27,32 @@ The Dev-channel row is not evidence for a stable Windows 10 or Windows 11 releas
 the NT version as 10.0 for both product families, so a build number must always accompany the
 marketing release name.
 
+## Targeted ARM64 process-label validation — 2026-09-21
+
+Windows 11 Pro Insider Preview **29671.1000**, Parallels ARM64 VM on Apple Silicon, eight
+virtual logical processors. This is a targeted feature check, not the complete checklist below.
+The source was cloned locally from `df86ac4e1491b5ba5b1aa6fc86b1589a63a40de9`, modified, and
+copied to a separate VM test directory with a SHA-256 file manifest.
+
+| Observer build | Quality gates and execution | Targeted GUI evidence |
+| --- | --- | --- |
+| ARM64 (`aarch64-pc-windows-msvc`) | fmt, all-target check, Clippy with warnings denied, 239 ordinary tests, release build; live four-architecture sampler test passed | Both pages' actual labels checked; broader automated interaction acceptance stopped at user request |
+| x86-64 (`x86_64-pc-windows-msvc`) | Same gates, 239 ordinary tests and live sampler test passed under emulation | Not completed |
+| x86 (`i686-pc-windows-msvc`) | Same gates, 238 ordinary tests and live sampler test passed under emulation | Not completed |
+
+All three observers correctly identified independently compiled ARM64, x86, x86-64 and ARM64EC
+GUI fixtures. The live test checked repeated sampling, rejection of mismatched creation times,
+and process exit. Deterministic identity tests cover PID reuse semantics; OS PID reuse was not
+forced. Unit tests cover unsupported APIs, unknown machine values, malformed/truncated PE
+metadata and AnyCPU headers. Three pre-existing environment-dependent tests remain ignored.
+Windows 10 fallback behavior has unit-test coverage only; no new stable-Windows or physical-device
+acceptance is claimed. See [architecture detection](process-architecture.md) for implementation
+and reproduction details.
+
+Toolchain: Rust 1.98.1 stable; MSVC 14.51.36231; Windows SDK 10.0.26100.0. Existing constant-size
+slice loops were changed to `as_chunks` to satisfy the repository's current stable Clippy gate;
+no dependencies or registry configuration schema were changed.
+
 ## GPU and driver coverage
 
 | Date | Windows build / arch | Vendor and adapter | Driver | GPU Engine | Dedicated usage | Shared usage | Metadata / temperature | UI | Status |

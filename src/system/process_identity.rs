@@ -23,7 +23,9 @@ use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::infrastructure::native::{OwnedHandle, process_needs_32_bit_suffix_handle};
+use crate::infrastructure::native::{
+    OwnedHandle, ProcessArchitecture, query_process_architecture_handle,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct ProcIdentity {
@@ -54,9 +56,11 @@ pub(crate) fn query_process_identity_for_pid(pid: u32) -> Result<ProcIdentity, u
     Ok(ProcIdentity::new(pid, creation_time_100ns))
 }
 
-pub(crate) fn query_process_needs_32_bit_suffix(identity: ProcIdentity) -> Result<bool, u32> {
+pub(crate) fn query_process_architecture(
+    identity: ProcIdentity,
+) -> Result<ProcessArchitecture, u32> {
     let handle = open_process_for_identity(identity, PROCESS_QUERY_LIMITED_INFORMATION)?;
-    process_needs_32_bit_suffix_handle(handle.as_raw())
+    query_process_architecture_handle(handle.as_raw())
 }
 
 pub(crate) fn open_process_for_identity(

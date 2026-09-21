@@ -12,6 +12,7 @@
 
 mod errors;
 mod handles;
+mod process_architecture;
 mod safety;
 mod ui;
 
@@ -24,9 +25,13 @@ pub(crate) use errors::{
     record_pdh_error_with_fields, record_win32_error_with_fields,
 };
 pub use handles::{OwnedHandle, OwnedIcon, OwnedWtsMemory};
-pub use safety::{enable_debug_privilege, process_is_elevated, process_needs_32_bit_suffix_handle};
+pub(crate) use process_architecture::{
+    ExecutionMode, ProcessArchitecture, query_process_architecture_handle,
+};
+pub use safety::{enable_debug_privilege, process_is_elevated};
+pub(crate) use ui::append_architecture_suffix;
 pub use ui::{
-    append_32_bit_suffix, call_window_proc, copy_text_to_callback_buffer, finish_list_view_update,
+    call_window_proc, copy_text_to_callback_buffer, finish_list_view_update,
     format_resource_string, get_window_userdata, height, hiword, loword,
     pause_redraw_for_visible_windows, redraw_window_tree, resume_redraw_for_windows,
     sanitize_task_manager_menu, set_dialog_msg_result, set_style, set_window_userdata,

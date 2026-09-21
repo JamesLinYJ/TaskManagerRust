@@ -27,15 +27,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::core::BOOL;
 
+use crate::infrastructure::native::ProcessArchitecture;
+
 use super::{TaskIdentity, WorkerTaskEntry, last_error_or_gen_failure, window_matches_identity};
 use crate::system::process_identity::{
-    ProcIdentity, query_process_identity_for_pid, query_process_needs_32_bit_suffix,
+    ProcIdentity, query_process_architecture, query_process_identity_for_pid,
 };
 
 #[derive(Default)]
 pub(super) struct TaskSamplerCache {
     desktop_names: Option<(String, String)>,
-    suffix_by_process: HashMap<ProcIdentity, bool>,
+    architecture_by_process: HashMap<ProcIdentity, ProcessArchitecture>,
 }
 
 pub(super) struct TaskWorkerSnapshot {
@@ -97,7 +99,8 @@ fn collect_tasks_current_winsta_worker(
         let mut context = WindowEnumContext {
             tasks: &mut tasks as *mut Vec<WorkerTaskEntry>,
             seen_tasks: &mut seen_tasks as *mut HashSet<TaskIdentity>,
-            suffix_by_process: &mut cache.suffix_by_process as *mut HashMap<ProcIdentity, bool>,
+            architecture_by_process: &mut cache.architecture_by_process
+                as *mut HashMap<ProcIdentity, ProcessArchitecture>,
             process_identities: &mut process_identities
                 as *mut HashMap<u32, Result<ProcIdentity, u32>>,
             row_error: None,
@@ -118,7 +121,7 @@ fn collect_tasks_current_winsta_worker(
             .map(|task| task.identity.process)
             .collect::<HashSet<_>>();
         cache
-            .suffix_by_process
+            .architecture_by_process
             .retain(|identity, _| current_processes.contains(identity));
         Ok(TaskWorkerSnapshot {
             tasks,
@@ -131,7 +134,7 @@ fn collect_tasks_current_winsta_worker(
 struct WindowEnumContext {
     tasks: *mut Vec<WorkerTaskEntry>,
     seen_tasks: *mut HashSet<TaskIdentity>,
-    suffix_by_process: *mut HashMap<ProcIdentity, bool>,
+    architecture_by_process: *mut HashMap<ProcIdentity, ProcessArchitecture>,
     process_identities: *mut HashMap<u32, Result<ProcIdentity, u32>>,
     row_error: Option<u32>,
     main_hwnd: HWND,
@@ -196,13 +199,13 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         if !seen_tasks.insert(identity) {
             return 1;
         }
-        let suffix_by_process = &mut *context.suffix_by_process;
-        let show_32_bit_suffix = if let Some(&cached) = suffix_by_process.get(&process) {
+        let architecture_by_process = &mut *context.architecture_by_process;
+        let architecture = if let Some(&cached) = architecture_by_process.get(&process) {
             Some(cached)
         } else {
-            match query_process_needs_32_bit_suffix(process) {
+            match query_process_architecture(process) {
                 Ok(detected) => {
-                    suffix_by_process.insert(process, detected);
+                    architecture_by_process.insert(process, detected);
                     Some(detected)
                 }
                 Err(error) => {
@@ -221,7 +224,7 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         tasks.push(WorkerTaskEntry {
             identity,
             title,
-            show_32_bit_suffix,
+            architecture,
             winstation: context.winstation.clone(),
             desktop: context.desktop.clone(),
             is_hung: IsHungAppWindow(hwnd) != 0,

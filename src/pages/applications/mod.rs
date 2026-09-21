@@ -68,8 +68,9 @@ use self::icons::{
 use self::sampler::{TaskSamplerCache, TaskWorkerResult, collect_tasks_worker};
 use crate::config::options::{Options, ViewMode};
 use crate::infrastructure::native::{
-    append_32_bit_suffix, copy_text_to_callback_buffer, finish_list_view_update,
-    record_win32_error, subclass_list_view, to_wide_null, window_rect_relative_to_page,
+    ProcessArchitecture, append_architecture_suffix, copy_text_to_callback_buffer,
+    finish_list_view_update, record_win32_error, subclass_list_view, to_wide_null,
+    window_rect_relative_to_page,
 };
 use crate::infrastructure::worker::{SingleFlightWorker, keep_pending};
 use crate::system::process_identity::{ProcIdentity, query_process_identity_for_pid};
@@ -140,7 +141,7 @@ pub struct TaskEntry {
     pub title: String,
     display_title: String,
     title_lower: String,
-    pub show_32_bit_suffix: Option<bool>,
+    pub architecture: Option<ProcessArchitecture>,
     pub winstation: String,
     winstation_lower: String,
     pub desktop: String,
@@ -156,7 +157,7 @@ pub struct TaskEntry {
 struct WorkerTaskEntry {
     identity: TaskIdentity,
     title: String,
-    show_32_bit_suffix: Option<bool>,
+    architecture: Option<ProcessArchitecture>,
     winstation: String,
     desktop: String,
     is_hung: bool,
@@ -1339,18 +1340,18 @@ impl TaskEntry {
         let WorkerTaskEntry {
             identity,
             title,
-            show_32_bit_suffix,
+            architecture,
             winstation,
             desktop,
             is_hung,
         } = worker;
-        let display_title = task_display_title(&title, show_32_bit_suffix);
+        let display_title = task_display_title(&title, architecture);
         Self {
             identity,
             title_lower: title.to_lowercase(),
             title,
             display_title,
-            show_32_bit_suffix,
+            architecture,
             winstation_lower: winstation.to_lowercase(),
             winstation,
             desktop_lower: desktop.to_lowercase(),
@@ -1384,16 +1385,16 @@ fn update_task_entry(
         mark_task_column_changed(task, &mut changed, TaskColumnId::Desktop);
     }
     let title_changed = task.title != worker.title;
-    let bitness_changed = task.show_32_bit_suffix != worker.show_32_bit_suffix;
+    let architecture_changed = task.architecture != worker.architecture;
     if title_changed {
         task.title.clone_from(&worker.title);
         task.title_lower = worker.title.to_lowercase();
     }
-    if bitness_changed {
-        task.show_32_bit_suffix = worker.show_32_bit_suffix;
+    if architecture_changed {
+        task.architecture = worker.architecture;
     }
-    if title_changed || bitness_changed {
-        task.display_title = task_display_title(&task.title, task.show_32_bit_suffix);
+    if title_changed || architecture_changed {
+        task.display_title = task_display_title(&task.title, task.architecture);
         mark_task_column_changed(task, &mut changed, TaskColumnId::Name);
     }
     if task.is_hung != worker.is_hung {
@@ -1404,11 +1405,8 @@ fn update_task_entry(
     changed
 }
 
-fn task_display_title(title: &str, show_32_bit_suffix: Option<bool>) -> String {
-    match show_32_bit_suffix {
-        Some(true) => append_32_bit_suffix(title, true).into_owned(),
-        Some(false) | None => title.to_string(),
-    }
+fn task_display_title(title: &str, architecture: Option<ProcessArchitecture>) -> String {
+    append_architecture_suffix(title, architecture).into_owned()
 }
 
 fn mark_task_column_changed(
@@ -1475,16 +1473,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_bitness_does_not_claim_a_process_architecture() {
+    fn unknown_architecture_preserves_the_raw_title() {
         assert_eq!(task_display_title("Editor", None), "Editor");
-        assert_eq!(
-            task_display_title("Editor", None),
-            task_display_title("Editor", Some(false))
-        );
-        assert_ne!(
-            task_display_title("Editor", Some(true)),
-            task_display_title("Editor", None)
-        );
     }
 
     #[test]

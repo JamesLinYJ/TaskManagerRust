@@ -38,6 +38,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::errors::record_win32_error;
+use super::{ExecutionMode, ProcessArchitecture};
 use crate::ui::localization::{TextKey, text};
 use crate::ui::resource_ids::{IDM_ALLCPUS, IDM_MULTIGRAPH, IDM_RUN};
 
@@ -343,12 +344,18 @@ pub fn redraw_window_tree(hwnd: HWND) {
     }
 }
 
-pub fn append_32_bit_suffix(label: &str, show_suffix: bool) -> Cow<'_, str> {
-    if !show_suffix {
-        return Cow::Borrowed(label);
-    }
-
-    Cow::Owned(format!("{label} {}", text(TextKey::Bitness32Suffix)))
+pub(crate) fn append_architecture_suffix(
+    label: &str,
+    architecture: Option<ProcessArchitecture>,
+) -> Cow<'_, str> {
+    let key = match architecture.map(|value| value.mode) {
+        Some(ExecutionMode::Compatibility32) => TextKey::Bitness32Suffix,
+        Some(ExecutionMode::EmulatedX86) => TextKey::ArchitectureX86EmulatedSuffix,
+        Some(ExecutionMode::EmulatedX64) => TextKey::ArchitectureX64EmulatedSuffix,
+        Some(ExecutionMode::Arm64Ec) => TextKey::ArchitectureArm64EcSuffix,
+        Some(ExecutionMode::Native) | None => return Cow::Borrowed(label),
+    };
+    Cow::Owned(format!("{label} {}", text(key)))
 }
 
 /// Forwards a message to a raw window procedure obtained from Win32.
@@ -584,6 +591,31 @@ pub unsafe fn widestr_ptr_to_string(ptr: *const u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::copy_text_to_utf16_buffer;
+
+    #[test]
+    fn architecture_suffixes_preserve_unknown_and_native_names() {
+        use super::{ExecutionMode, ProcessArchitecture, append_architecture_suffix};
+        assert_eq!(append_architecture_suffix("Editor", None), "Editor");
+        for (mode, marker) in [
+            (ExecutionMode::Native, "Editor"),
+            (ExecutionMode::Compatibility32, "32"),
+            (ExecutionMode::EmulatedX86, "x86"),
+            (ExecutionMode::EmulatedX64, "x86-64"),
+            (ExecutionMode::Arm64Ec, "ARM64EC"),
+        ] {
+            let architecture = ProcessArchitecture {
+                process_machine: 0,
+                native_machine: 0,
+                mode,
+            };
+            let label = append_architecture_suffix("Editor", Some(architecture));
+            if mode == ExecutionMode::Native {
+                assert_eq!(label, "Editor");
+            } else {
+                assert!(label.contains(marker), "{label}");
+            }
+        }
+    }
 
     #[test]
     fn callback_text_is_nul_terminated_and_leaves_unused_tail_untouched() {
