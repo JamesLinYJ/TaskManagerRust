@@ -161,32 +161,36 @@ mod tests {
 
     #[test]
     fn find_proc_creation_time_survives_i686_lparam_width() {
-        // These FILETIMEs do not fit in an i686 LPARAM. Narrowing to i32 and widening
-        // back sign-extends when bit 31 of the low half is set, and drops the high half.
-        let samples = [
-            0x0000_0001_0000_0001,
-            0x0000_0000_8000_0000,
-            0x0000_0001_8000_0001,
-            u64::MAX,
+        // An i686 LPARAM keeps 32 bits. The old cast drops the high half, then
+        // sign-extends bit 31 on the way back to u64.
+        let corrupted = [
+            (0x0000_0001_0000_0001, 0x0000_0000_0000_0001),
+            (0x0000_0000_8000_0000, 0xFFFF_FFFF_8000_0000),
+            (0x0000_0001_8000_0001, 0xFFFF_FFFF_8000_0001),
         ];
-        for creation_time_100ns in samples {
-            assert_ne!(
-                i686_lparam_creation_time(creation_time_100ns),
-                creation_time_100ns
-            );
-
-            let payload = super::FindProcPayload {
-                pid: 0x89AB_CDEF,
-                creation_time_100ns,
-            };
-            let lparam = super::find_proc_lparam(&payload);
-            #[cfg(target_pointer_width = "32")]
-            let lparam = (lparam as u32) as isize;
-            assert_eq!(
-                super::find_proc_identity(payload.pid as usize, lparam),
-                Some(ProcIdentity::new(payload.pid, creation_time_100ns))
-            );
+        for (creation_time_100ns, narrowed) in corrupted {
+            assert_eq!(i686_lparam_creation_time(creation_time_100ns), narrowed);
+            assert_ne!(narrowed, creation_time_100ns);
+            assert_find_proc_round_trip(creation_time_100ns);
         }
+        // All-ones survives the old sign-extend by accident. The payload path
+        // still has to return that exact creation time.
+        assert_eq!(i686_lparam_creation_time(u64::MAX), u64::MAX);
+        assert_find_proc_round_trip(u64::MAX);
+    }
+
+    fn assert_find_proc_round_trip(creation_time_100ns: u64) {
+        let payload = super::FindProcPayload {
+            pid: 0x89AB_CDEF,
+            creation_time_100ns,
+        };
+        let lparam = super::find_proc_lparam(&payload);
+        #[cfg(target_pointer_width = "32")]
+        let lparam = (lparam as u32) as isize;
+        assert_eq!(
+            super::find_proc_identity(payload.pid as usize, lparam),
+            Some(ProcIdentity::new(payload.pid, creation_time_100ns))
+        );
     }
 
     #[test]
