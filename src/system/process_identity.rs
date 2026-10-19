@@ -50,6 +50,36 @@ impl ProcIdentity {
     }
 }
 
+/// Payload for `WM_FINDPROC`.
+///
+/// `LPARAM` is 32 bits on i686. The creation time stays in this struct and the message
+/// carries only its address, which is pointer-sized on both i686 and x86_64.
+#[repr(C)]
+pub(crate) struct FindProcPayload {
+    pub(crate) pid: u32,
+    pub(crate) creation_time_100ns: u64,
+}
+
+pub(crate) fn find_proc_lparam(payload: &FindProcPayload) -> isize {
+    std::ptr::from_ref(payload) as isize
+}
+
+pub(crate) fn find_proc_identity(pid_param: usize, lparam: isize) -> Option<ProcIdentity> {
+    let pid = u32::try_from(pid_param).ok()?;
+    if lparam == 0 {
+        return None;
+    }
+    // SAFETY: `lparam` is the address produced by `find_proc_lparam` for a payload the sender
+    // keeps alive until the synchronous `SendMessageW` returns. This copies the two fields
+    // before that payload goes out of scope. The pointer is aligned because it came from a
+    // reference to `FindProcPayload`.
+    let payload = unsafe { (lparam as *const FindProcPayload).read() };
+    if payload.pid != pid || payload.pid == 0 || payload.creation_time_100ns == 0 {
+        return None;
+    }
+    Some(ProcIdentity::new(payload.pid, payload.creation_time_100ns))
+}
+
 pub(crate) fn query_process_identity_for_pid(pid: u32) -> Result<ProcIdentity, u32> {
     let handle = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
     let creation_time_100ns = query_process_creation_time(handle.as_raw())?;
@@ -127,5 +157,68 @@ mod tests {
     #[test]
     fn creation_time_distinguishes_reused_pid() {
         assert_ne!(ProcIdentity::new(42, 100), ProcIdentity::new(42, 200));
+    }
+
+    #[test]
+    fn find_proc_creation_time_survives_i686_lparam_width() {
+        // These FILETIMEs do not fit in an i686 LPARAM. Narrowing to i32 and widening
+        // back sign-extends when bit 31 of the low half is set, and drops the high half.
+        let samples = [
+            0x0000_0001_0000_0001,
+            0x0000_0000_8000_0000,
+            0x0000_0001_8000_0001,
+            u64::MAX,
+        ];
+        for creation_time_100ns in samples {
+            assert_ne!(
+                i686_lparam_creation_time(creation_time_100ns),
+                creation_time_100ns
+            );
+
+            let payload = super::FindProcPayload {
+                pid: 0x89AB_CDEF,
+                creation_time_100ns,
+            };
+            let lparam = super::find_proc_lparam(&payload);
+            #[cfg(target_pointer_width = "32")]
+            let lparam = (lparam as u32) as isize;
+            assert_eq!(
+                super::find_proc_identity(payload.pid as usize, lparam),
+                Some(ProcIdentity::new(payload.pid, creation_time_100ns))
+            );
+        }
+    }
+
+    #[test]
+    fn find_proc_rejects_unverified_or_mismatched_identity() {
+        let payload = super::FindProcPayload {
+            pid: 4,
+            creation_time_100ns: 0x1_0000_0001,
+        };
+        let lparam = super::find_proc_lparam(&payload);
+        assert_eq!(super::find_proc_identity(4, 0), None);
+        assert_eq!(super::find_proc_identity(5, lparam), None);
+
+        let unverified = super::FindProcPayload {
+            pid: 4,
+            creation_time_100ns: 0,
+        };
+        assert_eq!(
+            super::find_proc_identity(4, super::find_proc_lparam(&unverified)),
+            None
+        );
+        let idle = super::FindProcPayload {
+            pid: 0,
+            creation_time_100ns: 0x1_0000_0001,
+        };
+        assert_eq!(
+            super::find_proc_identity(0, super::find_proc_lparam(&idle)),
+            None
+        );
+    }
+
+    fn i686_lparam_creation_time(creation_time_100ns: u64) -> u64 {
+        let lparam = creation_time_100ns as u32 as i32;
+        lparam as i64 as u64
     }
 }

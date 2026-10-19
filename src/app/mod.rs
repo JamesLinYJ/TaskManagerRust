@@ -94,7 +94,7 @@ use crate::infrastructure::native::{
     to_wide_null, width, window_userdata_non_null,
 };
 use crate::system::cpu_topology::CpuTopologyError;
-use crate::system::process_identity::ProcIdentity;
+use crate::system::process_identity::{ProcIdentity, find_proc_identity};
 use crate::system::sampler::{SystemSample, SystemSampleError, SystemSampler};
 use crate::ui::assets::{APPLICATION_ICON_RESOURCE, create_accelerator_table, load_icon_resource};
 use crate::ui::dialogs::create_dialog;
@@ -2607,17 +2607,10 @@ unsafe extern "system" fn main_window_proc(
             WM_NOTIFY => application.on_notify(lparam),
             WM_MENUSELECT => application.on_menu_select(wparam, lparam),
             WM_INITMENU => application.on_init_menu(),
-            WM_FINDPROC => {
-                let Ok(pid) = u32::try_from(wparam) else {
-                    return 0;
-                };
-                let creation_time_100ns = lparam as u64;
-                if pid == 0 || creation_time_100ns == 0 {
-                    0
-                } else {
-                    application.on_find_process(ProcIdentity::new(pid, creation_time_100ns))
-                }
-            }
+            WM_FINDPROC => match find_proc_identity(wparam, lparam) {
+                Some(identity) => application.on_find_process(identity),
+                None => 0,
+            },
             PWM_INPOPUP => application.on_popup_state(wparam != 0),
             PWM_DEFERREDINIT => {
                 if let Err(error) = application.tray.load_icons() {
