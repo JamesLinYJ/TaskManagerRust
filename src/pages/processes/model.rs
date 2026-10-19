@@ -91,6 +91,9 @@ pub(super) struct ProcStaticMetadata {
     pub(super) user_name_lower: String,
     pub(super) session_id: Option<u32>,
     pub(super) user_identity_resolved: bool,
+    // Set when this identity refuses a limited process open. Later refreshes keep the
+    // SystemProcessInformation counters and do not open it again.
+    pub(super) query_access_denied: bool,
 }
 
 pub(super) fn compare_entries(

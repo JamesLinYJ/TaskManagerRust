@@ -10,34 +10,34 @@
 
 //! Owns process enumeration, account/session enrichment, and successful-snapshot delta baselines.
 //! Failed collections leave CPU and per-process baselines untouched.
+//!
+//! CPU, creation time, and memory counters come from one `SystemProcessInformation` query on
+//! the worker thread. That query covers the Idle process and processes that refuse `OpenProcess`.
+//! A limited, creation-time-checked open is used only for architecture and the primary token,
+//! and only for a verified identity that is not already cached or access-denied.
 
 use std::collections::{HashMap, HashSet};
-use std::mem::{size_of, zeroed};
+use std::ffi::c_void;
+use std::mem::{align_of, size_of};
 use std::ptr::null_mut;
 use std::slice;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA, ERROR_NO_MORE_FILES,
-    ERROR_NONE_MAPPED, FILETIME, GetLastError, HANDLE, LocalFree, RtlNtStatusToDosError,
+    ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA,
+    ERROR_NONE_MAPPED, GetLastError, HANDLE, LocalFree, RtlNtStatusToDosError,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
     GetLengthSid, GetTokenInformation, IsValidSid, LookupAccountSidW, SID_NAME_USE, TOKEN_QUERY,
     TOKEN_USER, TokenUser,
 };
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
-use windows_sys::Win32::System::ProcessStatus::{
-    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
-};
 use windows_sys::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW, WTSEnumerateProcessesW,
 };
 use windows_sys::Win32::System::Threading::{
-    GetPriorityClass, GetProcessHandleCount, GetProcessTimes, NORMAL_PRIORITY_CLASS, OpenProcess,
-    OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_VM_READ,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, REALTIME_PRIORITY_CLASS,
 };
 
 use super::model::{DirtyColumns, ProcEntry, ProcStaticMetadata};
@@ -47,7 +47,7 @@ use crate::infrastructure::native::{
 use crate::system::cpu_sampler::{
     ProcessorPerformance, checked_summed_processor_times, query_processor_performance,
 };
-use crate::system::process_identity::ProcIdentity;
+use crate::system::process_identity::{ProcIdentity, open_process_for_identity};
 
 #[derive(Clone, Default)]
 struct PreviousProcSample {
@@ -121,6 +121,8 @@ struct ProcWorkerCache {
     metadata: HashMap<ProcIdentity, ProcStaticMetadata>,
     account_names: AccountNameCache,
     processor_info: Vec<ProcessorPerformance>,
+    // Reused across refreshes. Valid bytes are only those returned by the latest query.
+    process_info: Vec<u8>,
 }
 
 // 常用文案缓存，避免命令执行路径上反复查本地化资源。
@@ -154,9 +156,8 @@ impl ProcWorkerState {
         let system_time =
             current_system_time(request.processor_count, &mut self.cache.processor_info)?;
         let total_delta = system_time_delta(system_time, self.previous_system_time);
-        let collected = unsafe {
-            collect_process_entries(&self.previous_samples, total_delta, &mut self.cache)?
-        };
+        let collected =
+            collect_process_entries(&self.previous_samples, total_delta, &mut self.cache)?;
 
         // CPU and per-process deltas must share the same successful snapshot boundary. A failed
         // process walk leaves both baselines untouched so the next sample remains comparable.
@@ -465,318 +466,598 @@ pub(super) fn signed_kb_delta(current: u64, previous: u64) -> i64 {
     }
 }
 
-// 通过 QueryFullProcessImageNameW 查询进程可执行文件的全路径。
-unsafe fn collect_process_entries(
+// SystemProcessInformation class 5. Times sit at fixed offsets on both pointer widths;
+// pointer-sized fields below ImageName follow the Windows 7+ layout.
+const SYSTEM_PROCESS_INFORMATION_CLASS: i32 = 5;
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
+const STATUS_INVALID_BUFFER_SIZE: i32 = 0xC000_0206u32 as i32;
+const PROCESS_INFO_INITIAL_BYTES: usize = 256 * 1024;
+const PROCESS_INFO_MAX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PARSED_PROCESSES: usize = 100_000;
+const MAX_IMAGE_NAME_BYTES: usize = 32_768;
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQuerySystemInformation(
+        system_information_class: i32,
+        system_information: *mut c_void,
+        system_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *const u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SystemProcessInformation {
+    next_entry_offset: u32,
+    number_of_threads: u32,
+    working_set_private_size: i64,
+    hard_fault_count: u32,
+    number_of_threads_high_watermark: u32,
+    cycle_time: u64,
+    create_time: i64,
+    user_time: i64,
+    kernel_time: i64,
+    image_name: UnicodeString,
+    base_priority: i32,
+    unique_process_id: usize,
+    inherited_from_unique_process_id: usize,
+    handle_count: u32,
+    session_id: u32,
+    unique_process_key: usize,
+    peak_virtual_size: usize,
+    virtual_size: usize,
+    page_fault_count: u32,
+    peak_working_set_size: usize,
+    working_set_size: usize,
+    quota_peak_paged_pool_usage: usize,
+    quota_paged_pool_usage: usize,
+    quota_peak_non_paged_pool_usage: usize,
+    quota_non_paged_pool_usage: usize,
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
+    private_page_count: usize,
+    read_operation_count: i64,
+    write_operation_count: i64,
+    other_operation_count: i64,
+    read_transfer_count: i64,
+    write_transfer_count: i64,
+    other_transfer_count: i64,
+}
+
+const _: () = {
+    assert!(std::mem::offset_of!(SystemProcessInformation, create_time) == 0x20);
+    assert!(std::mem::offset_of!(SystemProcessInformation, user_time) == 0x28);
+    assert!(std::mem::offset_of!(SystemProcessInformation, kernel_time) == 0x30);
+    assert!(std::mem::offset_of!(SystemProcessInformation, image_name) == 0x38);
+};
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(size_of::<SystemProcessInformation>() == 0x100);
+    assert!(std::mem::offset_of!(SystemProcessInformation, unique_process_id) == 0x50);
+    assert!(std::mem::offset_of!(SystemProcessInformation, working_set_size) == 0x90);
+    assert!(std::mem::offset_of!(SystemProcessInformation, pagefile_usage) == 0xB8);
+};
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    assert!(size_of::<SystemProcessInformation>() == 0xB8);
+    assert!(std::mem::offset_of!(SystemProcessInformation, unique_process_id) == 0x44);
+    assert!(std::mem::offset_of!(SystemProcessInformation, working_set_size) == 0x68);
+    assert!(std::mem::offset_of!(SystemProcessInformation, pagefile_usage) == 0x7C);
+};
+
+#[derive(Clone)]
+struct ParsedProcess {
+    pid: u32,
+    creation_time_100ns: u64,
+    cpu_time_100ns: Option<u64>,
+    image_name: String,
+    session_id: u32,
+    thread_count: u32,
+    handle_count: u32,
+    base_priority: i32,
+    working_set_bytes: usize,
+    page_faults: u32,
+    commit_bytes: usize,
+    paged_pool_bytes: usize,
+    nonpaged_pool_bytes: usize,
+}
+
+fn query_system_process_information(buffer: &mut Vec<u8>) -> Result<usize, u32> {
+    if buffer.len() < PROCESS_INFO_INITIAL_BYTES {
+        buffer.resize(PROCESS_INFO_INITIAL_BYTES, 0);
+    }
+    loop {
+        let Ok(length) = u32::try_from(buffer.len()) else {
+            return Err(ntstatus_to_win32(STATUS_INVALID_BUFFER_SIZE));
+        };
+        let mut returned = 0u32;
+        // SAFETY: the worker owns `buffer` for `length` bytes and does not share it. The call
+        // writes at most `length` bytes and reports the used size in `returned`.
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SYSTEM_PROCESS_INFORMATION_CLASS,
+                buffer.as_mut_ptr().cast(),
+                length,
+                &mut returned,
+            )
+        };
+        if status >= 0 {
+            let returned = returned as usize;
+            if returned == 0 || returned > buffer.len() {
+                return Err(ERROR_INVALID_DATA);
+            }
+            return Ok(returned);
+        }
+        if status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_TOO_SMALL {
+            return Err(ntstatus_to_win32(status));
+        }
+        let next = if returned as usize > buffer.len() {
+            returned as usize
+        } else {
+            buffer.len().saturating_mul(2)
+        };
+        if next <= buffer.len() || next > PROCESS_INFO_MAX_BYTES {
+            return Err(ntstatus_to_win32(status));
+        }
+        buffer.resize(next, 0);
+    }
+}
+
+fn parse_system_process_information(
+    buffer: &[u8],
+) -> Result<(Vec<ParsedProcess>, Option<u32>), u32> {
+    if buffer.len() < size_of::<SystemProcessInformation>() {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let mut rows = Vec::new();
+    let mut row_error = None;
+    let mut offset = 0usize;
+    let header_size = size_of::<SystemProcessInformation>();
+    loop {
+        if rows.len() >= MAX_PARSED_PROCESSES {
+            return Err(ERROR_INVALID_DATA);
+        }
+        let header = read_process_header(buffer, offset)?;
+        if let Some(row) = parsed_process(buffer, &header, &mut row_error) {
+            rows.push(row);
+        }
+        if header.next_entry_offset == 0 {
+            break;
+        }
+        let step = usize::try_from(header.next_entry_offset).map_err(|_| ERROR_INVALID_DATA)?;
+        if step < header_size {
+            return Err(ERROR_INVALID_DATA);
+        }
+        let Some(next) = offset.checked_add(step) else {
+            return Err(ERROR_INVALID_DATA);
+        };
+        if next <= offset || buffer.len().saturating_sub(next) < header_size {
+            return Err(ERROR_INVALID_DATA);
+        }
+        offset = next;
+    }
+    if rows.is_empty() {
+        return Err(ERROR_INVALID_DATA);
+    }
+    Ok((rows, row_error))
+}
+
+fn read_process_header(buffer: &[u8], offset: usize) -> Result<SystemProcessInformation, u32> {
+    let header_size = size_of::<SystemProcessInformation>();
+    let Some(end) = offset.checked_add(header_size) else {
+        return Err(ERROR_INVALID_DATA);
+    };
+    if end > buffer.len() {
+        return Err(ERROR_INVALID_DATA);
+    }
+    // SAFETY: `offset..end` is inside `buffer`. `read_unaligned` copies the header without
+    // requiring the struct's natural alignment. The buffer is not mutated during the copy.
+    let header = unsafe {
+        buffer
+            .as_ptr()
+            .add(offset)
+            .cast::<SystemProcessInformation>()
+            .read_unaligned()
+    };
+    Ok(header)
+}
+
+fn parsed_process(
+    buffer: &[u8],
+    header: &SystemProcessInformation,
+    row_error: &mut Option<u32>,
+) -> Option<ParsedProcess> {
+    let Ok(pid) = u32::try_from(header.unique_process_id) else {
+        row_error.get_or_insert(ERROR_INVALID_DATA);
+        return None;
+    };
+    let creation_time_100ns = if header.create_time < 0 {
+        row_error.get_or_insert(ERROR_INVALID_DATA);
+        0
+    } else {
+        header.create_time as u64
+    };
+    let image_name = match image_name_from_process_buffer(buffer, header.image_name) {
+        Ok(name) => name,
+        Err(error) => {
+            row_error.get_or_insert(error);
+            String::new()
+        }
+    };
+    Some(ParsedProcess {
+        pid,
+        creation_time_100ns,
+        cpu_time_100ns: cpu_time_from_counters(header.kernel_time, header.user_time, row_error),
+        image_name,
+        session_id: header.session_id,
+        thread_count: header.number_of_threads,
+        handle_count: header.handle_count,
+        base_priority: header.base_priority,
+        working_set_bytes: header.working_set_size,
+        page_faults: header.page_fault_count,
+        commit_bytes: header.pagefile_usage,
+        paged_pool_bytes: header.quota_paged_pool_usage,
+        nonpaged_pool_bytes: header.quota_non_paged_pool_usage,
+    })
+}
+
+fn cpu_time_from_counters(kernel: i64, user: i64, row_error: &mut Option<u32>) -> Option<u64> {
+    if kernel < 0 || user < 0 {
+        row_error.get_or_insert(ERROR_INVALID_DATA);
+        return None;
+    }
+    match u64::try_from(kernel).and_then(|kernel| u64::try_from(user).map(|user| (kernel, user))) {
+        Ok((kernel, user)) => match kernel.checked_add(user) {
+            Some(sum) => Some(sum),
+            None => {
+                row_error.get_or_insert(ERROR_INVALID_DATA);
+                None
+            }
+        },
+        Err(_) => {
+            row_error.get_or_insert(ERROR_INVALID_DATA);
+            None
+        }
+    }
+}
+
+fn image_name_from_process_buffer(buffer: &[u8], name: UnicodeString) -> Result<String, u32> {
+    if name.length == 0 {
+        return Ok(String::new());
+    }
+    if name.buffer.is_null() || !name.length.is_multiple_of(2) {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let bytes = usize::from(name.length);
+    if bytes > MAX_IMAGE_NAME_BYTES {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let buffer_start = buffer.as_ptr() as usize;
+    let Some(buffer_end) = buffer_start.checked_add(buffer.len()) else {
+        return Err(ERROR_INVALID_DATA);
+    };
+    let name_start = name.buffer as usize;
+    if !name_start.is_multiple_of(align_of::<u16>()) {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let Some(name_end) = name_start.checked_add(bytes) else {
+        return Err(ERROR_INVALID_DATA);
+    };
+    if name_start < buffer_start || name_end > buffer_end {
+        return Err(ERROR_INVALID_DATA);
+    }
+    // SAFETY: `name_start` is 2-aligned and `name_start..name_end` lies inside `buffer`, which
+    // outlives this read. The kernel, or the test builder, placed the UTF-16 units there.
+    let units = unsafe { slice::from_raw_parts(name.buffer, bytes / 2) };
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    Ok(String::from_utf16_lossy(&units[..end]))
+}
+
+fn priority_class_from_base_priority(base_priority: i32) -> u32 {
+    match base_priority {
+        4 => IDLE_PRIORITY_CLASS,
+        6 => BELOW_NORMAL_PRIORITY_CLASS,
+        8 => NORMAL_PRIORITY_CLASS,
+        10 => ABOVE_NORMAL_PRIORITY_CLASS,
+        13 => HIGH_PRIORITY_CLASS,
+        24 => REALTIME_PRIORITY_CLASS,
+        _ => 0,
+    }
+}
+
+fn build_process_entries(
+    rows: &[ParsedProcess],
+    previous_samples: &HashMap<ProcIdentity, PreviousProcSample>,
+    total_delta: Option<u64>,
+) -> CollectedProcessEntries {
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut next_samples = HashMap::with_capacity(rows.len());
+    let mut row_error = None;
+    for row in rows {
+        let identity = if row.creation_time_100ns == 0 {
+            ProcIdentity::pid_only(row.pid)
+        } else {
+            ProcIdentity::new(row.pid, row.creation_time_100ns)
+        };
+        let identity_usable = row.pid == 0 || row.creation_time_100ns != 0;
+        let image_name = if row.pid == 0 && row.image_name.is_empty() {
+            "System Idle Process".to_string()
+        } else {
+            row.image_name.clone()
+        };
+        let mut entry = ProcEntry {
+            identity,
+            pid: row.pid,
+            image_name: image_name.clone(),
+            image_name_lower: image_name.to_lowercase(),
+            architecture: None,
+            user_name: if row.pid == 0 {
+                "SYSTEM".to_string()
+            } else {
+                String::new()
+            },
+            user_name_lower: if row.pid == 0 {
+                "system".to_string()
+            } else {
+                String::new()
+            },
+            session_id: if row.pid == 0 {
+                Some(0)
+            } else {
+                Some(row.session_id)
+            },
+            cpu: 0,
+            cpu_time_100ns: 0,
+            display_cpu_time_100ns: 0,
+            mem_usage_kb: kb_from_bytes(row.working_set_bytes),
+            mem_diff_kb: 0,
+            page_faults: row.page_faults,
+            page_faults_diff: 0,
+            commit_charge_kb: kb_from_bytes(row.commit_bytes),
+            paged_pool_kb: kb_from_bytes(row.paged_pool_bytes),
+            nonpaged_pool_kb: kb_from_bytes(row.nonpaged_pool_bytes),
+            priority_class: priority_class_from_base_priority(row.base_priority),
+            handle_count: row.handle_count,
+            thread_count: row.thread_count,
+            display_text: std::array::from_fn(|_| String::new()),
+            pass_count: 0,
+            dirty_columns: DirtyColumns::default(),
+        };
+        if !identity_usable || row.cpu_time_100ns.is_none() {
+            row_error.get_or_insert(ERROR_INVALID_DATA);
+        }
+        if identity_usable && let Some(previous) = previous_samples.get(&identity) {
+            entry.mem_diff_kb = signed_kb_delta(entry.mem_usage_kb, previous.mem_usage_kb);
+            entry.page_faults_diff = i64::from(entry.page_faults) - i64::from(previous.page_faults);
+            if let Some(cpu_time) = row.cpu_time_100ns
+                && let Some(total_delta) = total_delta
+                && let Some(process_delta) = cpu_time.checked_sub(previous.raw_cpu_time_100ns)
+            {
+                entry.cpu = cpu_percent_from_delta(process_delta, total_delta);
+            }
+        }
+        if identity_usable && let Some(cpu_time) = row.cpu_time_100ns {
+            entry.cpu_time_100ns = cpu_time;
+            entry.display_cpu_time_100ns = cpu_time;
+            next_samples.insert(
+                identity,
+                PreviousProcSample {
+                    raw_cpu_time_100ns: cpu_time,
+                    mem_usage_kb: entry.mem_usage_kb,
+                    page_faults: entry.page_faults,
+                },
+            );
+        }
+        entries.push(entry);
+    }
+    CollectedProcessEntries {
+        entries,
+        next_samples,
+        row_error,
+    }
+}
+
+fn collect_process_entries(
     previous_samples: &HashMap<ProcIdentity, PreviousProcSample>,
     total_delta: Option<u64>,
     cache: &mut ProcWorkerCache,
 ) -> Result<CollectedProcessEntries, u32> {
-    unsafe {
-        // 采样阶段只构造“当下这一轮”的快照，真正的增量计算依赖外部传入的历史样本。
-        let raw_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        // 安全性: successful CreateToolhelp32Snapshot returns one owned snapshot handle released
-        // by CloseHandle; ownership is transferred immediately.
-        let Some(snapshot) = OwnedHandle::from_raw(raw_snapshot) else {
-            let error = windows_sys::Win32::Foundation::GetLastError();
-            return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
-        };
+    let returned = query_system_process_information(&mut cache.process_info)?;
+    let (rows, mut row_error) = parse_system_process_information(&cache.process_info[..returned])?;
+    let mut collected = build_process_entries(&rows, previous_samples, total_delta);
+    if row_error.is_none() {
+        row_error = collected.row_error;
+    }
 
-        let mut entries = Vec::with_capacity(previous_samples.len().max(64));
-        let mut next_samples = HashMap::with_capacity(previous_samples.len().max(64));
-        let mut resolved_user_identities = HashSet::with_capacity(previous_samples.len().max(64));
-        let mut unresolved_user_errors = HashMap::with_capacity(previous_samples.len().max(64));
-        let mut row_error = None;
-        let mut process_entry = zeroed::<PROCESSENTRY32W>();
-        process_entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    cache.account_names.begin_refresh();
+    let mut resolved_users = HashSet::with_capacity(collected.entries.len());
+    let mut unresolved_user_errors = HashMap::new();
+    let mut denied = HashSet::new();
+    enrich_process_entries(
+        &mut collected.entries,
+        cache,
+        &mut resolved_users,
+        &mut unresolved_user_errors,
+        &mut denied,
+        &mut row_error,
+    );
 
-        if Process32FirstW(snapshot.as_raw(), &mut process_entry) == 0 {
-            let error = windows_sys::Win32::Foundation::GetLastError();
-            return if error == ERROR_NO_MORE_FILES {
-                Ok(CollectedProcessEntries {
-                    entries,
-                    next_samples,
-                    row_error,
-                })
-            } else {
-                Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
-            };
-        }
-        cache.account_names.begin_refresh();
-
-        loop {
-            let pid = process_entry.th32ProcessID;
-            let thread_count = process_entry.cntThreads;
-            let image_name = utf16_buffer_to_string(&process_entry.szExeFile);
-            let mut entry = ProcEntry {
-                identity: ProcIdentity::pid_only(pid),
-                pid,
-                image_name: image_name.clone(),
-                image_name_lower: image_name.to_lowercase(),
-                architecture: None,
-                user_name: String::new(),
-                user_name_lower: String::new(),
-                session_id: None,
-                cpu: 0,
-                cpu_time_100ns: 0,
-                display_cpu_time_100ns: 0,
-                mem_usage_kb: 0,
-                mem_diff_kb: 0,
-                page_faults: 0,
-                page_faults_diff: 0,
-                commit_charge_kb: 0,
-                paged_pool_kb: 0,
-                nonpaged_pool_kb: 0,
-                priority_class: NORMAL_PRIORITY_CLASS,
-                handle_count: 0,
-                thread_count,
-                display_text: std::array::from_fn(|_| String::new()),
-                pass_count: 0,
-                dirty_columns: DirtyColumns::default(),
-            };
-            let mut raw_cpu_time_100ns = 0u64;
-
-            if pid == 0 {
-                entry.user_name = "SYSTEM".to_string();
-                entry.user_name_lower = "system".to_string();
-                entry.session_id = Some(0);
+    let required_user_pids = collected
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.pid != 0
+                && (!entry.identity.is_verified() || !resolved_users.contains(&entry.identity))
+        })
+        .map(|entry| entry.pid)
+        .collect::<HashSet<_>>();
+    let required_identity_pids = collected
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.pid != 0
+                && (entry.session_id.is_none() || required_user_pids.contains(&entry.pid))
+        })
+        .map(|entry| entry.pid)
+        .collect::<HashSet<_>>();
+    // SAFETY: the PID sets and account cache are owned by this worker call. The callee does not
+    // retain WTS pointers after it returns.
+    match unsafe {
+        collect_process_identity_map(
+            &required_identity_pids,
+            &required_user_pids,
+            &mut cache.account_names,
+        )
+    } {
+        Ok(identity_snapshot) => {
+            row_error = row_error.or(identity_snapshot.row_error);
+            for entry in collected.entries.iter_mut().filter(|entry| entry.pid != 0) {
+                if merge_wts_process_identity(entry, identity_snapshot.identities.get(&entry.pid))
+                    && entry.identity.is_verified()
+                {
+                    resolved_users.insert(entry.identity);
+                    unresolved_user_errors.remove(&entry.identity);
+                }
             }
+        }
+        Err(error) => {
+            row_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = collected
+        .entries
+        .iter()
+        .filter(|entry| entry.identity.is_verified() && !resolved_users.contains(&entry.identity))
+        .find_map(|entry| unresolved_user_errors.get(&entry.identity).copied())
+    {
+        row_error.get_or_insert(error);
+    }
 
-            let memory_handle = if pid == 0 {
-                None
-            } else {
-                let raw_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
-                // 安全性: a successful OpenProcess call returns one owned kernel handle whose
-                // release function is CloseHandle.
-                OwnedHandle::from_raw(raw_handle)
-            };
-            let query_handle = if pid != 0 && memory_handle.is_none() {
-                let raw_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-                // 安全性: a successful OpenProcess call returns one owned kernel handle whose
-                // release function is CloseHandle.
-                OwnedHandle::from_raw(raw_handle)
-            } else {
-                None
-            };
-            let info_handle = memory_handle
-                .as_ref()
-                .or(query_handle.as_ref())
-                .map(OwnedHandle::as_raw);
+    let current_identities = collected
+        .entries
+        .iter()
+        .map(|entry| entry.identity)
+        .filter(|identity| identity.is_verified())
+        .collect::<HashSet<_>>();
+    cache
+        .metadata
+        .retain(|identity, _| current_identities.contains(identity));
+    for entry in collected
+        .entries
+        .iter()
+        .filter(|entry| entry.identity.is_verified())
+    {
+        let resolved = resolved_users.contains(&entry.identity);
+        let access_denied = denied.contains(&entry.identity);
+        if let Some(metadata) = cache.metadata.get_mut(&entry.identity) {
+            if metadata.architecture.is_none() && entry.architecture.is_some() {
+                metadata.architecture = entry.architecture;
+            }
+            if metadata.session_id.is_none() && entry.session_id.is_some() {
+                metadata.session_id = entry.session_id;
+            }
+            if resolved && !metadata.user_identity_resolved {
+                metadata.user_name.clone_from(&entry.user_name);
+                metadata.user_name_lower.clone_from(&entry.user_name_lower);
+                metadata.user_identity_resolved = true;
+            }
+            if access_denied {
+                metadata.query_access_denied = true;
+            }
+        } else {
+            cache.metadata.insert(
+                entry.identity,
+                ProcStaticMetadata {
+                    architecture: entry.architecture,
+                    user_name: entry.user_name.clone(),
+                    user_name_lower: entry.user_name_lower.clone(),
+                    session_id: entry.session_id,
+                    user_identity_resolved: resolved,
+                    query_access_denied: access_denied,
+                },
+            );
+        }
+    }
 
-            if let Some(info_handle) = info_handle {
-                let mut creation = zeroed::<FILETIME>();
-                let mut exit = zeroed::<FILETIME>();
-                let mut kernel = zeroed::<FILETIME>();
-                let mut user = zeroed::<FILETIME>();
-                if GetProcessTimes(
-                    info_handle,
-                    &mut creation,
-                    &mut exit,
-                    &mut kernel,
-                    &mut user,
-                ) != 0
-                {
-                    entry.identity = ProcIdentity::new(pid, filetime_to_u64(creation));
-                    let cpu_time_100ns =
-                        filetime_to_u64(kernel).saturating_add(filetime_to_u64(user));
-                    raw_cpu_time_100ns = cpu_time_100ns;
-                    entry.cpu_time_100ns = cpu_time_100ns;
-                    entry.display_cpu_time_100ns = cpu_time_100ns;
-                    if let Some(previous) = previous_samples.get(&entry.identity)
-                        && let Some(total_delta) = total_delta
-                        && let Some(process_delta) =
-                            cpu_time_100ns.checked_sub(previous.raw_cpu_time_100ns)
-                    {
-                        entry.cpu = cpu_percent_from_delta(process_delta, total_delta);
+    collected.row_error = row_error;
+    Ok(collected)
+}
+
+fn enrich_process_entries(
+    entries: &mut [ProcEntry],
+    cache: &mut ProcWorkerCache,
+    resolved_users: &mut HashSet<ProcIdentity>,
+    unresolved_user_errors: &mut HashMap<ProcIdentity, u32>,
+    denied: &mut HashSet<ProcIdentity>,
+    row_error: &mut Option<u32>,
+) {
+    for entry in entries {
+        if entry.pid == 0 {
+            resolved_users.insert(entry.identity);
+            continue;
+        }
+        let mut access_was_denied = false;
+        if let Some(metadata) = cache.metadata.get(&entry.identity) {
+            access_was_denied = metadata.query_access_denied;
+            let queried_session = entry.session_id;
+            entry.apply_static_metadata(metadata);
+            if entry.session_id.is_none() {
+                entry.session_id = queried_session;
+            }
+            if metadata.user_identity_resolved {
+                resolved_users.insert(entry.identity);
+            }
+        }
+        // Architecture and the primary token are not in the system snapshot. Open once per
+        // verified identity. Access-denied identities keep their CPU row and are not opened again.
+        if access_was_denied || !entry.identity.is_verified() || entry.architecture.is_some() {
+            continue;
+        }
+        match open_process_for_identity(entry.identity, PROCESS_QUERY_LIMITED_INFORMATION) {
+            Ok(handle) => {
+                entry.architecture = match query_process_architecture_handle(handle.as_raw()) {
+                    Ok(architecture) => Some(architecture),
+                    Err(error) => {
+                        row_error.get_or_insert(if error == 0 { ERROR_GEN_FAILURE } else { error });
+                        None
                     }
-                }
-
-                if let Some(metadata) = cache.metadata.get(&entry.identity) {
-                    entry.apply_static_metadata(metadata);
-                    if metadata.user_identity_resolved {
-                        resolved_user_identities.insert(entry.identity);
-                    }
-                }
-                if entry.identity.is_verified() && entry.architecture.is_none() {
-                    entry.architecture = match query_process_architecture_handle(info_handle) {
-                        Ok(architecture) => Some(architecture),
-                        Err(error) => {
-                            row_error.get_or_insert(if error == 0 {
-                                ERROR_GEN_FAILURE
-                            } else {
-                                error
-                            });
-                            None
-                        }
-                    };
-                }
-
-                if entry.identity.is_verified()
-                    && !resolved_user_identities.contains(&entry.identity)
-                {
-                    // The token is tied to the already creation-time-verified process handle.
-                    // Access-denied and exit races remain row-local and are reported only if the
-                    // independently validated WTS primary-token SID cannot resolve the same row.
-                    match query_process_account_name(info_handle, &mut cache.account_names) {
+                };
+                if !resolved_users.contains(&entry.identity) {
+                    // SAFETY: `handle` is the creation-time-checked process handle owned for this call.
+                    match unsafe {
+                        query_process_account_name(handle.as_raw(), &mut cache.account_names)
+                    } {
                         Ok(user_name) => {
                             entry.user_name_lower = user_name.to_lowercase();
                             entry.user_name = user_name;
-                            resolved_user_identities.insert(entry.identity);
+                            resolved_users.insert(entry.identity);
                         }
                         Err(error) => {
                             unresolved_user_errors.insert(entry.identity, error);
                         }
                     }
                 }
-
-                if let Some(memory_handle) = memory_handle.as_ref() {
-                    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
-                        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-                        ..zeroed()
-                    };
-                    if K32GetProcessMemoryInfo(
-                        memory_handle.as_raw(),
-                        &mut counters as *mut _ as *mut _,
-                        size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-                    ) != 0
-                    {
-                        entry.mem_usage_kb = kb_from_bytes(counters.WorkingSetSize);
-                        entry.page_faults = counters.PageFaultCount;
-                        entry.commit_charge_kb = kb_from_bytes(counters.PrivateUsage);
-                        entry.paged_pool_kb = kb_from_bytes(counters.QuotaPagedPoolUsage);
-                        entry.nonpaged_pool_kb = kb_from_bytes(counters.QuotaNonPagedPoolUsage);
-
-                        if let Some(previous) = previous_samples.get(&entry.identity) {
-                            entry.mem_diff_kb =
-                                signed_kb_delta(entry.mem_usage_kb, previous.mem_usage_kb);
-                            entry.page_faults_diff =
-                                i64::from(entry.page_faults) - i64::from(previous.page_faults);
-                        }
-                    }
-                }
-
-                let mut handle_count = 0u32;
-                if GetProcessHandleCount(info_handle, &mut handle_count) != 0 {
-                    entry.handle_count = handle_count;
-                }
-
-                let priority_class = GetPriorityClass(info_handle);
-                if priority_class != 0 {
-                    entry.priority_class = priority_class;
-                }
-
-                if entry.identity.is_verified() {
-                    next_samples.insert(
-                        entry.identity,
-                        PreviousProcSample {
-                            raw_cpu_time_100ns,
-                            mem_usage_kb: entry.mem_usage_kb,
-                            page_faults: entry.page_faults,
-                        },
-                    );
-                }
-            }
-
-            entries.push(entry);
-
-            if Process32NextW(snapshot.as_raw(), &mut process_entry) == 0 {
-                let error = windows_sys::Win32::Foundation::GetLastError();
-                if error != ERROR_NO_MORE_FILES {
-                    return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
-                }
-                break;
-            }
-        }
-
-        let required_user_pids = entries
-            .iter()
-            .filter(|entry| {
-                entry.pid != 0
-                    && (!entry.identity.is_verified()
-                        || !resolved_user_identities.contains(&entry.identity))
-            })
-            .map(|entry| entry.pid)
-            .collect::<HashSet<_>>();
-        let required_identity_pids = entries
-            .iter()
-            .filter(|entry| {
-                entry.pid != 0
-                    && (entry.session_id.is_none() || required_user_pids.contains(&entry.pid))
-            })
-            .map(|entry| entry.pid)
-            .collect::<HashSet<_>>();
-        match collect_process_identity_map(
-            &required_identity_pids,
-            &required_user_pids,
-            &mut cache.account_names,
-        ) {
-            Ok(identity_snapshot) => {
-                row_error = row_error.or(identity_snapshot.row_error);
-                for entry in entries.iter_mut().filter(|entry| entry.pid != 0) {
-                    if merge_wts_process_identity(
-                        entry,
-                        identity_snapshot.identities.get(&entry.pid),
-                    ) && entry.identity.is_verified()
-                    {
-                        resolved_user_identities.insert(entry.identity);
-                        unresolved_user_errors.remove(&entry.identity);
-                    }
-                }
             }
             Err(error) => {
+                if error == ERROR_ACCESS_DENIED {
+                    denied.insert(entry.identity);
+                }
                 row_error.get_or_insert(error);
             }
         }
-        if let Some(error) = entries
-            .iter()
-            .filter(|entry| {
-                entry.identity.is_verified() && !resolved_user_identities.contains(&entry.identity)
-            })
-            .find_map(|entry| unresolved_user_errors.get(&entry.identity).copied())
-        {
-            row_error.get_or_insert(error);
-        }
-
-        let current_identities = entries
-            .iter()
-            .map(|entry| entry.identity)
-            .filter(|identity| identity.is_verified())
-            .collect::<HashSet<_>>();
-        cache
-            .metadata
-            .retain(|identity, _| current_identities.contains(identity));
-        for entry in entries.iter().filter(|entry| entry.identity.is_verified()) {
-            let resolved = resolved_user_identities.contains(&entry.identity);
-            if let Some(metadata) = cache.metadata.get_mut(&entry.identity) {
-                if metadata.architecture.is_none() && entry.architecture.is_some() {
-                    metadata.architecture = entry.architecture;
-                }
-                if metadata.session_id.is_none() && entry.session_id.is_some() {
-                    metadata.session_id = entry.session_id;
-                }
-                if resolved && !metadata.user_identity_resolved {
-                    metadata.user_name.clone_from(&entry.user_name);
-                    metadata.user_name_lower.clone_from(&entry.user_name_lower);
-                    metadata.user_identity_resolved = true;
-                }
-            } else {
-                cache.metadata.insert(
-                    entry.identity,
-                    ProcStaticMetadata {
-                        architecture: entry.architecture,
-                        user_name: entry.user_name.clone(),
-                        user_name_lower: entry.user_name_lower.clone(),
-                        session_id: entry.session_id,
-                        user_identity_resolved: resolved,
-                    },
-                );
-            }
-        }
-
-        Ok(CollectedProcessEntries {
-            entries,
-            next_samples,
-            row_error,
-        })
     }
 }
 
@@ -801,20 +1082,6 @@ pub(super) fn system_time_delta(current: u64, previous: Option<u64>) -> Option<u
     previous.and_then(|previous| current.checked_sub(previous))
 }
 
-// 将 Win32 FILETIME 结构合并为一个 u64（100ns 单位）。
-fn filetime_to_u64(filetime: FILETIME) -> u64 {
-    (u64::from(filetime.dwHighDateTime) << 32) | u64::from(filetime.dwLowDateTime)
-}
-
-// 将以 null 结尾的 UTF-16 切片转换为 Rust String，忽略 BOM 和无效代理对。
-fn utf16_buffer_to_string(buffer: &[u16]) -> String {
-    let length = buffer
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(buffer.len());
-    String::from_utf16_lossy(&buffer[..length])
-}
-
 // 根据进程 CPU 时间增量与系统总时间增量计算 CPU 使用率百分比。
 pub(super) fn cpu_percent_from_delta(delta_100ns: u64, total_delta_100ns: u64) -> u8 {
     if total_delta_100ns == 0 {
@@ -827,9 +1094,21 @@ pub(super) fn cpu_percent_from_delta(delta_100ns: u64, total_delta_100ns: u64) -
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use std::collections::HashMap;
+    use std::mem::size_of;
 
-    use super::{AccountNameCache, query_process_account_name};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, HIGH_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+
+    use super::{
+        AccountNameCache, ParsedProcess, SystemProcessInformation, UnicodeString,
+        build_process_entries, parse_system_process_information, query_process_account_name,
+        query_system_process_information,
+    };
+    use crate::infrastructure::native::OwnedHandle;
+    use crate::system::process_identity::{ProcIdentity, query_process_identity_for_pid};
 
     #[test]
     fn current_process_primary_token_resolves_to_a_non_empty_account_label() {
@@ -838,5 +1117,373 @@ mod tests {
             .expect("the current process primary token should expose TokenUser");
 
         assert!(!account_name.is_empty());
+    }
+
+    #[test]
+    fn idle_and_inaccessible_rows_get_cpu_from_system_process_counters() {
+        let first_rows = [
+            sample_row(0, 0, Some(5_000), "", 0),
+            sample_row(4, 100, Some(1_000), "System", 8),
+            sample_row(99, 200, Some(2_000), "secure.exe", 13),
+        ];
+        let first = build_process_entries(&first_rows, &HashMap::new(), Some(1_000));
+        assert!(first.row_error.is_none());
+        assert!(first.entries.iter().all(|entry| entry.cpu == 0));
+        assert!(!first.entries[0].identity.is_verified());
+        assert_eq!(first.entries[0].image_name, "System Idle Process");
+        assert_eq!(first.entries[0].user_name, "SYSTEM");
+        assert!(first.entries[2].identity.is_verified());
+        assert_eq!(first.entries[1].priority_class, NORMAL_PRIORITY_CLASS);
+        assert_eq!(first.entries[2].priority_class, HIGH_PRIORITY_CLASS);
+        assert_eq!(first.entries[0].priority_class, 0);
+        assert!(first.next_samples.contains_key(&ProcIdentity::new(0, 0)));
+
+        let second_rows = [
+            sample_row(0, 0, Some(5_700), "", 0),
+            sample_row(4, 100, Some(1_100), "System", 8),
+            sample_row(99, 200, Some(2_200), "secure.exe", 13),
+        ];
+        let second = build_process_entries(&second_rows, &first.next_samples, Some(1_000));
+        assert_eq!(cpu_of(&second, 0), 70);
+        assert_eq!(cpu_of(&second, 4), 10);
+        assert_eq!(cpu_of(&second, 99), 20);
+        assert!(second.row_error.is_none());
+        assert_eq!(second.entries[2].identity, ProcIdentity::new(99, 200));
+    }
+
+    #[test]
+    fn corrupt_counter_keeps_sibling_rows_and_does_not_seed_a_zero_baseline() {
+        let idle = sample_row(0, 0, Some(1_000), "", 0);
+        let broken = sample_row(50, 10, None, "bad.exe", 8);
+        let protected = sample_row(99, 20, Some(2_000), "secure.exe", 8);
+        let first = build_process_entries(
+            &[idle.clone(), broken.clone(), protected.clone()],
+            &HashMap::new(),
+            Some(100),
+        );
+        assert_eq!(first.entries.len(), 3);
+        assert!(first.row_error.is_some());
+        assert!(!first.next_samples.contains_key(&ProcIdentity::new(50, 10)));
+        assert!(first.next_samples.contains_key(&ProcIdentity::new(0, 0)));
+        assert_eq!(first.entries[1].cpu, 0);
+        assert_eq!(first.entries[1].cpu_time_100ns, 0);
+
+        let mut repaired = broken;
+        repaired.cpu_time_100ns = Some(10_000);
+        let idle_later = sample_row(0, 0, Some(1_080), "", 0);
+        let protected_later = sample_row(99, 20, Some(2_030), "secure.exe", 8);
+        let second = build_process_entries(
+            &[idle_later, repaired, protected_later],
+            &first.next_samples,
+            Some(100),
+        );
+        assert_eq!(second.entries.len(), 3);
+        assert_eq!(cpu_of(&second, 0), 80);
+        assert_eq!(cpu_of(&second, 50), 0);
+        assert_eq!(cpu_of(&second, 99), 30);
+    }
+
+    #[test]
+    fn reused_pid_does_not_inherit_the_previous_cpu_baseline() {
+        let first = build_process_entries(
+            &[sample_row(77, 999, Some(500), "app.exe", 8)],
+            &HashMap::new(),
+            Some(1_000),
+        );
+        let second = build_process_entries(
+            &[sample_row(77, 1_000, Some(500_000), "app.exe", 8)],
+            &first.next_samples,
+            Some(100),
+        );
+        assert_eq!(second.entries[0].identity, ProcIdentity::new(77, 1_000));
+        assert_eq!(second.entries[0].cpu, 0);
+        assert!(second.row_error.is_none());
+    }
+
+    #[test]
+    fn system_process_buffer_reports_idle_counters_and_keeps_a_bad_sibling() {
+        let buffer = system_process_buffer(&[
+            BufferSpec {
+                pid: 0,
+                creation_time: 0,
+                kernel_time: 50,
+                user_time: 0,
+                name: Some(String::new()),
+                threads: 8,
+                ..BufferSpec::default()
+            },
+            BufferSpec {
+                pid: 44,
+                creation_time: 123_456,
+                kernel_time: 10,
+                user_time: 5,
+                name: Some("app.exe".to_string()),
+                session_id: 2,
+                threads: 3,
+                handles: 11,
+                base_priority: 8,
+                working_set: 8_192,
+                page_faults: 9,
+                commit: 2_048,
+                paged_pool: 1_024,
+                nonpaged_pool: 3_072,
+            },
+            BufferSpec {
+                pid: 55,
+                creation_time: 99,
+                kernel_time: 1,
+                user_time: 1,
+                name: None,
+                ..BufferSpec::default()
+            },
+        ]);
+        let (rows, row_error) =
+            parse_system_process_information(&buffer).expect("synthetic buffer should parse");
+        assert_eq!(rows.len(), 3);
+        assert!(row_error.is_some());
+        assert_eq!(rows[0].pid, 0);
+        assert_eq!(rows[0].cpu_time_100ns, Some(50));
+        assert!(rows[0].image_name.is_empty());
+        assert_eq!(rows[1].image_name, "app.exe");
+        assert_eq!(rows[1].creation_time_100ns, 123_456);
+        assert_eq!(rows[1].cpu_time_100ns, Some(15));
+        assert_eq!(rows[2].pid, 55);
+        assert!(rows[2].image_name.is_empty());
+
+        let built = build_process_entries(&rows, &HashMap::new(), None);
+        assert_eq!(built.entries.len(), 3);
+        assert_eq!(built.entries[0].image_name, "System Idle Process");
+        assert_eq!(built.entries[0].cpu_time_100ns, 50);
+        assert!(!built.entries[0].identity.is_verified());
+        assert_eq!(built.entries[1].mem_usage_kb, 8);
+        assert_eq!(built.entries[1].commit_charge_kb, 2);
+        assert_eq!(built.entries[1].paged_pool_kb, 1);
+        assert_eq!(built.entries[1].nonpaged_pool_kb, 3);
+        assert_eq!(built.entries[1].page_faults, 9);
+        assert_eq!(built.entries[1].thread_count, 3);
+        assert_eq!(built.entries[1].handle_count, 11);
+        assert_eq!(built.entries[1].session_id, Some(2));
+        assert_eq!(built.entries[1].identity, ProcIdentity::new(44, 123_456));
+        assert!(built.entries[2].identity.is_verified());
+    }
+
+    #[test]
+    fn live_system_process_information_includes_idle_without_a_process_handle() {
+        let mut buffer = Vec::new();
+        let returned = query_system_process_information(&mut buffer).expect("system process query");
+        let (rows, _) = parse_system_process_information(&buffer[..returned]).expect("parse");
+
+        let idle = rows.iter().find(|row| row.pid == 0).expect("idle process");
+        assert!(idle.cpu_time_100ns.is_some_and(|time| time > 0));
+        // SAFETY: OpenProcess returns null or one owned process handle. Pid 0 has no process
+        // object that this access can open; a non-null result would be closed by OwnedHandle.
+        let idle_handle =
+            unsafe { OwnedHandle::from_raw(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, 0)) };
+        assert!(idle_handle.is_none());
+
+        // SAFETY: GetCurrentProcessId has no preconditions.
+        let self_pid = unsafe { GetCurrentProcessId() };
+        let self_row = rows
+            .iter()
+            .find(|row| row.pid == self_pid)
+            .expect("current process");
+        let self_identity =
+            query_process_identity_for_pid(self_pid).expect("current process identity");
+        assert_eq!(
+            self_row.creation_time_100ns,
+            self_identity.creation_time_100ns
+        );
+        assert!(self_row.cpu_time_100ns.is_some());
+
+        for row in &rows {
+            if row.pid == 0 {
+                continue;
+            }
+            // SAFETY: each successful OpenProcess returns one owned handle released by OwnedHandle.
+            let full = unsafe {
+                OwnedHandle::from_raw(OpenProcess(
+                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                    0,
+                    row.pid,
+                ))
+            };
+            let limited = unsafe {
+                OwnedHandle::from_raw(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, row.pid))
+            };
+            if full.is_none() && limited.is_none() {
+                assert_ne!(
+                    row.creation_time_100ns, 0,
+                    "pid {} refused OpenProcess but still needs a creation time",
+                    row.pid
+                );
+                assert!(
+                    row.cpu_time_100ns.is_some(),
+                    "pid {} refused OpenProcess but still needs CPU counters",
+                    row.pid
+                );
+                break;
+            }
+        }
+    }
+
+    fn sample_row(
+        pid: u32,
+        creation_time_100ns: u64,
+        cpu_time_100ns: Option<u64>,
+        image_name: &str,
+        base_priority: i32,
+    ) -> ParsedProcess {
+        ParsedProcess {
+            pid,
+            creation_time_100ns,
+            cpu_time_100ns,
+            image_name: image_name.to_string(),
+            session_id: 1,
+            thread_count: 1,
+            handle_count: 1,
+            base_priority,
+            working_set_bytes: 0,
+            page_faults: 0,
+            commit_bytes: 0,
+            paged_pool_bytes: 0,
+            nonpaged_pool_bytes: 0,
+        }
+    }
+
+    fn cpu_of(collected: &super::CollectedProcessEntries, pid: u32) -> u8 {
+        collected
+            .entries
+            .iter()
+            .find(|entry| entry.pid == pid)
+            .expect("row")
+            .cpu
+    }
+
+    #[derive(Clone)]
+    struct BufferSpec {
+        pid: u32,
+        creation_time: i64,
+        kernel_time: i64,
+        user_time: i64,
+        name: Option<String>,
+        session_id: u32,
+        threads: u32,
+        handles: u32,
+        base_priority: i32,
+        working_set: usize,
+        page_faults: u32,
+        commit: usize,
+        paged_pool: usize,
+        nonpaged_pool: usize,
+    }
+
+    impl Default for BufferSpec {
+        fn default() -> Self {
+            Self {
+                pid: 0,
+                creation_time: 0,
+                kernel_time: 0,
+                user_time: 0,
+                name: Some(String::new()),
+                session_id: 0,
+                threads: 1,
+                handles: 0,
+                base_priority: 0,
+                working_set: 0,
+                page_faults: 0,
+                commit: 0,
+                paged_pool: 0,
+                nonpaged_pool: 0,
+            }
+        }
+    }
+
+    fn system_process_buffer(specs: &[BufferSpec]) -> Vec<u8> {
+        struct Placed {
+            entry_offset: usize,
+            name_offset: Option<usize>,
+            name_bytes: u16,
+        }
+        let mut buffer = Vec::new();
+        let mut placed = Vec::new();
+        let header_size = size_of::<SystemProcessInformation>();
+        for spec in specs {
+            while !buffer.len().is_multiple_of(8) {
+                buffer.push(0);
+            }
+            let entry_offset = buffer.len();
+            buffer.resize(entry_offset + header_size, 0);
+            let (name_offset, name_bytes) = if let Some(name) = &spec.name {
+                let units: Vec<u16> = name.encode_utf16().collect();
+                let name_offset = buffer.len();
+                for unit in units {
+                    buffer.extend_from_slice(&unit.to_le_bytes());
+                }
+                let name_bytes = u16::try_from(buffer.len() - name_offset).unwrap();
+                (Some(name_offset), name_bytes)
+            } else {
+                (None, 4)
+            };
+            let header = SystemProcessInformation {
+                number_of_threads: spec.threads,
+                create_time: spec.creation_time,
+                user_time: spec.user_time,
+                kernel_time: spec.kernel_time,
+                image_name: UnicodeString {
+                    length: name_bytes,
+                    maximum_length: name_bytes,
+                    buffer: std::ptr::null(),
+                },
+                base_priority: spec.base_priority,
+                unique_process_id: usize::try_from(spec.pid).unwrap(),
+                handle_count: spec.handles,
+                session_id: spec.session_id,
+                page_fault_count: spec.page_faults,
+                working_set_size: spec.working_set,
+                quota_paged_pool_usage: spec.paged_pool,
+                quota_non_paged_pool_usage: spec.nonpaged_pool,
+                pagefile_usage: spec.commit,
+                ..SystemProcessInformation::default()
+            };
+            // SAFETY: `entry_offset` addresses `header_size` bytes reserved above, and this write
+            // does not alias another live reference to that range.
+            unsafe {
+                buffer
+                    .as_mut_ptr()
+                    .add(entry_offset)
+                    .cast::<SystemProcessInformation>()
+                    .write_unaligned(header);
+            }
+            placed.push(Placed {
+                entry_offset,
+                name_offset,
+                name_bytes,
+            });
+        }
+        for (index, entry) in placed.iter().enumerate() {
+            // SAFETY: every `entry_offset` still addresses a header inside this buffer. Name
+            // pointers are assigned only after the Vec has finished growing.
+            unsafe {
+                let header_ptr = buffer
+                    .as_mut_ptr()
+                    .add(entry.entry_offset)
+                    .cast::<SystemProcessInformation>();
+                let mut header = header_ptr.read_unaligned();
+                header.next_entry_offset = if index + 1 == placed.len() {
+                    0
+                } else {
+                    u32::try_from(placed[index + 1].entry_offset - entry.entry_offset).unwrap()
+                };
+                if let Some(name_offset) = entry.name_offset {
+                    if entry.name_bytes > 0 {
+                        header.image_name.buffer = buffer.as_ptr().add(name_offset).cast();
+                    }
+                    header.image_name.length = entry.name_bytes;
+                    header.image_name.maximum_length = entry.name_bytes;
+                }
+                header_ptr.write_unaligned(header);
+            }
+        }
+        buffer
     }
 }

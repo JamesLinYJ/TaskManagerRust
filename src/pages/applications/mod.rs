@@ -73,7 +73,9 @@ use crate::infrastructure::native::{
     window_rect_relative_to_page,
 };
 use crate::infrastructure::worker::{SingleFlightWorker, keep_pending};
-use crate::system::process_identity::{ProcIdentity, query_process_identity_for_pid};
+use crate::system::process_identity::{
+    FindProcPayload, ProcIdentity, find_proc_lparam, query_process_identity_for_pid,
+};
 use crate::ui::localization::{TextKey, text};
 use crate::ui::menus::build_popup_menu;
 use crate::ui::resource_ids::{
@@ -493,11 +495,18 @@ impl TaskPageState {
                     if let Some(identity) = self.selected_task_identities(true).first().copied()
                         && window_matches_actionable_identity(identity)
                     {
+                        // The payload lives on this stack until SendMessageW returns. The
+                        // receiver copies both fields during that synchronous call, so the
+                        // 64-bit creation time is not narrowed to LPARAM.
+                        let payload = FindProcPayload {
+                            pid: identity.process.pid,
+                            creation_time_100ns: identity.process.creation_time_100ns,
+                        };
                         SendMessageW(
                             self.main_hwnd,
                             crate::ui::resource_ids::WM_FINDPROC,
-                            identity.process.pid as usize,
-                            identity.process.creation_time_100ns as isize,
+                            payload.pid as usize,
+                            find_proc_lparam(&payload),
                         );
                     }
                 }
