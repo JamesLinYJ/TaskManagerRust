@@ -1613,6 +1613,10 @@ pub(super) fn terminate_prepared_process_tree(
 fn collect_process_tree_termination_order(
     root_identity: ProcIdentity,
 ) -> Result<Vec<ProcIdentity>, u32> {
+    // Toolhelp records PIDs only. Sample the decision time first so a process created while
+    // the snapshot is running — including one that reused a PID from the frozen list — fails
+    // the creation-time bound instead of being terminated as the old child.
+    let decision_time_100ns = process_tree_decision_time();
     let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     // SAFETY: a successful CreateToolhelp32Snapshot call returns a fresh snapshot handle owned
     // by this scope and released with CloseHandle.
@@ -1620,10 +1624,6 @@ fn collect_process_tree_termination_order(
         let error = unsafe { GetLastError() };
         return Err(if error == 0 { ERROR_GEN_FAILURE } else { error });
     };
-
-    let mut snapshot_time = unsafe { zeroed::<FILETIME>() };
-    unsafe { GetSystemTimeAsFileTime(&mut snapshot_time) };
-    let snapshot_time_100ns = filetime_to_u64(snapshot_time);
 
     let mut child_map = HashMap::<u32, Vec<u32>>::new();
     let mut process_entry = unsafe { zeroed::<PROCESSENTRY32W>() };
@@ -1657,12 +1657,23 @@ fn collect_process_tree_termination_order(
     let mut visited = HashSet::new();
     collect_verified_process_tree_children(
         root_identity,
-        snapshot_time_100ns,
+        decision_time_100ns,
         &child_map,
         &mut visited,
         &mut identities,
     )?;
     Ok(identities)
+}
+
+fn process_tree_decision_time() -> u64 {
+    // SAFETY: FILETIME is a plain value. GetSystemTimeAsFileTime writes one FILETIME through
+    // the pointer and does not retain it.
+    let decision_time = unsafe {
+        let mut decision_time = zeroed::<FILETIME>();
+        GetSystemTimeAsFileTime(&mut decision_time);
+        decision_time
+    };
+    filetime_to_u64(decision_time)
 }
 
 const fn filetime_to_u64(filetime: FILETIME) -> u64 {
@@ -1683,7 +1694,7 @@ pub(super) fn validate_snapshot_root_identity(
 // 后序遍历进程树；每条边都用创建时间验证，避免父 PID 被复用后串入旧子树。
 fn collect_verified_process_tree_children(
     parent: ProcIdentity,
-    snapshot_time_100ns: u64,
+    decision_time_100ns: u64,
     child_map: &HashMap<u32, Vec<u32>>,
     visited: &mut HashSet<u32>,
     order: &mut Vec<ProcIdentity>,
@@ -1699,7 +1710,7 @@ fn collect_verified_process_tree_children(
             }
             let child = match classify_descendant_process_result(
                 query_process_identity_for_pid(child_pid),
-                |child| is_valid_process_tree_edge(parent, *child, snapshot_time_100ns),
+                |child| is_valid_process_tree_edge(parent, *child, decision_time_100ns),
             ) {
                 DescendantProcessOutcome::Verified(child) => child,
                 DescendantProcessOutcome::GoneOrReused => continue,
@@ -1707,7 +1718,7 @@ fn collect_verified_process_tree_children(
             };
             collect_verified_process_tree_children(
                 child,
-                snapshot_time_100ns,
+                decision_time_100ns,
                 child_map,
                 visited,
                 order,
@@ -1719,15 +1730,19 @@ fn collect_verified_process_tree_children(
     Ok(())
 }
 
+/// `decision_time_100ns` must be sampled before `CreateToolhelp32Snapshot`.
+///
+/// A live child created after that instant reused a PID from the frozen list. Accepting it
+/// because a later clock read is still greater than its creation time terminates the replacement.
 pub(super) fn is_valid_process_tree_edge(
     parent: ProcIdentity,
     child: ProcIdentity,
-    snapshot_time_100ns: u64,
+    decision_time_100ns: u64,
 ) -> bool {
     parent.is_verified()
         && child.is_verified()
         && parent.creation_time_100ns <= child.creation_time_100ns
-        && child.creation_time_100ns <= snapshot_time_100ns
+        && child.creation_time_100ns <= decision_time_100ns
 }
 
 /// Adopts the two handles returned by a successful `CreateProcessW` call.
@@ -1862,5 +1877,34 @@ mod debugger_tests {
             .unwrap(),
             DebuggerRegistryView::Registry32
         );
+    }
+}
+
+#[cfg(test)]
+mod tree_identity_tests {
+    use super::{ProcIdentity, is_valid_process_tree_edge};
+
+    #[test]
+    fn replacement_created_after_the_decision_is_not_a_tree_child() {
+        let parent = ProcIdentity::new(10, 1_000);
+        // Born while Toolhelp is running. A clock read taken after the snapshot (2_000)
+        // still looks new enough and would terminate this replacement. The decision time
+        // sampled before the snapshot (1_200) rejects it.
+        let replacement = ProcIdentity::new(20, 1_500);
+        assert!(is_valid_process_tree_edge(parent, replacement, 2_000));
+        assert!(!is_valid_process_tree_edge(parent, replacement, 1_200));
+
+        let original_child = ProcIdentity::new(20, 1_100);
+        assert!(is_valid_process_tree_edge(parent, original_child, 1_200));
+        assert!(!is_valid_process_tree_edge(
+            ProcIdentity::pid_only(10),
+            original_child,
+            1_200
+        ));
+        assert!(!is_valid_process_tree_edge(
+            parent,
+            ProcIdentity::pid_only(20),
+            1_200
+        ));
     }
 }

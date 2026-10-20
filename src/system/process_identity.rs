@@ -83,7 +83,23 @@ pub(crate) fn find_proc_identity(pid_param: usize, lparam: isize) -> Option<Proc
 pub(crate) fn query_process_identity_for_pid(pid: u32) -> Result<ProcIdentity, u32> {
     let handle = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
     let creation_time_100ns = query_process_creation_time(handle.as_raw())?;
-    Ok(ProcIdentity::new(pid, creation_time_100ns))
+    identity_from_pid_and_creation_time(pid, creation_time_100ns)
+}
+
+/// A queried PID is a verified identity only when both values can distinguish a later reuse.
+///
+/// PID 0 is not a process object that can be opened, and a zero creation time is the
+/// `pid_only` sentinel. Returning either as `Ok` would report an unverified process as a
+/// successful identity query.
+fn identity_from_pid_and_creation_time(
+    pid: u32,
+    creation_time_100ns: u64,
+) -> Result<ProcIdentity, u32> {
+    if pid == 0 || creation_time_100ns == 0 {
+        Err(ERROR_INVALID_PARAMETER)
+    } else {
+        Ok(ProcIdentity::new(pid, creation_time_100ns))
+    }
 }
 
 pub(crate) fn query_process_architecture(
@@ -157,6 +173,22 @@ mod tests {
     #[test]
     fn creation_time_distinguishes_reused_pid() {
         assert_ne!(ProcIdentity::new(42, 100), ProcIdentity::new(42, 200));
+    }
+
+    #[test]
+    fn zero_creation_time_or_idle_pid_is_not_a_successful_identity() {
+        assert_eq!(
+            super::identity_from_pid_and_creation_time(42, 0),
+            Err(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            super::identity_from_pid_and_creation_time(0, 100),
+            Err(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            super::identity_from_pid_and_creation_time(42, 100).unwrap(),
+            ProcIdentity::new(42, 100)
+        );
     }
 
     #[test]
