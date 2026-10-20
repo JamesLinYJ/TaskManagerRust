@@ -48,6 +48,7 @@ use crate::pages::network::NetworkPageState;
 use crate::pages::performance::PerformancePageState;
 use crate::pages::processes::ProcessPageState;
 use crate::pages::services::ServicePageState;
+use crate::pages::startup::StartupPageState;
 use crate::pages::users::UserPageState;
 use crate::system::process_identity::ProcIdentity;
 use crate::system::sampler::SystemSample;
@@ -61,6 +62,7 @@ use crate::ui::resource_ids::{
     PWM_GPU_METADATA_WORKER_COMPLETE, PWM_GPU_WORKER_COMPLETE, PWM_NET_WORKER_COMPLETE,
     PWM_PROC_DUMP_COMPLETE, PWM_PROC_SEARCH_COMPLETE,
     PWM_PROC_WORKER_COMPLETE, PWM_SERVICE_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE,
+    IDC_STARTUPLIST, PWM_STARTUP_WORKER_COMPLETE,
     PWM_USER_WORKER_COMPLETE,
 };
 use crate::ui::runtime_menu::MenuBar;
@@ -97,6 +99,7 @@ enum PageState {
     Network(Box<NetworkPageState>),
     Users(Box<UserPageState>),
     Services(Box<ServicePageState>),
+    Startup(Box<StartupPageState>),
 }
 
 impl PageState {
@@ -129,6 +132,7 @@ impl PageState {
             Self::Network(_) => IDC_NICTOTALS,
             Self::Users(_) => IDC_USERLIST,
             Self::Services(_) => IDC_SERVICELIST,
+            Self::Startup(_) => IDC_STARTUPLIST,
         };
         if unsafe { GetDlgItem(hwnd, required_control) }.is_null() {
             return Err(ERROR_INVALID_WINDOW_HANDLE);
@@ -147,6 +151,7 @@ impl PageState {
             }
             Self::Users(state) => state.initialize(hwnd)?,
             Self::Services(state) => state.initialize(hwnd, main_hwnd)?,
+            Self::Startup(state) => state.initialize(hwnd)?,
         }
         Ok(())
     }
@@ -201,6 +206,10 @@ impl PageState {
                 state.apply_options(options);
                 false
             }
+            Self::Startup(state) => {
+                state.apply_options(options);
+                false
+            }
         };
         if redraw_owner_draw_page {
             redraw_window_tree(hwnd);
@@ -233,6 +242,10 @@ impl PageState {
                 state.apply_options(options);
                 state.timer_event();
             }
+            Self::Startup(state) => {
+                state.apply_options(options);
+                state.timer_event();
+            }
         }
     }
 
@@ -252,6 +265,7 @@ impl PageState {
             Self::Network(state) => state.destroy(),
             Self::Users(state) => state.destroy(),
             Self::Services(state) => state.destroy(),
+            Self::Startup(state) => state.destroy(),
         }
     }
 
@@ -314,6 +328,20 @@ impl PageState {
         }
     }
 
+    fn handle_startup_command(&mut self, command_id: u16) -> bool {
+        match self {
+            Self::Startup(state) => state.handle_command(command_id),
+            _ => false,
+        }
+    }
+
+    fn startup_command_state(&self) -> Option<crate::pages::startup::StartupCommandState> {
+        match self {
+            Self::Startup(state) => Some(state.command_state()),
+            _ => None,
+        }
+    }
+
     fn user_show_domain_names(&self) -> Option<bool> {
         match self {
             Self::Users(state) => Some(state.show_domain_names()),
@@ -338,6 +366,7 @@ impl PageState {
             Self::Network(state) => state.no_title(),
             Self::Users(state) => state.no_title(),
             Self::Services(state) => state.no_title(),
+            Self::Startup(state) => state.no_title(),
         }
     }
 
@@ -354,6 +383,7 @@ impl PageState {
             Self::Network(_) => 1,
             Self::Users(_) => 1,
             Self::Services(_) => 1,
+            Self::Startup(_) => 1,
             Self::Performance(_) => 1,
             Self::Cpu(_) => 1,
             Self::Gpu(_) => 1,
@@ -372,6 +402,7 @@ impl PageState {
             }
             Self::Users(state) => isize::from(state.handle_command(command_id)),
             Self::Services(state) => isize::from(state.handle_command(command_id)),
+            Self::Startup(state) => isize::from(state.handle_command(command_id)),
             _ => 0,
         }
     }
@@ -389,6 +420,7 @@ impl PageState {
             Self::Cpu(state) => unsafe { state.handle_notify(lparam) },
             Self::Users(state) => unsafe { state.handle_notify(lparam) },
             Self::Services(state) => unsafe { state.handle_notify(lparam) },
+            Self::Startup(state) => unsafe { state.handle_notify(lparam) },
             _ => 0,
         }
     }
@@ -418,6 +450,15 @@ impl PageState {
             }
             Self::Services(state)
                 if wparam as HWND == unsafe { GetDlgItem(hwnd, IDC_SERVICELIST) } =>
+            {
+                state.show_context_menu(
+                    i32::from((lparam & 0xFFFF) as i16),
+                    i32::from(((lparam >> 16) & 0xFFFF) as i16),
+                );
+                Some(1)
+            }
+            Self::Startup(state)
+                if wparam as HWND == unsafe { GetDlgItem(hwnd, IDC_STARTUPLIST) } =>
             {
                 state.show_context_menu(
                     i32::from((lparam & 0xFFFF) as i16),
@@ -457,6 +498,10 @@ impl PageState {
                 state.size_page();
                 false
             }
+            Self::Startup(state) => {
+                state.size_page();
+                false
+            }
         };
         if redraw_owner_draw_page {
             redraw_window_tree(hwnd);
@@ -475,7 +520,7 @@ impl PageState {
         match self {
             Self::Process(_) | Self::Network(_) => WS_CLIPCHILDREN,
             Self::Performance(_) | Self::Cpu(_) | Self::Gpu(_) => WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-            Self::Task(_) | Self::Users(_) | Self::Services(_) => 0,
+            Self::Task(_) | Self::Users(_) | Self::Services(_) | Self::Startup(_) => 0,
         }
     }
 
@@ -517,9 +562,11 @@ impl PageState {
         match msg {
             WM_COMMAND => match self {
                 Self::Gpu(state) => Some(state.handle_command(wparam)),
-                Self::Task(_) | Self::Process(_) | Self::Users(_) | Self::Services(_) => {
-                    Some(self.handle_page_command((wparam & 0xFFFF) as u16))
-                }
+                Self::Task(_)
+                | Self::Process(_)
+                | Self::Users(_)
+                | Self::Services(_)
+                | Self::Startup(_) => Some(self.handle_page_command((wparam & 0xFFFF) as u16)),
                 _ => None,
             },
             WM_NOTIFY => match self {
@@ -527,7 +574,8 @@ impl PageState {
                 | Self::Process(_)
                 | Self::Cpu(_)
                 | Self::Users(_)
-                | Self::Services(_) => Some(unsafe { self.handle_notify(lparam) }),
+                | Self::Services(_)
+                | Self::Startup(_) => Some(unsafe { self.handle_notify(lparam) }),
                 _ => None,
             },
             WM_CONTEXTMENU => self.handle_context_menu(hwnd, wparam, lparam),
@@ -690,6 +738,13 @@ impl PageState {
                 }
                 _ => None,
             },
+            PWM_STARTUP_WORKER_COMPLETE => match self {
+                Self::Startup(state) => {
+                    state.handle_worker_completion();
+                    Some(0)
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -719,6 +774,7 @@ impl DialogPage {
             PageId::Network => PageState::Network(Box::new(NetworkPageState::new())),
             PageId::Users => PageState::Users(Box::new(UserPageState::new())),
             PageId::Services => PageState::Services(Box::new(ServicePageState::new())),
+            PageId::Startup => PageState::Startup(Box::new(StartupPageState::new())),
         };
         Self {
             hinstance: null_mut(),
@@ -949,6 +1005,14 @@ impl DialogPage {
         &self,
     ) -> Option<crate::pages::processes::ProcessViewCommandState> {
         self.state.process_view_command_state()
+    }
+
+    pub fn handle_startup_command(&mut self, command_id: u16) -> bool {
+        self.state.handle_startup_command(command_id)
+    }
+
+    pub fn startup_command_state(&self) -> Option<crate::pages::startup::StartupCommandState> {
+        self.state.startup_command_state()
     }
 
     pub fn user_show_domain_names(&self) -> Option<bool> {

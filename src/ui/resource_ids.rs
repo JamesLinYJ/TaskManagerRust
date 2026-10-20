@@ -37,6 +37,7 @@ pub const PWM_SERVICE_WORKER_COMPLETE: u32 = 0x0400 + 25;
 pub const PWM_NEWTASK_COMPLETE: u32 = 0x0400 + 26;
 pub const PWM_PROC_DUMP_COMPLETE: u32 = 0x0400 + 27;
 pub const PWM_PROC_SEARCH_COMPLETE: u32 = 0x0400 + 28;
+pub const PWM_STARTUP_WORKER_COMPLETE: u32 = 0x0400 + 29;
 
 // 顶层窗口、菜单和对话框模板 ID。
 pub const IDD_MAINWND: u16 = 105;
@@ -72,6 +73,9 @@ pub const IDD_SERVICESPAGE: u16 = 4300;
 pub const IDR_MAINMENU_SERVICE: u16 = 4301;
 pub const IDR_SERVICE_CONTEXT: u16 = 4302;
 pub const IDD_NEWTASK: u16 = 4400;
+pub const IDD_STARTUPPAGE: u16 = 4500;
+pub const IDR_MAINMENU_STARTUP: u16 = 4501;
+pub const IDR_STARTUP_CONTEXT: u16 = 4502;
 
 pub const IDI_TRAY_CPU_00: u16 = 127;
 pub const IDI_TRAY_CPU_01: u16 = 128;
@@ -266,6 +270,8 @@ pub const IDC_NEWTASK_COMMAND: i32 = 5501;
 pub const IDC_NEWTASK_BROWSE: i32 = 5502;
 pub const IDC_NEWTASK_ADMIN: i32 = 5503;
 pub const IDC_SERVICELIST: i32 = 4303;
+pub const IDC_STARTUPLIST: i32 = 4403;
+pub const IDC_STARTUP_NOTICE: i32 = 4404;
 pub const IDC_MESSAGE_TITLE: i32 = 251;
 pub const IDC_MESSAGE_MESSAGE: i32 = 252;
 pub const IDC_CPU0: i32 = 2000;
@@ -392,6 +398,8 @@ pub const IDM_PROC_TREE: u16 = 40130;
 pub const IDM_PROC_EXPAND: u16 = 40131;
 pub const IDM_PROC_COLLAPSE: u16 = 40132;
 pub const IDM_PROC_DUMP: u16 = 40140;
+pub const IDM_STARTUP_ENABLE: u16 = 40160;
+pub const IDM_STARTUP_DISABLE: u16 = 40161;
 
 pub const IDC_NEXTTAB: u16 = 40100;
 pub const IDC_PREVTAB: u16 = 40101;

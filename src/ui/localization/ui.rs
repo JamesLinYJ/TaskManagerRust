@@ -107,6 +107,14 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
                 TextKey::GoToProcess,
             );
         }
+        IDD_STARTUPPAGE => {
+            set_dialog_item_text(hwnd, i32::from(IDM_STARTUP_ENABLE), TextKey::StartupEnable);
+            set_dialog_item_text(
+                hwnd,
+                i32::from(IDM_STARTUP_DISABLE),
+                TextKey::StartupDisable,
+            );
+        }
         IDD_PERFPAGE => {
             set_dialog_item_text(hwnd, IDC_STATIC14, TextKey::Handles);
             set_dialog_item_text(hwnd, IDC_STATIC15, TextKey::Threads);

@@ -45,6 +45,7 @@ const SBS_VERT_STYLE: u32 = SBS_VERT as u32;
 const CBS_DROPDOWNLIST_STYLE: u32 = CBS_DROPDOWNLIST as u32;
 const SS_RIGHT_STYLE: u32 = 0x0000_0002;
 const SS_ENDELLIPSIS_STYLE: u32 = 0x0000_4000;
+const SS_NOPREFIX_STYLE: u32 = 0x0000_0080;
 const DIALOG_FONT_NAME: &str = "MS Shell Dlg";
 const DIALOG_FONT_SIZE: u16 = 8;
 const CPU_LABELS: [&str; 64] = [
@@ -1160,6 +1161,60 @@ fn build_services_dialog() -> DialogSpec<'static> {
     }
 }
 
+fn build_startup_dialog() -> DialogSpec<'static> {
+    DialogSpec {
+        style: DS_3DLOOK | DS_CONTROL | WS_CHILD,
+        ex_style: 0,
+        x: 0,
+        y: 0,
+        cx: 393,
+        cy: 197,
+        title: "",
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
+        controls: vec![
+            ControlSpec {
+                class_name: "SysListView32",
+                text: "List5",
+                id: IDC_STARTUPLIST as u16,
+                style: WS_CHILD
+                    | WS_VISIBLE
+                    | WS_BORDER
+                    | WS_TABSTOP
+                    | LVS_REPORT
+                    | LVS_SINGLESEL
+                    | LVS_OWNERDATA,
+                ex_style: 0,
+                x: 9,
+                y: 9,
+                cx: 376,
+                cy: 131,
+            },
+            ControlSpec {
+                class_name: "Static",
+                text: "",
+                id: IDC_STARTUP_NOTICE as u16,
+                style: WS_CHILD | SS_NOPREFIX_STYLE | SS_ENDELLIPSIS_STYLE,
+                ex_style: 0,
+                x: 9,
+                y: 128,
+                cx: 250,
+                cy: 8,
+            },
+            button("&Enable", IDM_STARTUP_ENABLE as i32, 0, 268, 144, 50, 14),
+            button(
+                "&Disable",
+                IDM_STARTUP_DISABLE as i32,
+                BS_DEFPUSHBUTTON_STYLE,
+                322,
+                144,
+                50,
+                14,
+            ),
+        ],
+    }
+}
+
 fn build_users_dialog() -> DialogSpec<'static> {
     DialogSpec {
         style: DS_3DLOOK | DS_CONTROL | WS_CHILD,
@@ -1428,6 +1483,7 @@ fn dialog_spec(dialog_id: u16) -> Option<DialogSpec<'static>> {
         IDD_AFFINITY => build_affinity_dialog(),
         IDD_USERSPAGE => build_users_dialog(),
         IDD_SERVICESPAGE => build_services_dialog(),
+        IDD_STARTUPPAGE => build_startup_dialog(),
         IDD_MESSAGE => build_message_dialog(),
         IDD_DIAGNOSTICS => build_diagnostics_dialog(),
         IDD_NEWTASK => build_new_task_dialog(),
@@ -1511,6 +1567,7 @@ mod tests {
         IDD_DIAGNOSTICS, IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_NEWTASK,
         IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_SERVICESPAGE, IDD_TASKPAGE,
         IDD_USERSPAGE,
+        IDC_STARTUPLIST, IDD_STARTUPPAGE,
     };
     use windows_sys::Win32::UI::Controls::LVS_OWNERDATA;
 
@@ -1528,6 +1585,7 @@ mod tests {
             IDD_AFFINITY,
             IDD_USERSPAGE,
             IDD_SERVICESPAGE,
+            IDD_STARTUPPAGE,
             IDD_MESSAGE,
             IDD_DIAGNOSTICS,
             IDD_NEWTASK,
@@ -1548,6 +1606,7 @@ mod tests {
             (IDD_TASKPAGE, IDC_TASKLIST, false),
             (IDD_NETPAGE, IDC_NICTOTALS, false),
             (IDD_SERVICESPAGE, IDC_SERVICELIST, true),
+            (IDD_STARTUPPAGE, IDC_STARTUPLIST, true),
         ];
 
         for (dialog_id, control_id, expected) in cases {

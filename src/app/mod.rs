@@ -1189,6 +1189,13 @@ impl App {
             self.enable_menu_item(menu, IDM_PROC_EXPAND, commands.can_expand);
             self.enable_menu_item(menu, IDM_PROC_COLLAPSE, commands.can_collapse);
         }
+        if self.options.current_page == PageId::Startup.persisted() {
+            let commands = self.pages[PageId::Startup.index()]
+                .startup_command_state()
+                .unwrap_or_default();
+            self.enable_menu_item(menu, IDM_STARTUP_ENABLE, commands.enable);
+            self.enable_menu_item(menu, IDM_STARTUP_DISABLE, commands.disable);
+        }
 
         // 安全性: same menu handle as above.
         unsafe {
@@ -2295,6 +2302,17 @@ impl App {
                     if self.options.current_page == PageId::Services.persisted() {
                         let handled =
                             self.pages[PageId::Services.index()].handle_service_command(command_id);
+                        if handled {
+                            self.update_menu_states();
+                        }
+                    } else {
+                        MessageBeep(0);
+                    }
+                }
+                IDM_STARTUP_ENABLE | IDM_STARTUP_DISABLE => {
+                    if self.options.current_page == PageId::Startup.persisted() {
+                        let handled =
+                            self.pages[PageId::Startup.index()].handle_startup_command(command_id);
                         if handled {
                             self.update_menu_states();
                         }

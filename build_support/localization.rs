@@ -136,6 +136,14 @@ const MENU_STATUS_HELP_KEYS: &[(&str, &str)] = &[
         "IDM_PROC_SEARCHONLINE",
         "crate::ui::resource_ids::IDM_PROC_SEARCHONLINE",
     ),
+    (
+        "IDM_STARTUP_ENABLE",
+        "crate::ui::resource_ids::IDM_STARTUP_ENABLE",
+    ),
+    (
+        "IDM_STARTUP_DISABLE",
+        "crate::ui::resource_ids::IDM_STARTUP_DISABLE",
+    ),
 ];
 
 pub(crate) fn generate() {

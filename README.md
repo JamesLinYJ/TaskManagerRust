@@ -17,6 +17,7 @@ This is not a copy of the modern Task Manager. CPU and GPU details come from sys
 - **GPU** handles multiple adapters and engines, dedicated and shared memory, temperature, driver details, and DirectX information.
 - **Networking and Users** show adapter throughput history and Windows session state.
 - **Services** lists Win32 services with description, status, startup type, and the owning process. Start, stop, pause, continue, and Go to Process run only when the current row allows them. Go to Process requires a process id plus creation time.
+- **Startup** lists Run-key and Startup-folder apps with name, publisher or command, location, and enabled state. Enable and disable write the StartupApproved value and report a failure immediately when the entry is missing or the new state cannot be read back. Entries are not deleted.
 
 ## Download
 
