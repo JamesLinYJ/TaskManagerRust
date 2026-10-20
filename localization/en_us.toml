@@ -337,6 +337,8 @@ StartupEnableFailed = "Unable to enable the startup app."
 StartupDisableFailed = "Unable to disable the startup app."
 StartupStateUnchanged = "The startup app did not enter the requested state."
 StartupEntryMissing = "The startup app is no longer present."
+StartupStaleStatus = "%s (not refreshed)"
+StartupPartialNotice = "Some startup locations could not be read. Entries from those locations are unchanged."
 HresultPrefix = "HRESULT:"
 
 [menu_status_help]

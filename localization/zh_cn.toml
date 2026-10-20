@@ -327,6 +327,8 @@ StartupEnableFailed = "无法启用该启动项。"
 StartupDisableFailed = "无法禁用该启动项。"
 StartupStateUnchanged = "该启动项没有进入请求的状态。"
 StartupEntryMissing = "该启动项已不存在。"
+StartupStaleStatus = "%s（未刷新）"
+StartupPartialNotice = "部分启动位置无法读取。这些位置上已显示的项目保持不变。"
 HresultPrefix = "HRESULT:"
 
 [menu_status_help]

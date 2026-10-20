@@ -125,9 +125,12 @@ until the cause is understood.
 
 The Startup page reads the native 64-bit registry view for `HKCU` and `HKLM` `\Run`, the explicit
 `WOW6432Node` Run key, and the current-user and common Startup folders from `SHGetKnownFolderPath`.
-Enabled state comes from the matching `StartupApproved` value. A missing value is enabled. Enable
-and disable rewrite that value only, then read it back; they do not delete the Run value or the
-Startup-folder file.
+Enabled state comes from the matching `StartupApproved` value. A missing value is enabled. The
+first dword is enabled for 2 and 6, and disabled for 1, 3, and 7. Disabling a 6 writes 7, and
+enabling a 7 writes 6. Enable and disable rewrite that value only, then read it back; they do not
+delete the Run value or the Startup-folder file. If one source fails while another succeeds, the
+page keeps the previous rows for the failed source, marks them not refreshed, and shows a notice.
+A source error that exists only in diagnostics is not treated as a complete snapshot.
 
 | Check | Evidence | Status |
 | --- | --- | --- |

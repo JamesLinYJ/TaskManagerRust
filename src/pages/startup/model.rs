@@ -12,14 +12,17 @@
 //! Startup-page decisions that do not touch the registry or the file system.
 //!
 //! An entry stays in its Run key or Startup folder. Enable and disable only describe the
-//! 12-byte `StartupApproved` value Task Manager writes. A missing value means enabled. A blob
-//! that is too short, or whose first dword is not one of the documented states, stays unknown
-//! and cannot be reported as a successful change.
+//! 12-byte `StartupApproved` value Task Manager writes. A missing value means enabled. The
+//! first dword is enabled for 2 and 6, and disabled for 1, 3, and 7. Toggling keeps the
+//! 2/3 family distinct from the 6/7 family. A blob that is too short, or whose first dword is
+//! not one of those states, stays unknown and cannot be reported as a successful change.
 
 pub(crate) const APPROVED_DISABLED_BY_POLICY: u32 = 1;
 pub(crate) const APPROVED_ENABLED: u32 = 2;
 pub(crate) const APPROVED_DISABLED_BY_USER: u32 = 3;
 pub(crate) const APPROVED_ENABLED_BY_USER: u32 = 6;
+/// Disabled partner of [`APPROVED_ENABLED_BY_USER`]. Windows writes this when it disables a 6.
+pub(crate) const APPROVED_DISABLED_BY_USER_ALT: u32 = 7;
 pub(crate) const APPROVED_BLOB_LEN: usize = 12;
 
 pub(crate) const HKCU_RUN: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -167,36 +170,86 @@ pub(crate) enum StartupActionFailure {
     StateUnchanged { observed: StartupEnabledState },
 }
 
+pub(crate) fn approved_flag(bytes: &[u8]) -> Option<u32> {
+    let flag = bytes.get(..4)?;
+    Some(u32::from_le_bytes([flag[0], flag[1], flag[2], flag[3]]))
+}
+
 pub(crate) fn state_from_approved(bytes: Option<&[u8]>) -> StartupEnabledState {
     let Some(bytes) = bytes else {
         return StartupEnabledState::Enabled;
     };
-    if bytes.len() < 4 {
-        return StartupEnabledState::Unknown;
-    }
-    let flag = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    match flag {
-        APPROVED_ENABLED | APPROVED_ENABLED_BY_USER => StartupEnabledState::Enabled,
-        APPROVED_DISABLED_BY_POLICY | APPROVED_DISABLED_BY_USER => StartupEnabledState::Disabled,
+    match approved_flag(bytes) {
+        Some(APPROVED_ENABLED | APPROVED_ENABLED_BY_USER) => StartupEnabledState::Enabled,
+        Some(
+            APPROVED_DISABLED_BY_POLICY | APPROVED_DISABLED_BY_USER | APPROVED_DISABLED_BY_USER_ALT,
+        ) => StartupEnabledState::Disabled,
         _ => StartupEnabledState::Unknown,
+    }
+}
+
+/// Chooses the StartupApproved dword for `toggle` without leaving the 6/7 family.
+pub(crate) fn toggled_approved_flag(current: Option<u32>, toggle: StartupToggle) -> u32 {
+    let user_family = matches!(
+        current,
+        Some(APPROVED_ENABLED_BY_USER | APPROVED_DISABLED_BY_USER_ALT)
+    );
+    if toggle.enables() {
+        if user_family {
+            APPROVED_ENABLED_BY_USER
+        } else {
+            APPROVED_ENABLED
+        }
+    } else if user_family {
+        APPROVED_DISABLED_BY_USER_ALT
+    } else {
+        APPROVED_DISABLED_BY_USER
     }
 }
 
 pub(crate) fn approved_blob(
     toggle: StartupToggle,
+    current_flag: Option<u32>,
     disabled_filetime_100ns: u64,
 ) -> [u8; APPROVED_BLOB_LEN] {
     let mut bytes = [0u8; APPROVED_BLOB_LEN];
-    let flag = if toggle.enables() {
-        APPROVED_ENABLED
-    } else {
-        APPROVED_DISABLED_BY_USER
-    };
+    let flag = toggled_approved_flag(current_flag, toggle);
     bytes[..4].copy_from_slice(&flag.to_le_bytes());
     if !toggle.enables() {
         bytes[4..].copy_from_slice(&disabled_filetime_100ns.to_le_bytes());
     }
     bytes
+}
+
+/// Keeps previous rows for sources that failed this refresh and marks those rows retained.
+///
+/// A source listed in `omitted` contributes none of `fresh`. Rows already shown for that source
+/// stay, with the retained flag set, so a later paint can show that they were not refreshed.
+pub(crate) fn merge_partial_rows<T: Clone>(
+    previous: &[T],
+    fresh: Vec<T>,
+    omitted: &[StartupSource],
+    source_of: impl Fn(&T) -> StartupSource,
+) -> Vec<(T, bool)> {
+    let mut omitted_unique = Vec::new();
+    for source in omitted {
+        if !omitted_unique.contains(source) {
+            omitted_unique.push(*source);
+        }
+    }
+    let mut merged = Vec::with_capacity(fresh.len() + previous.len());
+    for row in fresh {
+        if omitted_unique.contains(&source_of(&row)) {
+            continue;
+        }
+        merged.push((row, false));
+    }
+    for source in omitted_unique {
+        for row in previous.iter().filter(|row| source_of(row) == source) {
+            merged.push((row.clone(), true));
+        }
+    }
+    merged
 }
 
 pub(crate) fn state_matches_request(toggle: StartupToggle, state: StartupEnabledState) -> bool {
@@ -374,18 +427,23 @@ mod tests {
             StartupEnabledState::Unknown
         );
         assert_eq!(
-            state_from_approved(Some(&approved_blob(StartupToggle::Enable, 99))),
+            state_from_approved(Some(&approved_blob(StartupToggle::Enable, None, 99))),
             StartupEnabledState::Enabled
         );
-        let disabled = approved_blob(StartupToggle::Disable, 0x01D0_1234_5678_9ABC);
+        let disabled = approved_blob(StartupToggle::Disable, None, 0x01D0_1234_5678_9ABC);
         assert_eq!(
             state_from_approved(Some(&disabled)),
             StartupEnabledState::Disabled
         );
+        assert_eq!(u32::from_le_bytes(disabled[..4].try_into().unwrap()), 3);
         assert_eq!(&disabled[4..], &0x01D0_1234_5678_9ABCu64.to_le_bytes());
         assert_eq!(
             state_from_approved(Some(&[0x06, 0x00, 0x00, 0x00])),
             StartupEnabledState::Enabled
+        );
+        assert_eq!(
+            state_from_approved(Some(&[0x07, 0x00, 0x00, 0x00])),
+            StartupEnabledState::Disabled
         );
         assert_eq!(
             state_from_approved(Some(&[0x01, 0x00, 0x00, 0x00])),
@@ -395,7 +453,113 @@ mod tests {
             state_from_approved(Some(&[0x00, 0x00, 0x00, 0x00])),
             StartupEnabledState::Unknown
         );
-        assert_eq!(approved_blob(StartupToggle::Enable, 7)[4..], [0; 8]);
+        assert_eq!(approved_blob(StartupToggle::Enable, None, 7)[4..], [0; 8]);
+    }
+
+    #[test]
+    fn toggling_preserves_the_startup_approved_family() {
+        let filetime = 0x01D0_1234_5678_9ABCu64;
+        let disabled_from_six = approved_blob(StartupToggle::Disable, Some(0x06), filetime);
+        assert_eq!(
+            u32::from_le_bytes(disabled_from_six[..4].try_into().unwrap()),
+            0x07
+        );
+        assert_eq!(&disabled_from_six[4..], &filetime.to_le_bytes());
+        assert_eq!(
+            state_from_approved(Some(&disabled_from_six)),
+            StartupEnabledState::Disabled
+        );
+        assert_eq!(
+            command_state(Some(StartupEnabledState::Disabled)),
+            StartupCommandState {
+                enable: true,
+                disable: false
+            }
+        );
+
+        let enabled_from_seven = approved_blob(StartupToggle::Enable, Some(0x07), filetime);
+        assert_eq!(
+            u32::from_le_bytes(enabled_from_seven[..4].try_into().unwrap()),
+            0x06
+        );
+        assert_eq!(&enabled_from_seven[4..], &[0; 8]);
+        assert_eq!(
+            state_from_approved(Some(&enabled_from_seven)),
+            StartupEnabledState::Enabled
+        );
+
+        assert_eq!(
+            toggled_approved_flag(Some(0x02), StartupToggle::Disable),
+            0x03
+        );
+        assert_eq!(
+            toggled_approved_flag(Some(0x03), StartupToggle::Enable),
+            0x02
+        );
+        assert_eq!(toggled_approved_flag(None, StartupToggle::Disable), 0x03);
+        assert_eq!(toggled_approved_flag(None, StartupToggle::Enable), 0x02);
+        assert_eq!(
+            toggled_approved_flag(Some(0x01), StartupToggle::Enable),
+            0x02
+        );
+        assert_eq!(
+            toggled_approved_flag(Some(0x07), StartupToggle::Disable),
+            0x07
+        );
+    }
+
+    #[test]
+    fn a_failed_source_keeps_its_previous_rows_and_marks_them_retained() {
+        let previous = [
+            (StartupSource::CurrentUserRun, "OneDrive"),
+            (StartupSource::LocalMachineRun, "SecurityHealth"),
+            (StartupSource::LocalMachineWowRun, "Legacy"),
+        ];
+        let fresh = vec![
+            (StartupSource::CurrentUserRun, "OneDrive"),
+            (StartupSource::CurrentUserStartupFolder, "Widget.lnk"),
+        ];
+        let merged = merge_partial_rows(
+            &previous,
+            fresh,
+            &[
+                StartupSource::LocalMachineRun,
+                StartupSource::LocalMachineRun,
+            ],
+            |row| row.0,
+        );
+        assert_eq!(
+            merged,
+            vec![
+                ((StartupSource::CurrentUserRun, "OneDrive"), false),
+                (
+                    (StartupSource::CurrentUserStartupFolder, "Widget.lnk"),
+                    false
+                ),
+                ((StartupSource::LocalMachineRun, "SecurityHealth"), true),
+            ]
+        );
+
+        let replaced = merge_partial_rows(
+            &previous,
+            vec![(StartupSource::LocalMachineRun, "New")],
+            &[],
+            |row| row.0,
+        );
+        assert_eq!(
+            replaced,
+            vec![((StartupSource::LocalMachineRun, "New"), false)]
+        );
+        assert!(
+            merge_partial_rows(
+                &[],
+                vec![(StartupSource::CurrentUserRun, "OneDrive")],
+                &[StartupSource::LocalMachineRun],
+                |row| row.0,
+            )
+            .iter()
+            .all(|row| !row.1)
+        );
     }
 
     #[test]

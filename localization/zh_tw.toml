@@ -327,6 +327,8 @@ StartupEnableFailed = "無法啟用這個啟動項目。"
 StartupDisableFailed = "無法停用這個啟動項目。"
 StartupStateUnchanged = "這個啟動項目沒有進入要求的狀態。"
 StartupEntryMissing = "這個啟動項目已不存在。"
+StartupStaleStatus = "%s（未重新整理）"
+StartupPartialNotice = "部分啟動位置無法讀取。這些位置上已顯示的項目保持不變。"
 HresultPrefix = "HRESULT:"
 
 [menu_status_help]

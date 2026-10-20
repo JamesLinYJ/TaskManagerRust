@@ -330,6 +330,8 @@ StartupEnableFailed = "Die Autostart-App konnte nicht aktiviert werden."
 StartupDisableFailed = "Die Autostart-App konnte nicht deaktiviert werden."
 StartupStateUnchanged = "Die Autostart-App hat den angeforderten Zustand nicht erreicht."
 StartupEntryMissing = "Die Autostart-App ist nicht mehr vorhanden."
+StartupStaleStatus = "%s (nicht aktualisiert)"
+StartupPartialNotice = "Einige Autostart-Speicherorte konnten nicht gelesen werden. Einträge von diesen Speicherorten sind unverändert."
 HresultPrefix = "HRESULT:"
 
 [menu_status_help]

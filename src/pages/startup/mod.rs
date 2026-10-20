@@ -14,6 +14,7 @@ mod sampler;
 
 // 启动项页列出 Run 键和“启动”文件夹中的项目，并在后台 worker 上启用或禁用。
 // UI 线程只提交请求、维护列表选择和绘制。刷新保留来源加名称对应的选择、焦点和滚动位置。
+// 某个来源枚举失败时保留该来源上一轮的行，并把这些行和页面提示标成未刷新。
 // 启用和禁用不删除原项；写入结果读回不一致、项目已消失或 API 失败时立即显示错误。
 
 use std::mem::zeroed;
@@ -31,15 +32,16 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GWL_STYLE, GetClientRect,
-    GetDialogBaseUnits, GetDlgItem, GetWindowLongW, HMENU, MB_ICONERROR, MB_OK, MF_BYCOMMAND,
-    MF_ENABLED, MF_GRAYED, MessageBoxW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SendMessageW, SetWindowLongW, TPM_RETURNCMD, TrackPopupMenuEx, WM_SETREDRAW,
+    GetDialogBaseUnits, GetDlgItem, GetWindowLongW, HMENU, IsWindowVisible, MB_ICONERROR, MB_OK,
+    MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetWindowLongW, SetWindowTextW, ShowWindow,
+    TPM_RETURNCMD, TrackPopupMenuEx, WM_SETREDRAW,
 };
 
 use crate::config::options::Options;
 use crate::infrastructure::diagnostics::Field;
 use crate::infrastructure::native::{
-    copy_text_to_callback_buffer, finish_list_view_update, loword,
+    copy_text_to_callback_buffer, finish_list_view_update, format_resource_string, loword,
     record_hresult_error_with_fields, record_win32_error, record_win32_error_with_fields,
     subclass_list_view, to_wide_null, window_rect_relative_to_page,
 };
@@ -47,15 +49,15 @@ use crate::infrastructure::worker::SingleFlightWorker;
 use crate::ui::localization::{TextKey, startup_column_titles, text};
 use crate::ui::menus::build_popup_menu;
 use crate::ui::resource_ids::{
-    IDC_STARTUPLIST, IDM_STARTUP_DISABLE, IDM_STARTUP_ENABLE, IDR_STARTUP_CONTEXT,
-    PWM_STARTUP_WORKER_COMPLETE,
+    IDC_STARTUP_NOTICE, IDC_STARTUPLIST, IDM_STARTUP_DISABLE, IDM_STARTUP_ENABLE,
+    IDR_STARTUP_CONTEXT, PWM_STARTUP_WORKER_COMPLETE,
 };
 
 pub(crate) use self::model::StartupCommandState;
 use self::model::{
     StartupActionFailure, StartupEnabledState, StartupEntryId, StartupRequest, StartupScrollPolicy,
-    StartupToggle, command_state, display_name, merge_startup_requests, publisher_or_command,
-    refresh_scroll_policy, retained_startup_id,
+    StartupToggle, command_state, display_name, merge_partial_rows, merge_startup_requests,
+    publisher_or_command, refresh_scroll_policy, retained_startup_id,
 };
 use self::sampler::{
     StartupCollection, StartupQueryFailure, StartupRefreshFailure, StartupWorkerCompletion, perform,
@@ -65,6 +67,7 @@ const DEFSPACING_BASE: i32 = 3;
 const DLG_SCALE_X: i32 = 4;
 const COLUMN_COUNT: usize = 4;
 
+#[derive(Clone)]
 struct StartupRow {
     id: StartupEntryId,
     name: String,
@@ -76,6 +79,8 @@ struct StartupRow {
     state: StartupEnabledState,
     state_text: String,
     state_sort: String,
+    /// True when this row was kept because its source failed the latest enumeration.
+    stale: bool,
 }
 
 pub struct StartupPageState {
@@ -277,18 +282,40 @@ impl StartupPageState {
                 EndDeferWindowPos(hdwp);
                 return;
             }
+            let notice = GetDlgItem(self.hwnd, IDC_STARTUP_NOTICE);
+            let notice_visible = !notice.is_null() && IsWindowVisible(notice) != 0;
             let anchor_rect = window_rect_relative_to_page(anchor, self.hwnd);
             let dx = (parent_rect.right - def_spacing * 2) - anchor_rect.right;
             let dy = (parent_rect.bottom - def_spacing * 2) - anchor_rect.bottom;
             let list_rect = window_rect_relative_to_page(list, self.hwnd);
+            let list_width = (anchor_rect.right - list_rect.left + dx).max(0);
+            let button_top = anchor_rect.top + dy;
+            let list_bottom = if notice_visible {
+                let notice_rect = window_rect_relative_to_page(notice, self.hwnd);
+                let notice_height = (notice_rect.bottom - notice_rect.top).max(def_spacing);
+                let notice_top = button_top - def_spacing - notice_height;
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    notice,
+                    std::ptr::null_mut(),
+                    list_rect.left,
+                    notice_top,
+                    list_width,
+                    notice_height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                notice_top - def_spacing
+            } else {
+                button_top - def_spacing
+            };
             hdwp = DeferWindowPos(
                 hdwp,
                 list,
                 std::ptr::null_mut(),
                 0,
                 0,
-                (anchor_rect.right - list_rect.left + dx).max(0),
-                (anchor_rect.top - list_rect.top + dy - def_spacing).max(0),
+                list_width,
+                (list_bottom - list_rect.top).max(0),
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
             for control_id in [
@@ -419,8 +446,9 @@ impl StartupPageState {
         let Some(row) = self.rows.iter_mut().find(|row| row.id.matches(id)) else {
             return;
         };
-        let state_text = state_text(state).to_string();
+        let state_text = status_label(state, false);
         row.state = state;
+        row.stale = false;
         row.state_sort = state_text.to_lowercase();
         row.state_text = state_text;
         self.sort_rows();
@@ -446,7 +474,16 @@ impl StartupPageState {
         self.last_row_errors = collection.row_errors;
         self.last_source_errors = collection.source_errors;
         let previous = self.selected.clone();
-        self.rows = collection.entries.into_iter().map(startup_row).collect();
+        let omitted = collection.omitted_sources;
+        let fresh = collection.entries.into_iter().map(startup_row).collect();
+        self.rows = merge_partial_rows(&self.rows, fresh, &omitted, |row| row.id.source)
+            .into_iter()
+            .map(|(mut row, retained)| {
+                apply_row_status(&mut row, retained);
+                row
+            })
+            .collect();
+        self.set_partial_notice(!omitted.is_empty());
         self.sort_rows();
         self.selected =
             retained_startup_id(previous.as_ref(), self.rows.iter().map(|row| &row.id)).cloned();
@@ -640,6 +677,50 @@ impl StartupPageState {
         if let Some(error) = self.last_source_errors.first().copied() {
             self.last_refresh_error = Some(error.failure);
         }
+        let changed = self.mark_rows_stale();
+        let notice_changed = self.set_partial_notice(true);
+        if changed || notice_changed {
+            self.rebuild_list(refresh_scroll_policy());
+        }
+    }
+
+    fn mark_rows_stale(&mut self) -> bool {
+        let mut changed = false;
+        for row in &mut self.rows {
+            if !row.stale {
+                apply_row_status(row, true);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Shows or hides the page notice. Returns whether visibility changed.
+    fn set_partial_notice(&self, partial: bool) -> bool {
+        // SAFETY: the notice is a child of this page. The text buffer lives for SetWindowTextW.
+        unsafe {
+            if self.hwnd.is_null() {
+                return false;
+            }
+            let notice = GetDlgItem(self.hwnd, IDC_STARTUP_NOTICE);
+            if notice.is_null() {
+                return false;
+            }
+            let message = if partial {
+                text(TextKey::StartupPartialNotice)
+            } else {
+                ""
+            };
+            let wide = to_wide_null(message);
+            SetWindowTextW(notice, wide.as_ptr());
+            let was_visible = IsWindowVisible(notice) != 0;
+            if was_visible == partial {
+                return false;
+            }
+            ShowWindow(notice, if partial { SW_SHOW } else { SW_HIDE });
+            self.size_page();
+            true
+        }
     }
 
     fn record_source_errors(&self, errors: &[self::sampler::StartupSourceError]) {
@@ -675,7 +756,7 @@ impl StartupPageState {
 fn startup_row(record: self::sampler::StartupRecord) -> StartupRow {
     let name = display_name(record.id.source, &record.id.name);
     let detail = publisher_or_command(record.publisher.as_deref(), &record.command);
-    let state_text = state_text(record.state).to_string();
+    let state_text = status_label(record.state, false);
     StartupRow {
         name_sort: name.to_lowercase(),
         name,
@@ -686,7 +767,24 @@ fn startup_row(record: self::sampler::StartupRecord) -> StartupRow {
         state: record.state,
         state_sort: state_text.to_lowercase(),
         state_text,
+        stale: false,
         id: record.id,
+    }
+}
+
+fn apply_row_status(row: &mut StartupRow, stale: bool) {
+    let state_text = status_label(row.state, stale);
+    row.stale = stale;
+    row.state_sort = state_text.to_lowercase();
+    row.state_text = state_text;
+}
+
+fn status_label(state: StartupEnabledState, stale: bool) -> String {
+    let base = state_text(state);
+    if stale {
+        format_resource_string(text(TextKey::StartupStaleStatus), &[base.to_string()])
+    } else {
+        base.to_string()
     }
 }
 

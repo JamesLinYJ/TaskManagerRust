@@ -330,6 +330,8 @@ StartupEnableFailed = "Impossible d'activer l'application de démarrage."
 StartupDisableFailed = "Impossible de désactiver l'application de démarrage."
 StartupStateUnchanged = "L'application de démarrage n'a pas atteint l'état demandé."
 StartupEntryMissing = "L'application de démarrage n'est plus présente."
+StartupStaleStatus = "%s (non actualisé)"
+StartupPartialNotice = "Certains emplacements de démarrage n'ont pas pu être lus. Les entrées de ces emplacements sont inchangées."
 HresultPrefix = "HRESULT :"
 
 [menu_status_help]

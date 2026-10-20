@@ -339,4 +339,6 @@ pub enum TextKey {
     StartupStateUnchanged,
     StartupEntryMissing,
     HresultPrefix,
+    StartupStaleStatus,
+    StartupPartialNotice,
 }

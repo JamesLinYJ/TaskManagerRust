@@ -13,9 +13,13 @@
 //!
 //! The page worker owns every registry key and find handle. Enumeration reads the native
 //! 64-bit registry view, including the explicit WOW6432Node Run key. Enable and disable rewrite
-//! only the 12-byte StartupApproved value and then read it back. The Run value and the Startup
-//! folder file are checked before and after that write so a missing entry is never reported as
-//! a successful change.
+//! only the 12-byte StartupApproved value and then read it back, keeping the 2/3 family distinct
+//! from the 6/7 family. The Run value and the Startup folder file are checked before and after
+//! that write so a missing entry is never reported as a successful change.
+//!
+//! A source that fails to enumerate is listed in `omitted_sources` and contributes no rows.
+//! The page keeps the previous rows for that source. The snapshot is an error only when every
+//! source fails.
 
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
@@ -47,9 +51,9 @@ use crate::infrastructure::native::{to_wide_null, widestr_ptr_to_string};
 
 use super::model::{
     StartupActionFailure, StartupEnabledState, StartupEntryId, StartupSource, StartupToggle,
-    approved_blob, classify_startup_result, executable_candidate, has_version_resource_extension,
-    is_absolute_win32_path, registry_value_name_is_safe, startup_file_name_is_safe,
-    state_from_approved,
+    approved_blob, approved_flag, classify_startup_result, executable_candidate,
+    has_version_resource_extension, is_absolute_win32_path, registry_value_name_is_safe,
+    startup_file_name_is_safe, state_from_approved,
 };
 
 const VALUE_ENUM_LIMIT: u32 = 4_096;
@@ -103,6 +107,8 @@ pub(super) struct StartupCollection {
     pub(super) entries: Vec<StartupRecord>,
     pub(super) row_errors: Vec<StartupRowError>,
     pub(super) source_errors: Vec<StartupSourceError>,
+    /// Sources that produced no rows because enumeration failed.
+    pub(super) omitted_sources: Vec<StartupSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +199,7 @@ fn collect_startup_entries() -> Result<StartupCollection, StartupRefreshFailure>
     let mut entries = Vec::new();
     let mut row_errors = Vec::new();
     let mut source_errors = Vec::new();
+    let mut omitted_sources = Vec::new();
     let mut any_success = false;
 
     for source in StartupSource::ALL {
@@ -203,7 +210,10 @@ fn collect_startup_entries() -> Result<StartupCollection, StartupRefreshFailure>
                 row_errors.append(&mut part.row_errors);
                 source_errors.append(&mut part.source_errors);
             }
-            Err(failure) => source_errors.push(StartupSourceError { source, failure }),
+            Err(failure) => {
+                source_errors.push(StartupSourceError { source, failure });
+                omitted_sources.push(source);
+            }
         }
     }
 
@@ -223,6 +233,7 @@ fn collect_startup_entries() -> Result<StartupCollection, StartupRefreshFailure>
         entries,
         row_errors,
         source_errors,
+        omitted_sources,
     })
 }
 
@@ -484,12 +495,17 @@ fn write_and_read_approved(
 ) -> Result<StartupEnabledState, StartupActionFailure> {
     let key = create_key(registry_root(id.source), id.source.approved_key())
         .map_err(StartupActionFailure::Win32)?;
+    let current_flag = match query_value_bytes(key.raw(), &id.name) {
+        Ok(Some(bytes)) => approved_flag(&bytes),
+        Ok(None) => None,
+        Err(code) => return Err(StartupActionFailure::Win32(code)),
+    };
     let filetime = if toggle.enables() {
         0
     } else {
         system_filetime_100ns()
     };
-    let blob = approved_blob(toggle, filetime);
+    let blob = approved_blob(toggle, current_flag, filetime);
     set_binary_value(key.raw(), &id.name, &blob).map_err(StartupActionFailure::Win32)?;
     match query_value_bytes(key.raw(), &id.name) {
         Ok(Some(bytes)) => Ok(state_from_approved(Some(&bytes))),

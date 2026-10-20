@@ -330,6 +330,8 @@ StartupEnableFailed = "Не удалось включить приложение
 StartupDisableFailed = "Не удалось отключить приложение автозагрузки."
 StartupStateUnchanged = "Приложение автозагрузки не перешло в запрошенное состояние."
 StartupEntryMissing = "Приложение автозагрузки больше не существует."
+StartupStaleStatus = "%s (не обновлено)"
+StartupPartialNotice = "Некоторые расположения автозагрузки не удалось прочитать. Записи из этих расположений не изменились."
 HresultPrefix = "HRESULT:"
 
 [menu_status_help]

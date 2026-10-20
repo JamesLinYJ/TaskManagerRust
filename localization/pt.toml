@@ -330,6 +330,8 @@ StartupEnableFailed = "Não foi possível ativar o aplicativo de inicialização
 StartupDisableFailed = "Não foi possível desativar o aplicativo de inicialização."
 StartupStateUnchanged = "O aplicativo de inicialização não entrou no estado solicitado."
 StartupEntryMissing = "O aplicativo de inicialização não está mais presente."
+StartupStaleStatus = "%s (não atualizado)"
+StartupPartialNotice = "Não foi possível ler alguns locais de inicialização. As entradas desses locais permanecem inalteradas."
 HresultPrefix = "HRESULT:"
 
 [menu_status_help]

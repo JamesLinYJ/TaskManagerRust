@@ -43,6 +43,7 @@ const SBS_VERT_STYLE: u32 = SBS_VERT as u32;
 const CBS_DROPDOWNLIST_STYLE: u32 = CBS_DROPDOWNLIST as u32;
 const SS_RIGHT_STYLE: u32 = 0x0000_0002;
 const SS_ENDELLIPSIS_STYLE: u32 = 0x0000_4000;
+const SS_NOPREFIX_STYLE: u32 = 0x0000_0080;
 const DIALOG_FONT_NAME: &str = "MS Shell Dlg";
 const DIALOG_FONT_SIZE: u16 = 8;
 const CPU_LABELS: [&str; 64] = [
@@ -1095,6 +1096,17 @@ fn build_startup_dialog() -> DialogSpec<'static> {
                 y: 9,
                 cx: 376,
                 cy: 131,
+            },
+            ControlSpec {
+                class_name: "Static",
+                text: "",
+                id: IDC_STARTUP_NOTICE as u16,
+                style: WS_CHILD | SS_NOPREFIX_STYLE | SS_ENDELLIPSIS_STYLE,
+                ex_style: 0,
+                x: 9,
+                y: 128,
+                cx: 250,
+                cy: 8,
             },
             button("&Enable", IDM_STARTUP_ENABLE as i32, 0, 268, 144, 50, 14),
             button(
