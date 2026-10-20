@@ -35,6 +35,7 @@ pub const PWM_GPU_METADATA_WORKER_COMPLETE: u32 = 0x0400 + 23;
 pub const PWM_DIAGNOSTIC_EXPORT_COMPLETE: u32 = 0x0400 + 24;
 pub const PWM_SERVICE_WORKER_COMPLETE: u32 = 0x0400 + 25;
 pub const PWM_NEWTASK_COMPLETE: u32 = 0x0400 + 26;
+pub const PWM_PROC_DUMP_COMPLETE: u32 = 0x0400 + 27;
 
 // 顶层窗口、菜单和对话框模板 ID。
 pub const IDD_MAINWND: u16 = 105;
@@ -375,6 +376,7 @@ pub const IDM_SERVICE_GOTOPROCESS: u16 = 40122;
 pub const IDM_PROC_TREE: u16 = 40130;
 pub const IDM_PROC_EXPAND: u16 = 40131;
 pub const IDM_PROC_COLLAPSE: u16 = 40132;
+pub const IDM_PROC_DUMP: u16 = 40140;
 
 pub const IDC_NEXTTAB: u16 = 40100;
 pub const IDC_PREVTAB: u16 = 40101;

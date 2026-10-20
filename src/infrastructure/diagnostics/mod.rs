@@ -19,6 +19,8 @@ mod archive;
 mod crash;
 mod secure_fs;
 
+pub(crate) use crash::{release_dbghelp_dump, try_acquire_dbghelp_dump};
+
 use std::cell::Cell;
 use std::env;
 use std::ffi::{OsStr, OsString};

@@ -197,6 +197,7 @@ ProcessTree = "&Дерево процессов"
 ExpandProcess = "&Развернуть"
 CollapseProcess = "&Свернуть"
 OpenFileLocation = "Open File &Location"
+CreateDumpFile = "Создать файл дампа (&F)"
 Debug = "&Отладка"
 SetPriority = "Задать &приоритет"
 Realtime = "&Реального времени"
@@ -289,6 +290,10 @@ NotResponding = "Не отвечает"
 Running = "Работает"
 MessageCouldNotBeSent = "Сообщение не удалось отправить."
 UnableToOpenFileLocation = "Unable to Open File Location"
+UnableToCreateDumpFile = "Не удалось создать файл дампа"
+DumpFileCreated = "Файл дампа создан."
+DumpFileFilter = "Файлы дампа"
+DumpCleanupFailed = "Не удалось удалить временный файл дампа."
 KillProcessTreePrompt = """This operation will attempt to terminate this process and any
 processes which were directly or indirectly started by it.
 
@@ -368,3 +373,4 @@ IDM_SERVICE_GOTOPROCESS = "Выбирает процесс службы на с�
 IDM_PROC_TREE = "Группирует процессы под родительским процессом, который их создал"
 IDM_PROC_EXPAND = "Показывает дочерние процессы выбранного элемента"
 IDM_PROC_COLLAPSE = "Скрывает дочерние процессы выбранного элемента"
+IDM_PROC_DUMP = "Записывает полный дамп памяти этого процесса в выбранный файл"
