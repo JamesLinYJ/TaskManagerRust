@@ -57,6 +57,8 @@ pub(crate) enum ServiceStartupType {
 pub(crate) enum ServiceControlAction {
     Start,
     Stop,
+    Pause,
+    Continue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +74,8 @@ pub(crate) enum ServiceRequest {
 pub(crate) struct ServiceCommandState {
     pub(crate) start: bool,
     pub(crate) stop: bool,
+    pub(crate) pause: bool,
+    pub(crate) continue_service: bool,
     pub(crate) go_to_process: bool,
 }
 
@@ -80,6 +84,8 @@ impl ServiceCommandState {
         Self {
             start: false,
             stop: false,
+            pause: false,
+            continue_service: false,
             go_to_process: false,
         }
     }
@@ -144,6 +150,8 @@ pub(crate) fn command_state(selected: Option<ServiceCommandInput>) -> ServiceCom
             selected.status,
             ServiceRunState::Running | ServiceRunState::Paused
         ),
+        pause: selected.status == ServiceRunState::Running,
+        continue_service: selected.status == ServiceRunState::Paused,
         go_to_process: selected.process.is_some_and(ProcIdentity::is_verified),
     }
 }
@@ -160,6 +168,14 @@ pub(crate) fn control_reached_requested_state(
         ServiceControlAction::Stop => matches!(
             state,
             ServiceRunState::Stopped | ServiceRunState::StopPending
+        ),
+        ServiceControlAction::Pause => matches!(
+            state,
+            ServiceRunState::Paused | ServiceRunState::PausePending
+        ),
+        ServiceControlAction::Continue => matches!(
+            state,
+            ServiceRunState::Running | ServiceRunState::ContinuePending
         ),
     }
 }
@@ -274,6 +290,8 @@ mod tests {
         )));
         assert!(stopped.start);
         assert!(!stopped.stop);
+        assert!(!stopped.pause);
+        assert!(!stopped.continue_service);
         assert!(!stopped.go_to_process);
 
         let disabled = command_state(Some(input(
@@ -290,6 +308,8 @@ mod tests {
         )));
         assert!(!running.start);
         assert!(running.stop);
+        assert!(running.pause);
+        assert!(!running.continue_service);
         assert!(!running.go_to_process);
 
         let verified = command_state(Some(input(
@@ -298,6 +318,8 @@ mod tests {
             Some(ProcIdentity::new(44, 100)),
         )));
         assert!(verified.stop);
+        assert!(!verified.pause);
+        assert!(verified.continue_service);
         assert!(verified.go_to_process);
 
         let pending = command_state(Some(input(
@@ -307,7 +329,45 @@ mod tests {
         )));
         assert!(!pending.start);
         assert!(!pending.stop);
+        assert!(!pending.pause);
+        assert!(!pending.continue_service);
         assert!(pending.go_to_process);
+    }
+
+    #[test]
+    fn pause_and_continue_require_the_matching_state() {
+        assert!(control_reached_requested_state(
+            ServiceControlAction::Pause,
+            ServiceRunState::PausePending
+        ));
+        assert!(control_reached_requested_state(
+            ServiceControlAction::Pause,
+            ServiceRunState::Paused
+        ));
+        assert!(!control_reached_requested_state(
+            ServiceControlAction::Pause,
+            ServiceRunState::Running
+        ));
+        assert!(control_reached_requested_state(
+            ServiceControlAction::Continue,
+            ServiceRunState::ContinuePending
+        ));
+        assert!(control_reached_requested_state(
+            ServiceControlAction::Continue,
+            ServiceRunState::Running
+        ));
+        assert!(!control_reached_requested_state(
+            ServiceControlAction::Continue,
+            ServiceRunState::Paused
+        ));
+        assert_eq!(
+            classify_control_result(ServiceControlAction::Pause, Ok(ServiceRunState::Paused)),
+            Ok(ServiceRunState::Paused)
+        );
+        assert_eq!(
+            classify_control_result(ServiceControlAction::Continue, Ok(ServiceRunState::Running)),
+            Ok(ServiceRunState::Running)
+        );
     }
 
     #[test]

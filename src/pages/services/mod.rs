@@ -12,7 +12,7 @@
 mod model;
 mod sampler;
 
-// 服务页列出本机 Win32 服务，并在后台 worker 上启动或停止服务。
+// 服务页列出本机 Win32 服务，并在后台 worker 上启动、停止、暂停或继续服务。
 // UI 线程只提交请求、维护列表选择和绘制。刷新保留服务名对应的选择、焦点和滚动位置。
 // “转到进程”只使用带创建时间的 ProcIdentity；没有校验过的进程时该命令保持禁用。
 
@@ -47,8 +47,9 @@ use crate::system::process_identity::{FindProcPayload, ProcIdentity, find_proc_l
 use crate::ui::localization::{TextKey, service_column_titles, text};
 use crate::ui::menus::build_popup_menu;
 use crate::ui::resource_ids::{
-    IDC_SERVICELIST, IDM_SERVICE_GOTOPROCESS, IDM_SERVICE_START, IDM_SERVICE_STOP,
-    IDR_SERVICE_CONTEXT, PWM_SERVICE_WORKER_COMPLETE, WM_FINDPROC,
+    IDC_SERVICELIST, IDM_SERVICE_CONTINUE, IDM_SERVICE_GOTOPROCESS, IDM_SERVICE_PAUSE,
+    IDM_SERVICE_START, IDM_SERVICE_STOP, IDR_SERVICE_CONTEXT, PWM_SERVICE_WORKER_COMPLETE,
+    WM_FINDPROC,
 };
 
 pub(crate) use self::model::ServiceCommandState;
@@ -174,6 +175,14 @@ impl ServicePageState {
                 self.request_control(ServiceControlAction::Stop);
                 true
             }
+            IDM_SERVICE_PAUSE => {
+                self.request_control(ServiceControlAction::Pause);
+                true
+            }
+            IDM_SERVICE_CONTINUE => {
+                self.request_control(ServiceControlAction::Continue);
+                true
+            }
             IDM_SERVICE_GOTOPROCESS => {
                 self.go_to_process();
                 true
@@ -249,6 +258,8 @@ impl ServicePageState {
         unsafe {
             enable_command(popup.as_raw(), IDM_SERVICE_START, state.start);
             enable_command(popup.as_raw(), IDM_SERVICE_STOP, state.stop);
+            enable_command(popup.as_raw(), IDM_SERVICE_PAUSE, state.pause);
+            enable_command(popup.as_raw(), IDM_SERVICE_CONTINUE, state.continue_service);
             enable_command(popup.as_raw(), IDM_SERVICE_GOTOPROCESS, state.go_to_process);
             let command = TrackPopupMenuEx(
                 popup.as_raw(),
@@ -301,6 +312,8 @@ impl ServicePageState {
             for control_id in [
                 i32::from(IDM_SERVICE_START),
                 i32::from(IDM_SERVICE_STOP),
+                i32::from(IDM_SERVICE_PAUSE),
+                i32::from(IDM_SERVICE_CONTINUE),
                 i32::from(IDM_SERVICE_GOTOPROCESS),
             ] {
                 let control = GetDlgItem(self.hwnd, control_id);
@@ -350,6 +363,8 @@ impl ServicePageState {
         let allowed = match action {
             ServiceControlAction::Start => state.start,
             ServiceControlAction::Stop => state.stop,
+            ServiceControlAction::Pause => state.pause,
+            ServiceControlAction::Continue => state.continue_service,
         };
         let Some(service_name) = self.selected_service.clone() else {
             self.beep();
@@ -603,6 +618,8 @@ impl ServicePageState {
         let state = self.command_state();
         enable_button(self.hwnd, IDM_SERVICE_START, state.start);
         enable_button(self.hwnd, IDM_SERVICE_STOP, state.stop);
+        enable_button(self.hwnd, IDM_SERVICE_PAUSE, state.pause);
+        enable_button(self.hwnd, IDM_SERVICE_CONTINUE, state.continue_service);
         enable_button(self.hwnd, IDM_SERVICE_GOTOPROCESS, state.go_to_process);
     }
 
@@ -639,6 +656,8 @@ impl ServicePageState {
         let summary = match action {
             ServiceControlAction::Start => text(TextKey::ServiceStartFailed),
             ServiceControlAction::Stop => text(TextKey::ServiceStopFailed),
+            ServiceControlAction::Pause => text(TextKey::ServicePauseFailed),
+            ServiceControlAction::Continue => text(TextKey::ServiceContinueFailed),
         };
         let body = match failure {
             ServiceActionFailure::Api(code) => {
