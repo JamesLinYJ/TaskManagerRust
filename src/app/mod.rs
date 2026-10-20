@@ -191,6 +191,7 @@ pub struct App {
     last_cpu_topology_error: Option<CpuTopologyError>,
     last_system_worker_error: Option<u32>,
     window_mode: WindowModeController,
+    session_always_on_top: bool,
     min_width: i32,
     min_height: i32,
     already_applied_initial_position: bool,
@@ -400,6 +401,7 @@ impl App {
             last_cpu_topology_error: None,
             last_system_worker_error: None,
             window_mode: WindowModeController::default(),
+            session_always_on_top: false,
             min_width: 0,
             min_height: 0,
             already_applied_initial_position: false,
@@ -805,19 +807,7 @@ impl App {
                 ],
             );
 
-            SetWindowPos(
-                hwnd,
-                if self.options.always_on_top() {
-                    HWND_TOPMOST
-                } else {
-                    HWND_NOTOPMOST
-                },
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE,
-            );
+            self.apply_session_always_on_top(hwnd);
 
             if let Err(error) = self.create_status_bar() {
                 self.initialization_error = Some(error);
@@ -1157,7 +1147,7 @@ impl App {
             );
         }
 
-        self.check_menu(menu, IDM_ALWAYSONTOP, self.options.always_on_top());
+        self.check_menu(menu, IDM_ALWAYSONTOP, self.session_always_on_top);
         self.check_menu(menu, IDM_MINIMIZEONUSE, self.options.minimize_on_use());
         self.check_menu(menu, IDM_CONFIRMATIONS, self.options.confirmations());
         self.check_menu(menu, IDM_KERNELTIMES, self.options.kernel_times());
@@ -1222,6 +1212,27 @@ impl App {
                 menu,
                 u32::from(item_id),
                 MF_BYCOMMAND | if checked { MF_CHECKED } else { MF_UNCHECKED },
+            );
+        }
+    }
+
+    fn apply_session_always_on_top(&self, hwnd: HWND) {
+        // Session-only WS_EX_TOPMOST. SetWindowPos is the documented way to set or clear it.
+        // The choice is not written into Options.
+        // Safety: hwnd is the main window owned by this App on the UI thread.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                if self.session_always_on_top {
+                    HWND_TOPMOST
+                } else {
+                    HWND_NOTOPMOST
+                },
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE,
             );
         }
     }
@@ -1822,24 +1833,12 @@ impl App {
     }
 
     fn show_running_instance(&self) {
-        // 恢复窗口时顺带重新应用 topmost 状态，保持和当前选项一致。
+        // 恢复窗口时重新应用本会话的置顶状态。
         // 安全性: operations target the main HWND owned by this App.
         unsafe {
             OpenIcon(self.main_hwnd);
             SetForegroundWindow(self.main_hwnd);
-            SetWindowPos(
-                self.main_hwnd,
-                if self.options.always_on_top() {
-                    HWND_TOPMOST
-                } else {
-                    HWND_NOTOPMOST
-                },
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE,
-            );
+            self.apply_session_always_on_top(self.main_hwnd);
         }
     }
 
@@ -1875,7 +1874,7 @@ impl App {
                         SetMenuDefaultItem(popup_handle, u32::from(IDM_RESTORETASKMAN), 0);
                     }
 
-                    self.check_menu(popup_handle, IDM_ALWAYSONTOP, self.options.always_on_top());
+                    self.check_menu(popup_handle, IDM_ALWAYSONTOP, self.session_always_on_top);
                     SetForegroundWindow(self.main_hwnd);
                     self.menu.enter_popup();
                     let command = TrackPopupMenuEx(
@@ -2023,7 +2022,7 @@ impl App {
         unsafe {
             if self.menu.can_temporarily_hide()
                 && !self.window_mode.is_temporarily_hidden()
-                && self.options.always_on_top()
+                && self.session_always_on_top
             {
                 ShowWindow(hwnd, SW_HIDE);
                 SetCapture(hwnd);
@@ -2099,21 +2098,8 @@ impl App {
                     self.switch_tabs(command_id == IDC_NEXTTAB);
                 }
                 IDM_ALWAYSONTOP => {
-                    let always_on_top = !self.options.always_on_top();
-                    self.options.set_always_on_top(always_on_top);
-                    SetWindowPos(
-                        hwnd,
-                        if always_on_top {
-                            HWND_TOPMOST
-                        } else {
-                            HWND_NOTOPMOST
-                        },
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE,
-                    );
+                    self.session_always_on_top = !self.session_always_on_top;
+                    self.apply_session_always_on_top(hwnd);
                     self.update_menu_states();
                 }
                 IDM_HIDEWHENMIN => {
