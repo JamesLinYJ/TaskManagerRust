@@ -9,6 +9,7 @@
 // --------------------------------------------------------------------------
 
 mod actions;
+mod dump;
 mod model;
 mod sampler;
 mod tree;
@@ -20,6 +21,8 @@ mod tree;
 // 线程模型：
 //   SingleFlightWorker 工作线程在后台执行 collect_process_entries() 采样，
 //   UI 线程只提交刷新意图并异步提交结果；CPU delta 基线由 worker 独占。
+//   创建转储文件使用另一个 SingleFlightWorker。保存对话框留在 UI 线程，
+//   MiniDumpWriteDump 在该 worker 上执行，不与采样请求合并。
 //
 // 缓存失效策略：
 //   previous_samples (HashMap) 只在完整采样成功后由 worker 整体替换，供下轮
@@ -214,6 +217,8 @@ struct ProcessStrings {
     cant_change_priority: String,
     cant_set_affinity: String,
     cant_open_file_location: String,
+    cant_create_dump: String,
+    dump_created: String,
     priority_low: String,
     priority_below_normal: String,
     priority_normal: String,
@@ -247,6 +252,7 @@ enum ProcCommand {
     TerminateTree,
     Debug,
     OpenFileLocation,
+    CreateDump,
     Affinity,
     SetPriority(ProcPriority),
     PickColumns,
@@ -294,6 +300,7 @@ impl ProcCommand {
             Self::TerminateTree => IDM_PROC_ENDTREE,
             Self::Debug => IDM_PROC_DEBUG,
             Self::OpenFileLocation => IDM_PROC_OPENFILELOCATION,
+            Self::CreateDump => IDM_PROC_DUMP,
             Self::Affinity => IDM_AFFINITY,
             Self::SetPriority(priority) => priority.command_id(),
             Self::PickColumns => IDM_PROCCOLS,
@@ -309,6 +316,7 @@ impl ProcCommand {
             IDM_PROC_ENDTREE => Some(Self::TerminateTree),
             id if id == IDC_DEBUG as u16 || id == IDM_PROC_DEBUG => Some(Self::Debug),
             IDM_PROC_OPENFILELOCATION => Some(Self::OpenFileLocation),
+            IDM_PROC_DUMP => Some(Self::CreateDump),
             IDM_AFFINITY => Some(Self::Affinity),
             IDM_PROC_LOW => Some(Self::SetPriority(ProcPriority::Low)),
             IDM_PROC_BELOWNORMAL => Some(Self::SetPriority(ProcPriority::BelowNormal)),
@@ -352,6 +360,7 @@ pub struct ProcessPageState {
     strings: ProcessStrings,
     pass_count: u64,
     worker: Option<SingleFlightWorker<ProcWorkerRequest, ProcWorkerResult>>,
+    dump_worker: Option<SingleFlightWorker<dump::ProcessDumpRequest, dump::ProcessDumpReport>>,
     last_refresh_error: Option<u32>,
     last_row_error: Option<u32>,
 }
@@ -380,6 +389,7 @@ impl Default for ProcessPageState {
             strings: ProcessStrings::default(),
             pass_count: 0,
             worker: None,
+            dump_worker: None,
             last_refresh_error: None,
             last_row_error: None,
         }
@@ -446,6 +456,7 @@ impl ProcessPageState {
                 return Err(windows_sys::Win32::Foundation::ERROR_INVALID_WINDOW_HANDLE);
             }
             self.start_worker_thread()?;
+            self.start_dump_worker()?;
             subclass_list_view(list_hwnd);
             let current_style = GetWindowLongW(list_hwnd, GWL_STYLE) as u32;
             SetWindowLongW(
@@ -493,6 +504,7 @@ impl ProcessPageState {
 
     pub fn destroy(&mut self) {
         self.stop_worker_thread();
+        self.stop_dump_worker();
         self.entries.clear();
         self.visible_rows.clear();
         self.collapsed.clear();
@@ -600,6 +612,11 @@ impl ProcessPageState {
             ProcCommand::OpenFileLocation => {
                 if let Some(identity) = self.current_selected_identity() {
                     self.open_file_location(identity);
+                }
+            }
+            ProcCommand::CreateDump => {
+                if let Some(identity) = self.current_selected_identity() {
+                    self.create_dump_file(identity);
                 }
             }
             ProcCommand::Affinity => {
@@ -730,6 +747,15 @@ impl ProcessPageState {
             (
                 ProcCommand::OpenFileLocation,
                 TextKey::OpenFileLocation,
+                if identity_verified {
+                    MenuItemState::ENABLED
+                } else {
+                    MenuItemState::disabled()
+                },
+            ),
+            (
+                ProcCommand::CreateDump,
+                TextKey::CreateDumpFile,
                 if identity_verified {
                     MenuItemState::ENABLED
                 } else {
@@ -877,6 +903,8 @@ impl ProcessPageState {
         self.strings.cant_change_priority = text(TextKey::UnableToChangePriority).to_string();
         self.strings.cant_set_affinity = text(TextKey::UnableToSetAffinity).to_string();
         self.strings.cant_open_file_location = text(TextKey::UnableToOpenFileLocation).to_string();
+        self.strings.cant_create_dump = text(TextKey::UnableToCreateDumpFile).to_string();
+        self.strings.dump_created = text(TextKey::DumpFileCreated).to_string();
         self.strings.priority_low = text(TextKey::Low).to_string();
         self.strings.priority_below_normal = text(TextKey::BelowNormal).to_string();
         self.strings.priority_normal = text(TextKey::Normal).to_string();

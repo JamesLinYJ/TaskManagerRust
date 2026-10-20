@@ -197,6 +197,7 @@ ProcessTree = "Árbol de &procesos"
 ExpandProcess = "&Expandir"
 CollapseProcess = "&Contraer"
 OpenFileLocation = "Open File &Location"
+CreateDumpFile = "Crear archivo de volcado (&F)"
 Debug = "&Depurar"
 SetPriority = "Establecer &prioridad"
 Realtime = "&Tiempo real"
@@ -289,6 +290,9 @@ NotResponding = "No responde"
 Running = "En ejecucion"
 MessageCouldNotBeSent = "No se pudo enviar el mensaje."
 UnableToOpenFileLocation = "Unable to Open File Location"
+UnableToCreateDumpFile = "No se puede crear el archivo de volcado"
+DumpFileCreated = "Se creó el archivo de volcado."
+DumpFileFilter = "Archivos de volcado"
 KillProcessTreePrompt = """This operation will attempt to terminate this process and any
 processes which were directly or indirectly started by it.
 
@@ -368,3 +372,4 @@ IDM_SERVICE_GOTOPROCESS = "Selecciona el proceso del servicio en la página Proc
 IDM_PROC_TREE = "Agrupa los procesos bajo el proceso primario que los creó"
 IDM_PROC_EXPAND = "Muestra los procesos secundarios de la selección"
 IDM_PROC_COLLAPSE = "Oculta los procesos secundarios de la selección"
+IDM_PROC_DUMP = "Escribe un volcado de memoria completo de este proceso en un archivo elegido"

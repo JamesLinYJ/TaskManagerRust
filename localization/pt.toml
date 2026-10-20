@@ -197,6 +197,7 @@ ProcessTree = "Árvore de &processos"
 ExpandProcess = "&Expandir"
 CollapseProcess = "&Recolher"
 OpenFileLocation = "Open File &Location"
+CreateDumpFile = "Criar arquivo de despejo (&F)"
 Debug = "&Depurar"
 SetPriority = "Definir &prioridade"
 Realtime = "&Tempo real"
@@ -289,6 +290,9 @@ NotResponding = "Nao esta respondendo"
 Running = "Em execucao"
 MessageCouldNotBeSent = "Nao foi possivel enviar a mensagem."
 UnableToOpenFileLocation = "Unable to Open File Location"
+UnableToCreateDumpFile = "Não foi possível criar o arquivo de despejo"
+DumpFileCreated = "O arquivo de despejo foi criado."
+DumpFileFilter = "Arquivos de despejo"
 KillProcessTreePrompt = """This operation will attempt to terminate this process and any
 processes which were directly or indirectly started by it.
 
@@ -368,3 +372,4 @@ IDM_SERVICE_GOTOPROCESS = "Seleciona o processo do serviço na página Processos
 IDM_PROC_TREE = "Agrupa os processos sob o processo pai que os criou"
 IDM_PROC_EXPAND = "Mostra os processos filhos da seleção"
 IDM_PROC_COLLAPSE = "Oculta os processos filhos da seleção"
+IDM_PROC_DUMP = "Grava um despejo de memória completo deste processo em um arquivo escolhido"
