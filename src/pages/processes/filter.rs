@@ -370,7 +370,7 @@ mod tests {
         let rows = sample();
         let view = plan(
             &rows,
-            "a",
+            "alp",
             Some(id(2)),
             Some(id(1)),
             None,
@@ -412,7 +412,7 @@ mod tests {
         let rows = sample();
         let view = plan(
             &rows,
-            "a",
+            "alp",
             None,
             None,
             None,

@@ -806,7 +806,8 @@ impl ProcessPageState {
         if !identity.is_verified() {
             return false;
         }
-        if !self.name_filter.is_empty() {
+        let cleared_filter = !self.name_filter.is_empty();
+        if cleared_filter {
             self.clear_name_filter();
         }
         if self.entries.iter().any(|entry| entry.identity == identity) {
@@ -816,7 +817,15 @@ impl ProcessPageState {
             true
         } else {
             self.pending_find_identity = Some(identity);
-            self.selected_identity = Some(identity);
+            if cleared_filter {
+                // The edit is already blank. Rebuild the committed snapshot
+                // before the worker runs, so a failed collection cannot leave
+                // the previous filtered rows under an empty filter.
+                let visible_selection = self.current_selected_identity();
+                self.rebuild_listview(visible_selection, None, ProcessViewUpdate::Refresh);
+            } else {
+                self.selected_identity = Some(identity);
+            }
             self.refresh_processes();
             true
         }
@@ -1005,32 +1014,41 @@ impl ProcessPageState {
         neighbor_hint: Option<ProcIdentity>,
         update: ProcessViewUpdate,
     ) {
-        unsafe {
-            // 进程列表使用 LVS_OWNERDATA。虚拟项只覆盖筛选后的行，隐藏行不会进入
-            // LVN_GETDISPINFOW，因此也不会被格式化。
-            let list_hwnd = self.list_hwnd();
-            if list_hwnd.is_null() {
-                return;
-            }
-            let rows = self
-                .entries
-                .iter()
-                .map(|entry| (entry.identity, entry.image_name_lower.as_str()))
-                .collect::<Vec<_>>();
-            let plan = plan_process_name_view(
-                &rows,
-                &self.name_filter,
-                self.selected_identity,
-                visible_selection,
-                neighbor_hint,
-                update,
+        // 进程列表使用 LVS_OWNERDATA。虚拟项只覆盖筛选后的行，隐藏行不会进入
+        // LVN_GETDISPINFOW，因此也不会被格式化。没有列表窗口时仍提交模型，避免
+        // 空白筛选和上一轮可见行长期不一致。
+        let rows = self
+            .entries
+            .iter()
+            .map(|entry| (entry.identity, entry.image_name_lower.as_str()))
+            .collect::<Vec<_>>();
+        let plan = plan_process_name_view(
+            &rows,
+            &self.name_filter,
+            self.selected_identity,
+            visible_selection,
+            neighbor_hint,
+            update,
+        );
+        let highlight_identity = plan.selected_list_index.and_then(|list_index| {
+            plan.visible_indices
+                .get(list_index)
+                .and_then(|&entry_index| self.entries.get(entry_index))
+                .map(|entry| entry.identity)
+        });
+        let list_hwnd = self.list_hwnd();
+        if list_hwnd.is_null() {
+            self.visible_rows.clone_from(&plan.visible_indices);
+            self.displayed_identities.clear();
+            self.displayed_identities.extend(
+                self.visible_rows
+                    .iter()
+                    .filter_map(|&index| self.entries.get(index).map(|entry| entry.identity)),
             );
-            let highlight_identity = plan.selected_list_index.and_then(|list_index| {
-                plan.visible_indices
-                    .get(list_index)
-                    .and_then(|&entry_index| self.entries.get(entry_index))
-                    .map(|entry| entry.identity)
-            });
+            self.selected_identity = plan.identity_cache;
+            return;
+        }
+        unsafe {
             let existing_count = SendMessageW(list_hwnd, LVM_GETITEMCOUNT, 0, 0) as usize;
             let structure_changed = existing_count != plan.visible_indices.len();
             let next_identities = plan
@@ -1526,8 +1544,8 @@ mod tests {
         merge_wts_process_identity, signed_kb_delta, system_time_delta, wts_identity_matches,
     };
     use super::{
-        ProcIdentity, ProcessPageState, SelectionScrollPolicy, refresh_selection_scroll_policy,
-        reorder_process_columns, write_process_column_layout,
+        ProcIdentity, ProcessNameFilter, ProcessPageState, SelectionScrollPolicy,
+        refresh_selection_scroll_policy, reorder_process_columns, write_process_column_layout,
     };
     use crate::config::options::{ColumnId, Options};
     use crate::system::process_identity::query_process_identity_for_pid;
@@ -1543,7 +1561,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
     use windows_sys::Win32::System::Threading::{
@@ -2078,6 +2097,38 @@ mod tests {
         assert_eq!(state.entries[0].image_name, "trusted.exe");
         assert_eq!(state.pass_count, 7);
         assert_eq!(state.last_refresh_error, Some(5));
+    }
+
+    #[test]
+    fn find_process_shows_the_committed_snapshot_before_refreshing_a_missing_target() {
+        let mut alpha = empty_process_entry("alpha.exe");
+        alpha.identity = ProcIdentity::new(1, 11);
+        alpha.pid = 1;
+        let mut bravo = empty_process_entry("bravo.exe");
+        bravo.identity = ProcIdentity::new(2, 22);
+        bravo.pid = 2;
+        let missing = ProcIdentity::new(9, 99);
+        let mut state = ProcessPageState {
+            entries: vec![alpha, bravo],
+            visible_rows: vec![1],
+            displayed_identities: vec![ProcIdentity::new(2, 22)],
+            name_filter: ProcessNameFilter::from_text("bravo"),
+            selected_identity: Some(ProcIdentity::new(2, 22)),
+            ..ProcessPageState::default()
+        };
+
+        assert!(state.find_process(missing));
+
+        assert!(state.name_filter.is_empty());
+        assert_eq!(state.visible_rows, vec![0, 1]);
+        assert_eq!(
+            state.displayed_identities,
+            vec![ProcIdentity::new(1, 11), ProcIdentity::new(2, 22)]
+        );
+        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.pending_find_identity, Some(missing));
+        assert_eq!(state.selected_identity, Some(ProcIdentity::new(2, 22)));
+        assert_eq!(state.last_refresh_error, Some(ERROR_BROKEN_PIPE));
     }
 
     #[test]
