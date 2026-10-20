@@ -11,6 +11,7 @@
 mod actions;
 mod model;
 mod sampler;
+mod tree;
 
 // 进程页实现。
 // 这里负责采集进程列表、计算每轮刷新之间的增量数据、维护排序状态，
@@ -24,12 +25,16 @@ mod sampler;
 //   previous_samples (HashMap) 只在完整采样成功后由 worker 整体替换，供下轮
 //   delta（CPU、内存、缺页）计算使用。失败不会推进基线。
 //   DirtyColumns / DirtyRowRange 作为行/列级脏标记，避免整表重绘。
-use std::collections::HashMap;
+//   进程树的父子边由 worker 在同一次快照里解析；UI 线程只布局、展开和绘制。
+use std::collections::{HashMap, HashSet};
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_GEN_FAILURE, ERROR_INVALID_DATA, HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM,
+    ERROR_GEN_FAILURE, ERROR_INVALID_DATA, HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM,
+};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetDC, GetTextExtentPoint32W, HGDIOBJ, ReleaseDC, SelectObject,
 };
 use windows_sys::Win32::System::Threading::{
     ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
@@ -38,23 +43,31 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked, LVCF_FMT, LVCF_SUBITEM,
     LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVIF_STATE, LVIF_TEXT,
-    LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN, LVM_ENSUREVISIBLE,
-    LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNWIDTH, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT,
-    LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETITEMCOUNT,
-    LVM_SETITEMSTATE, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED,
-    LVS_SHOWSELALWAYS, LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, NMHDR, NMLISTVIEW, NMLVDISPINFOW,
+    LVIR_BOUNDS, LVIR_LABEL, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN,
+    LVM_ENSUREVISIBLE, LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNWIDTH, LVM_GETCOUNTPERPAGE,
+    LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_INSERTCOLUMNW,
+    LVM_REDRAWITEMS, LVM_SCROLL, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVN_COLUMNCLICK,
+    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVNI_FOCUSED, LVNI_SELECTED, LVS_SHOWSELALWAYS,
+    LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, NM_CLICK, NM_DBLCLK, NMHDR, NMITEMACTIVATE,
+    NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, VK_ADD, VK_LEFT, VK_RIGHT, VK_SUBTRACT,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EndDialog, GWL_STYLE, GetClientRect,
     GetCursorPos, GetDlgItem, GetWindowLongW, IDCANCEL, IDOK, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetWindowLongW, TPM_RETURNCMD, TrackPopupMenuEx,
-    WM_COMMAND, WM_INITDIALOG, WM_SETREDRAW,
+    WM_COMMAND, WM_GETFONT, WM_INITDIALOG, WM_SETREDRAW,
 };
 
 use self::actions::load_debugger_path;
 use self::model::{DirtyColumns, ProcEntry, column_text, compare_entries, update_process_entry};
 use self::sampler::{ProcWorkerRequest, ProcWorkerResult, ProcWorkerState};
+use self::tree::{
+    TreeRow, expansion_ancestors, layout_process_rows, nearest_visible_identity,
+    retain_live_identities, same_tree_presentation, tree_image_prefix,
+};
 use crate::config::options::{ColumnId, Options, UpdateSpeed};
 use crate::infrastructure::native::{
     copy_text_to_callback_buffer, finish_list_view_update, get_window_userdata, loword,
@@ -237,6 +250,17 @@ enum ProcCommand {
     Affinity,
     SetPriority(ProcPriority),
     PickColumns,
+    ToggleTree,
+    Expand,
+    Collapse,
+}
+
+/// Checked and enabled state for the process tree commands on the View menu.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessViewCommandState {
+    pub tree_mode: bool,
+    pub can_expand: bool,
+    pub can_collapse: bool,
 }
 
 impl ProcPriority {
@@ -273,6 +297,9 @@ impl ProcCommand {
             Self::Affinity => IDM_AFFINITY,
             Self::SetPriority(priority) => priority.command_id(),
             Self::PickColumns => IDM_PROCCOLS,
+            Self::ToggleTree => IDM_PROC_TREE,
+            Self::Expand => IDM_PROC_EXPAND,
+            Self::Collapse => IDM_PROC_COLLAPSE,
         }
     }
 
@@ -290,6 +317,9 @@ impl ProcCommand {
             IDM_PROC_HIGH => Some(Self::SetPriority(ProcPriority::High)),
             IDM_PROC_REALTIME => Some(Self::SetPriority(ProcPriority::Realtime)),
             IDM_PROCCOLS => Some(Self::PickColumns),
+            IDM_PROC_TREE => Some(Self::ToggleTree),
+            IDM_PROC_EXPAND => Some(Self::Expand),
+            IDM_PROC_COLLAPSE => Some(Self::Collapse),
             _ => None,
         }
     }
@@ -301,7 +331,13 @@ pub struct ProcessPageState {
     hwnd_page: HWND,
     main_hwnd: HWND,
     entries: Vec<ProcEntry>,
-    displayed_identities: Vec<ProcIdentity>,
+    visible_rows: Vec<TreeRow>,
+    /// Parents the user has folded. Absent parents stay open, including ones
+    /// that appear on a later refresh. Session-only; not stored in `Options`.
+    collapsed: HashSet<ProcIdentity>,
+    /// Session-only. The flat list is still available from the View menu.
+    /// This is not stored in `Options`.
+    tree_mode: bool,
     active_columns: Vec<ColumnId>,
     selected_identity: Option<ProcIdentity>,
     pending_find_identity: Option<ProcIdentity>,
@@ -327,7 +363,9 @@ impl Default for ProcessPageState {
             hwnd_page: null_mut(),
             main_hwnd: null_mut(),
             entries: Vec::with_capacity(128),
-            displayed_identities: Vec::with_capacity(128),
+            visible_rows: Vec::with_capacity(128),
+            collapsed: HashSet::new(),
+            tree_mode: true,
             active_columns: Vec::with_capacity(NUM_COLUMN),
             selected_identity: None,
             pending_find_identity: None,
@@ -456,7 +494,8 @@ impl ProcessPageState {
     pub fn destroy(&mut self) {
         self.stop_worker_thread();
         self.entries.clear();
-        self.displayed_identities.clear();
+        self.visible_rows.clear();
+        self.collapsed.clear();
     }
 
     /// Handles a notification forwarded by the process page dialog procedure.
@@ -490,6 +529,21 @@ impl ProcessPageState {
                         self.update_ui_state();
                     }
                     1
+                }
+                code if code == NM_CLICK || code == NM_DBLCLK => {
+                    let activate = &*(lparam as *const NMITEMACTIVATE);
+                    self.handle_tree_click(
+                        activate.iItem,
+                        activate.iSubItem,
+                        activate.ptAction.x,
+                        code == NM_DBLCLK,
+                    );
+                    0
+                }
+                code if code == LVN_KEYDOWN => {
+                    let key = &*(lparam as *const NMLVKEYDOWN);
+                    self.handle_tree_key(key.wVKey);
+                    0
                 }
                 code if code == LVN_COLUMNCLICK => {
                     let notify = &*(lparam as *const NMLISTVIEW);
@@ -556,6 +610,22 @@ impl ProcessPageState {
             ProcCommand::SetPriority(priority) => {
                 if let Some(identity) = self.current_selected_identity() {
                     self.set_priority(identity, priority);
+                }
+            }
+            ProcCommand::ToggleTree => {
+                self.tree_mode = !self.tree_mode;
+                self.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
+            }
+            ProcCommand::Expand => {
+                if let Some(identity) = self.current_selected_identity().or(self.selected_identity)
+                {
+                    self.set_row_expanded(identity, true);
+                }
+            }
+            ProcCommand::Collapse => {
+                if let Some(identity) = self.current_selected_identity().or(self.selected_identity)
+                {
+                    self.set_row_expanded(identity, false);
                 }
             }
         }
@@ -680,6 +750,26 @@ impl ProcessPageState {
         }
 
         popup.append_separator()?;
+        let view_state = self.view_command_state();
+        popup.append_item(
+            ProcCommand::Expand.command_id(),
+            text(TextKey::ExpandProcess),
+            if view_state.can_expand {
+                MenuItemState::ENABLED
+            } else {
+                MenuItemState::disabled()
+            },
+        )?;
+        popup.append_item(
+            ProcCommand::Collapse.command_id(),
+            text(TextKey::CollapseProcess),
+            if view_state.can_collapse {
+                MenuItemState::ENABLED
+            } else {
+                MenuItemState::disabled()
+            },
+        )?;
+        popup.append_separator()?;
         popup.append_submenu(text(TextKey::SetPriority), priority_menu)?;
 
         if self.processor_count > 1 {
@@ -761,14 +851,9 @@ impl ProcessPageState {
             return true;
         };
 
+        self.expand_ancestors_of(identity);
         self.selected_identity = Some(self.entries[index].identity);
-        let list_hwnd = self.list_hwnd();
-        self.set_list_selection(
-            list_hwnd,
-            Some(index),
-            SelectionScrollPolicy::RevealSelection,
-        );
-        self.update_ui_state();
+        self.rebuild_listview(SelectionScrollPolicy::RevealSelection);
         true
     }
 
@@ -900,6 +985,9 @@ impl ProcessPageState {
             .pending_find_identity
             .take()
             .filter(|identity| self.entries.iter().any(|entry| entry.identity == *identity));
+        if let Some(identity) = requested_selection {
+            self.expand_ancestors_of(identity);
+        }
         let selection_scroll_policy = refresh_selection_scroll_policy(requested_selection);
         self.selected_identity = requested_selection.or(previous_selection);
         self.rebuild_listview(selection_scroll_policy);
@@ -932,68 +1020,174 @@ impl ProcessPageState {
     }
 
     fn rebuild_listview(&mut self, selection_scroll_policy: SelectionScrollPolicy) {
+        let next_rows = self.layout_visible_rows();
+        let list_hwnd = self.list_hwnd();
+        if list_hwnd.is_null() {
+            self.publish_visible_rows(next_rows);
+            return;
+        }
         unsafe {
-            // 进程列表使用 LVS_OWNERDATA；刷新只更新虚拟项数量和索引映射，
-            // 不再为每个进程创建、删除或移动 Win32 ListView 项。
-            let list_hwnd = self.list_hwnd();
-            if list_hwnd.is_null() {
-                return;
-            }
-            let selected_identity = self.selected_identity;
-            let selected_index = selected_identity.and_then(|identity| {
-                self.entries
-                    .iter()
-                    .position(|entry| entry.identity == identity)
-            });
+            self.present_visible_rows(list_hwnd, next_rows, selection_scroll_policy);
+        }
+    }
+
+    fn layout_visible_rows(&mut self) -> Vec<TreeRow> {
+        let identities: Vec<ProcIdentity> =
+            self.entries.iter().map(|entry| entry.identity).collect();
+        let parents: Vec<Option<ProcIdentity>> =
+            self.entries.iter().map(|entry| entry.parent).collect();
+        let live = identities.iter().copied().collect::<HashSet<_>>();
+        retain_live_identities(&mut self.collapsed, &live);
+        layout_process_rows(&identities, &parents, &self.collapsed, self.tree_mode)
+    }
+
+    fn publish_visible_rows(&mut self, next_rows: Vec<TreeRow>) {
+        self.selected_identity = self.retarget_visible_identity(self.selected_identity, &next_rows);
+        self.visible_rows = next_rows;
+    }
+
+    fn retarget_visible_identity(
+        &self,
+        identity: Option<ProcIdentity>,
+        rows: &[TreeRow],
+    ) -> Option<ProcIdentity> {
+        let identity = identity?;
+        if !self.entries.iter().any(|entry| entry.identity == identity) {
+            return None;
+        }
+        let visible = rows.iter().map(|row| row.identity).collect::<HashSet<_>>();
+        let identities: Vec<_> = self.entries.iter().map(|entry| entry.identity).collect();
+        let parents: Vec<_> = self.entries.iter().map(|entry| entry.parent).collect();
+        nearest_visible_identity(identity, &identities, &parents, &visible)
+    }
+
+    /// Presents an already computed row order on the virtual list.
+    ///
+    /// # Safety
+    ///
+    /// `list_hwnd` must be this page's live process ListView.
+    unsafe fn present_visible_rows(
+        &mut self,
+        list_hwnd: HWND,
+        next_rows: Vec<TreeRow>,
+        selection_scroll_policy: SelectionScrollPolicy,
+    ) {
+        unsafe {
+            // 进程列表使用 LVS_OWNERDATA。树形刷新只改虚拟项数量和可见身份，
+            // 不在 UI 线程打开进程。
+            let anchor = self.identity_at_top(list_hwnd);
+            let focused = self.identity_for_list_state(LVNI_FOCUSED);
+            let presentation_changed = !same_tree_presentation(&self.visible_rows, &next_rows);
             let existing_count = SendMessageW(list_hwnd, LVM_GETITEMCOUNT, 0, 0) as usize;
-            let structure_changed = existing_count != self.entries.len();
-            let order_changed = self.displayed_identities.len() != self.entries.len()
-                || self
-                    .displayed_identities
-                    .iter()
-                    .copied()
-                    .ne(self.entries.iter().map(|entry| entry.identity));
-            let bulk_update = structure_changed || order_changed;
+            let count_changed = existing_count != next_rows.len();
+            let bulk_update = presentation_changed || count_changed;
+            self.selected_identity =
+                self.retarget_visible_identity(self.selected_identity, &next_rows);
+            let selected_identity = self.selected_identity;
+            let focused_identity = focused
+                .filter(|identity| next_rows.iter().any(|row| row.identity == *identity))
+                .or(selected_identity);
 
             if bulk_update {
                 SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
             }
 
-            let mut dirty_rows = DirtyRowRange::default();
+            let mut dirty_entries = HashSet::new();
             for (index, entry) in self.entries.iter_mut().enumerate() {
                 if entry.dirty_columns.any() {
                     entry.dirty_columns = DirtyColumns::default();
-                    dirty_rows.mark(index);
+                    dirty_entries.insert(index);
                 }
             }
 
-            if structure_changed {
+            self.visible_rows = next_rows;
+            if count_changed {
                 SendMessageW(
                     list_hwnd,
                     LVM_SETITEMCOUNT,
-                    self.entries.len(),
+                    self.visible_rows.len(),
                     (LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL) as LPARAM,
                 );
             }
 
+            let selected_index =
+                selected_identity.and_then(|identity| self.visible_index(identity));
+            let focused_index = focused_identity.and_then(|identity| self.visible_index(identity));
             if bulk_update {
                 // Dynamic sort keys can move the selected process on every sample. Refreshes must
                 // preserve the user's wheel position; only an explicit navigation may reveal it.
-                self.set_list_selection(list_hwnd, selected_index, selection_scroll_policy);
+                self.set_list_selection(
+                    list_hwnd,
+                    selected_index,
+                    focused_index,
+                    selection_scroll_policy,
+                );
+                if selection_scroll_policy == SelectionScrollPolicy::PreserveViewport
+                    && let Some(anchor) = anchor
+                {
+                    self.scroll_identity_to_top(list_hwnd, anchor);
+                }
                 finish_list_view_update(list_hwnd);
             } else {
-                dirty_rows.redraw_visible(list_hwnd, self.entries.len());
+                let mut dirty_rows = DirtyRowRange::default();
+                for (visible_index, row) in self.visible_rows.iter().enumerate() {
+                    if dirty_entries.contains(&row.entry_index) {
+                        dirty_rows.mark(visible_index);
+                    }
+                }
+                dirty_rows.redraw_visible(list_hwnd, self.visible_rows.len());
             }
 
-            self.displayed_identities.clear();
-            self.displayed_identities
-                .extend(self.entries.iter().map(|entry| entry.identity));
-
-            if selected_index.is_none() {
-                self.selected_identity = None;
-            }
-
+            self.selected_identity = selected_identity.filter(|_| selected_index.is_some());
             self.update_ui_state();
+        }
+    }
+
+    fn visible_index(&self, identity: ProcIdentity) -> Option<usize> {
+        self.visible_rows
+            .iter()
+            .position(|row| row.identity == identity)
+    }
+
+    fn identity_at_top(&self, list_hwnd: HWND) -> Option<ProcIdentity> {
+        unsafe {
+            if list_hwnd.is_null() || self.visible_rows.is_empty() {
+                return None;
+            }
+            let top = SendMessageW(list_hwnd, LVM_GETTOPINDEX, 0, 0);
+            if top < 0 {
+                return None;
+            }
+            self.visible_rows.get(top as usize).map(|row| row.identity)
+        }
+    }
+
+    fn scroll_identity_to_top(&self, list_hwnd: HWND, identity: ProcIdentity) {
+        let Some(index) = self.visible_index(identity) else {
+            return;
+        };
+        unsafe {
+            let top = SendMessageW(list_hwnd, LVM_GETTOPINDEX, 0, 0).max(0) as usize;
+            if top == index {
+                return;
+            }
+            let mut rect = RECT {
+                left: LVIR_BOUNDS as i32,
+                ..zeroed()
+            };
+            if SendMessageW(
+                list_hwnd,
+                LVM_GETITEMRECT,
+                0,
+                &mut rect as *mut RECT as LPARAM,
+            ) == 0
+            {
+                SendMessageW(list_hwnd, LVM_ENSUREVISIBLE, index, 0);
+                return;
+            }
+            let height = (rect.bottom - rect.top).max(1);
+            let delta = (index as i32 - top as i32).saturating_mul(height);
+            SendMessageW(list_hwnd, LVM_SCROLL, 0, delta as LPARAM);
         }
     }
 
@@ -1001,6 +1195,7 @@ impl ProcessPageState {
         &self,
         list_hwnd: HWND,
         selected_index: Option<usize>,
+        focused_index: Option<usize>,
         scroll_policy: SelectionScrollPolicy,
     ) {
         unsafe {
@@ -1018,7 +1213,12 @@ impl ProcessPageState {
             );
 
             if let Some(index) = selected_index {
-                item.state = LVIS_SELECTED | LVIS_FOCUSED;
+                let focus_here = focused_index.is_none_or(|focused| focused == index);
+                item.state = if focus_here {
+                    LVIS_SELECTED | LVIS_FOCUSED
+                } else {
+                    LVIS_SELECTED
+                };
                 SendMessageW(
                     list_hwnd,
                     LVM_SETITEMSTATE,
@@ -1028,6 +1228,16 @@ impl ProcessPageState {
                 if scroll_policy == SelectionScrollPolicy::RevealSelection {
                     SendMessageW(list_hwnd, LVM_ENSUREVISIBLE, index, 0);
                 }
+            }
+            if let Some(index) = focused_index.filter(|index| Some(*index) != selected_index) {
+                item.stateMask = LVIS_FOCUSED;
+                item.state = LVIS_FOCUSED;
+                SendMessageW(
+                    list_hwnd,
+                    LVM_SETITEMSTATE,
+                    index,
+                    &mut item as *mut _ as LPARAM,
+                );
             }
         }
     }
@@ -1048,7 +1258,8 @@ impl ProcessPageState {
                 return;
             }
 
-            let entry = self.entries.get(item.iItem as usize);
+            let row = self.visible_rows.get(item.iItem as usize).copied();
+            let entry = row.and_then(|row| self.entries.get(row.entry_index));
             let Some(entry) = entry else {
                 *item.pszText = 0;
                 return;
@@ -1058,6 +1269,22 @@ impl ProcessPageState {
                 return;
             };
 
+            if self.tree_mode
+                && column_id == ColumnId::ImageName
+                && let Some(row) = row
+            {
+                let prefix = tree_image_prefix(&row);
+                if !prefix.is_empty() {
+                    let presented =
+                        format!("{prefix}{}", column_text(entry, column_id, &self.strings));
+                    copy_text_to_callback_buffer(
+                        item.pszText,
+                        item.cchTextMax as usize,
+                        &presented,
+                    );
+                    return;
+                }
+            }
             let text = column_text(entry, column_id, &self.strings);
             copy_text_to_callback_buffer(item.pszText, item.cchTextMax as usize, text);
         }
@@ -1096,12 +1323,12 @@ impl ProcessPageState {
                 );
             }
 
-            if !self.entries.is_empty() {
+            if !self.visible_rows.is_empty() {
                 SendMessageW(
                     list_hwnd,
                     LVM_REDRAWITEMS,
                     0,
-                    self.entries.len().saturating_sub(1) as LPARAM,
+                    self.visible_rows.len().saturating_sub(1) as LPARAM,
                 );
             }
         }
@@ -1145,19 +1372,193 @@ impl ProcessPageState {
     }
 
     fn current_selected_identity(&self) -> Option<ProcIdentity> {
+        self.identity_for_list_state(LVNI_SELECTED)
+    }
+
+    fn identity_for_list_state(&self, state: u32) -> Option<ProcIdentity> {
         unsafe {
             let list_hwnd = self.list_hwnd();
-            let index = SendMessageW(
-                list_hwnd,
-                LVM_GETNEXTITEM,
-                usize::MAX,
-                LVNI_SELECTED as LPARAM,
-            ) as i32;
+            if list_hwnd.is_null() {
+                return None;
+            }
+            let index = SendMessageW(list_hwnd, LVM_GETNEXTITEM, usize::MAX, state as LPARAM);
             if index < 0 {
                 return None;
             }
+            self.visible_rows
+                .get(index as usize)
+                .map(|row| row.identity)
+        }
+    }
 
-            self.entries.get(index as usize).map(|entry| entry.identity)
+    pub fn view_command_state(&self) -> ProcessViewCommandState {
+        let row = self.selected_identity.and_then(|identity| {
+            self.visible_rows
+                .iter()
+                .find(|row| row.identity == identity)
+        });
+        let has_children = row.is_some_and(|row| row.has_children);
+        let expanded = row.is_some_and(|row| row.expanded);
+        ProcessViewCommandState {
+            tree_mode: self.tree_mode,
+            can_expand: self.tree_mode && has_children && !expanded,
+            can_collapse: self.tree_mode && has_children && expanded,
+        }
+    }
+
+    fn expand_ancestors_of(&mut self, identity: ProcIdentity) {
+        let identities: Vec<_> = self.entries.iter().map(|entry| entry.identity).collect();
+        let parents: Vec<_> = self.entries.iter().map(|entry| entry.parent).collect();
+        for ancestor in expansion_ancestors(&identities, &parents, identity) {
+            self.collapsed.remove(&ancestor);
+        }
+    }
+
+    fn set_row_expanded(&mut self, identity: ProcIdentity, expanded: bool) {
+        if !self.tree_mode {
+            return;
+        }
+        let changed = if expanded {
+            self.collapsed.remove(&identity)
+        } else {
+            self.collapsed.insert(identity)
+        };
+        if changed {
+            self.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
+        }
+    }
+
+    fn select_tree_identity(&mut self, identity: ProcIdentity) {
+        if !self.entries.iter().any(|entry| entry.identity == identity) {
+            return;
+        }
+        self.expand_ancestors_of(identity);
+        self.selected_identity = Some(identity);
+        self.rebuild_listview(SelectionScrollPolicy::RevealSelection);
+    }
+
+    fn handle_tree_key(&mut self, key: u16) {
+        if !self.tree_mode {
+            return;
+        }
+        let Some(identity) = self.current_selected_identity().or(self.selected_identity) else {
+            return;
+        };
+        let Some(row) = self
+            .visible_rows
+            .iter()
+            .copied()
+            .find(|row| row.identity == identity)
+        else {
+            return;
+        };
+        match key {
+            VK_RIGHT | VK_ADD => {
+                if row.has_children && !row.expanded {
+                    self.set_row_expanded(identity, true);
+                } else if row.expanded {
+                    self.select_first_visible_child(identity);
+                }
+            }
+            VK_LEFT | VK_SUBTRACT => {
+                if row.has_children && row.expanded {
+                    self.set_row_expanded(identity, false);
+                } else if let Some(parent) = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.identity == identity)
+                    .and_then(|entry| entry.parent)
+                {
+                    self.select_tree_identity(parent);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn select_first_visible_child(&mut self, identity: ProcIdentity) {
+        let Some(index) = self.visible_index(identity) else {
+            return;
+        };
+        let depth = self.visible_rows[index].depth;
+        let Some(child) = self.visible_rows.get(index + 1).copied() else {
+            return;
+        };
+        if child.depth > depth {
+            self.select_tree_identity(child.identity);
+        }
+    }
+
+    fn handle_tree_click(&mut self, item: i32, subitem: i32, x: i32, double_click: bool) {
+        if !self.tree_mode || item < 0 || subitem != 0 {
+            return;
+        }
+        let Some(row) = self.visible_rows.get(item as usize).copied() else {
+            return;
+        };
+        if !row.has_children {
+            return;
+        }
+        let on_prefix = self.prefix_contains_click(item as usize, &row, x);
+        let expand = !row.expanded;
+        if double_click {
+            if !on_prefix {
+                self.set_row_expanded(row.identity, expand);
+            }
+        } else if on_prefix {
+            self.set_row_expanded(row.identity, expand);
+        }
+    }
+
+    fn prefix_contains_click(&self, visible_index: usize, row: &TreeRow, x: i32) -> bool {
+        let prefix = tree_image_prefix(row);
+        if prefix.is_empty() {
+            return false;
+        }
+        let list_hwnd = self.list_hwnd();
+        if list_hwnd.is_null() {
+            return false;
+        }
+        let wide = to_wide_null(&prefix);
+        let mut size = SIZE { cx: 0, cy: 0 };
+        unsafe {
+            let hdc = GetDC(list_hwnd);
+            if hdc.is_null() {
+                return false;
+            }
+            let font = SendMessageW(list_hwnd, WM_GETFONT, 0, 0);
+            let previous = if font == 0 {
+                null_mut()
+            } else {
+                SelectObject(hdc, font as HGDIOBJ)
+            };
+            let measured = GetTextExtentPoint32W(
+                hdc,
+                wide.as_ptr(),
+                i32::try_from(wide.len().saturating_sub(1)).unwrap_or(i32::MAX),
+                &mut size,
+            );
+            if font != 0 {
+                SelectObject(hdc, previous);
+            }
+            ReleaseDC(list_hwnd, hdc);
+            if measured == 0 {
+                return false;
+            }
+            let mut rect = RECT {
+                left: LVIR_LABEL as i32,
+                ..zeroed()
+            };
+            if SendMessageW(
+                list_hwnd,
+                LVM_GETITEMRECT,
+                visible_index,
+                &mut rect as *mut RECT as LPARAM,
+            ) == 0
+            {
+                return false;
+            }
+            x >= rect.left && x < rect.left.saturating_add(size.cx)
         }
     }
 
@@ -1369,7 +1770,7 @@ mod tests {
     };
     use crate::config::options::{ColumnId, Options};
     use crate::system::process_identity::query_process_identity_for_pid;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::env;
     use std::fs;
     use std::os::windows::io::AsRawHandle;
@@ -1407,6 +1808,7 @@ mod tests {
     fn empty_process_entry(image_name: &str) -> ProcEntry {
         ProcEntry {
             identity: ProcIdentity::new(1234, 10),
+            parent: None,
             pid: 1234,
             image_name: image_name.to_string(),
             image_name_lower: image_name.to_lowercase(),
@@ -1916,6 +2318,92 @@ mod tests {
         assert_eq!(state.entries[0].image_name, "trusted.exe");
         assert_eq!(state.pass_count, 7);
         assert_eq!(state.last_refresh_error, Some(5));
+    }
+
+    fn tree_entry(
+        image_name: &str,
+        identity: ProcIdentity,
+        parent: Option<ProcIdentity>,
+    ) -> ProcEntry {
+        let mut entry = empty_process_entry(image_name);
+        entry.identity = identity;
+        entry.pid = identity.pid;
+        entry.parent = parent;
+        entry
+    }
+
+    fn visible_pids(state: &ProcessPageState) -> Vec<u32> {
+        state
+            .visible_rows
+            .iter()
+            .map(|row| row.identity.pid)
+            .collect()
+    }
+
+    #[test]
+    fn process_tree_refresh_keeps_expansion_and_drops_only_the_exited_row() {
+        let parent = ProcIdentity::new(4, 50);
+        let child = ProcIdentity::new(8, 80);
+        let sibling = ProcIdentity::new(9, 90);
+        let mut state = ProcessPageState {
+            tree_mode: true,
+            collapsed: HashSet::new(),
+            selected_identity: Some(child),
+            active_columns: vec![ColumnId::ImageName],
+            ..ProcessPageState::default()
+        };
+
+        state.apply_process_snapshot(vec![
+            tree_entry("child.exe", child, Some(parent)),
+            tree_entry("parent.exe", parent, None),
+            tree_entry("sibling.exe", sibling, None),
+        ]);
+        assert_eq!(visible_pids(&state), vec![4, 8, 9]);
+        assert_eq!(state.selected_identity, Some(child));
+        assert!(!state.collapsed.contains(&parent));
+
+        state.collapsed.insert(parent);
+        state.apply_process_snapshot(vec![
+            tree_entry("child.exe", child, Some(parent)),
+            tree_entry("parent.exe", parent, None),
+            tree_entry("sibling.exe", sibling, None),
+        ]);
+        assert_eq!(visible_pids(&state), vec![4, 9]);
+        assert_eq!(state.selected_identity, Some(parent));
+
+        state.apply_process_snapshot(vec![
+            tree_entry("parent.exe", parent, None),
+            tree_entry("sibling.exe", sibling, None),
+        ]);
+        assert_eq!(visible_pids(&state), vec![4, 9]);
+        assert!(state.collapsed.contains(&parent));
+        assert!(!state.entries.iter().any(|entry| entry.identity == child));
+    }
+
+    #[test]
+    fn list_mode_stays_flat_and_find_process_expands_ancestors() {
+        let parent = ProcIdentity::new(4, 50);
+        let child = ProcIdentity::new(2, 80);
+        let mut state = ProcessPageState {
+            tree_mode: false,
+            active_columns: vec![ColumnId::Pid],
+            ..ProcessPageState::default()
+        };
+        state.apply_process_snapshot(vec![
+            tree_entry("parent.exe", parent, None),
+            tree_entry("child.exe", child, Some(parent)),
+        ]);
+        assert_eq!(visible_pids(&state), vec![2, 4]);
+        assert!(state.visible_rows.iter().all(|row| row.depth == 0));
+
+        state.collapsed.insert(parent);
+        state.tree_mode = true;
+        state.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
+        assert_eq!(visible_pids(&state), vec![4]);
+        assert!(state.find_process(child));
+        assert_eq!(visible_pids(&state), vec![4, 2]);
+        assert_eq!(state.selected_identity, Some(child));
+        assert!(!state.collapsed.contains(&parent));
     }
 
     #[test]

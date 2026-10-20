@@ -366,6 +366,9 @@ pub const IDM_TASK_FINDPROCESS: u16 = 40047;
 pub const IDM_SERVICE_START: u16 = 40120;
 pub const IDM_SERVICE_STOP: u16 = 40121;
 pub const IDM_SERVICE_GOTOPROCESS: u16 = 40122;
+pub const IDM_PROC_TREE: u16 = 40130;
+pub const IDM_PROC_EXPAND: u16 = 40131;
+pub const IDM_PROC_COLLAPSE: u16 = 40132;
 
 pub const IDC_NEXTTAB: u16 = 40100;
 pub const IDC_PREVTAB: u16 = 40101;

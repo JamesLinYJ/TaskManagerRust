@@ -59,6 +59,9 @@ impl DirtyColumns {
 pub struct ProcEntry {
     // `ProcEntry` 同时承载原始采样值、展示值和刷新期的脏信息。
     pub(super) identity: ProcIdentity,
+    /// Parent from the same committed snapshot. `None` is a root: the parent
+    /// was missing, unverified, or rejected because its PID was reused.
+    pub(super) parent: Option<ProcIdentity>,
     pub(super) pid: u32,
     pub(super) image_name: String,
     pub(super) image_name_lower: String,
@@ -269,6 +272,8 @@ pub(super) fn update_process_entry(
         entry.pid = snapshot.pid;
         mark_process_column_changed(entry, &mut changed, ColumnId::Pid, visible_columns);
     }
+    // Parent identity is not a column. The page relayouts from it after the merge.
+    entry.parent = snapshot.parent;
     if entry.user_name != snapshot.user_name {
         entry.user_name.clone_from(&snapshot.user_name);
         entry.user_name_lower = snapshot.user_name_lower.clone();
