@@ -16,4 +16,5 @@ pub(crate) mod gpu;
 pub(crate) mod network;
 pub(crate) mod performance;
 pub(crate) mod processes;
+pub(crate) mod services;
 pub(crate) mod users;

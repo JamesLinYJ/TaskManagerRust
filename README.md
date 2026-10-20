@@ -16,6 +16,7 @@ This is not a copy of the modern Task Manager. CPU and GPU details come from sys
 - **CPU** shows the processor name, effective frequency, topology, caches, virtualization, ISA features, system rates, and a 60-second utilization graph.
 - **GPU** handles multiple adapters and engines, dedicated and shared memory, temperature, driver details, and DirectX information.
 - **Networking and Users** show adapter throughput history and Windows session state.
+- **Services** lists Win32 services with description, status, startup type, and the owning process. Start, stop, and Go to Process run only when the current row allows them. Go to Process requires a process id plus creation time.
 
 ## Download
 
@@ -163,7 +164,7 @@ The project remains one Rust crate. Directories follow ownership boundaries rath
 - `src/ui` contains reusable chart, dialog, menu, drawing, resource, and localization code.
 - `src/config` owns the versioned registry options format.
 
-Workers publish complete snapshots from one source at a time. The UI rejects stale generations and keeps the last valid snapshot when a refresh fails. Expensive Win32, PDH, DXGI, WMI, WTS, and icon work stays off the UI thread.
+Workers publish complete snapshots from one source at a time. The UI rejects stale generations and keeps the last valid snapshot when a refresh fails. Expensive Win32, PDH, DXGI, WMI, WTS, Service Control Manager, and icon work stays off the UI thread.
 
 ## Image resources
 

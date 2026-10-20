@@ -1023,6 +1023,50 @@ fn build_affinity_dialog() -> DialogSpec<'static> {
     }
 }
 
+fn build_services_dialog() -> DialogSpec<'static> {
+    DialogSpec {
+        style: DS_3DLOOK | DS_CONTROL | WS_CHILD,
+        ex_style: 0,
+        x: 0,
+        y: 0,
+        cx: 393,
+        cy: 197,
+        title: "",
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
+        controls: vec![
+            ControlSpec {
+                class_name: "SysListView32",
+                text: "List4",
+                id: IDC_SERVICELIST as u16,
+                style: WS_CHILD
+                    | WS_VISIBLE
+                    | WS_BORDER
+                    | WS_TABSTOP
+                    | LVS_REPORT
+                    | LVS_SINGLESEL
+                    | LVS_OWNERDATA,
+                ex_style: 0,
+                x: 9,
+                y: 9,
+                cx: 376,
+                cy: 131,
+            },
+            button("&Start", IDM_SERVICE_START as i32, 0, 214, 144, 50, 14),
+            button("&Stop", IDM_SERVICE_STOP as i32, 0, 268, 144, 50, 14),
+            button(
+                "&Go To Process",
+                IDM_SERVICE_GOTOPROCESS as i32,
+                BS_DEFPUSHBUTTON_STYLE,
+                322,
+                144,
+                64,
+                14,
+            ),
+        ],
+    }
+}
+
 fn build_users_dialog() -> DialogSpec<'static> {
     DialogSpec {
         style: DS_3DLOOK | DS_CONTROL | WS_CHILD,
@@ -1236,6 +1280,7 @@ fn dialog_spec(dialog_id: u16) -> Option<DialogSpec<'static>> {
         IDD_SELECTPROCCOLS => build_select_columns_dialog(),
         IDD_AFFINITY => build_affinity_dialog(),
         IDD_USERSPAGE => build_users_dialog(),
+        IDD_SERVICESPAGE => build_services_dialog(),
         IDD_MESSAGE => build_message_dialog(),
         IDD_DIAGNOSTICS => build_diagnostics_dialog(),
         _ => return None,
@@ -1313,9 +1358,10 @@ pub fn dialog_box(
 mod tests {
     use super::{DialogTemplateBuilder, dialog_spec};
     use crate::ui::resource_ids::{
-        IDC_AFFINITY_GROUP_SELECTOR, IDC_NICTOTALS, IDC_PROCLIST, IDC_TASKLIST, IDD_AFFINITY,
-        IDD_CPUPAGE, IDD_DIAGNOSTICS, IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE,
-        IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_TASKPAGE, IDD_USERSPAGE,
+        IDC_AFFINITY_GROUP_SELECTOR, IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_TASKLIST,
+        IDD_AFFINITY, IDD_CPUPAGE, IDD_DIAGNOSTICS, IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE,
+        IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_SERVICESPAGE,
+        IDD_TASKPAGE, IDD_USERSPAGE,
     };
     use windows_sys::Win32::UI::Controls::LVS_OWNERDATA;
 
@@ -1332,6 +1378,7 @@ mod tests {
             IDD_SELECTPROCCOLS,
             IDD_AFFINITY,
             IDD_USERSPAGE,
+            IDD_SERVICESPAGE,
             IDD_MESSAGE,
             IDD_DIAGNOSTICS,
         ] {
@@ -1345,11 +1392,12 @@ mod tests {
     }
 
     #[test]
-    fn only_the_process_list_uses_owner_data_storage() {
+    fn owner_data_lists_are_the_process_and_service_pages() {
         let cases = [
             (IDD_PROCPAGE, IDC_PROCLIST, true),
             (IDD_TASKPAGE, IDC_TASKLIST, false),
             (IDD_NETPAGE, IDC_NICTOTALS, false),
+            (IDD_SERVICESPAGE, IDC_SERVICELIST, true),
         ];
 
         for (dialog_id, control_id, expected) in cases {

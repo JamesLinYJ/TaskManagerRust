@@ -92,6 +92,15 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
             set_dialog_item_text(hwnd, i32::from(IDM_LOGOFF), TextKey::Logoff);
             set_dialog_item_text(hwnd, i32::from(IDM_SENDMESSAGE), TextKey::SendMessage);
         }
+        IDD_SERVICESPAGE => {
+            set_dialog_item_text(hwnd, i32::from(IDM_SERVICE_START), TextKey::ServiceStart);
+            set_dialog_item_text(hwnd, i32::from(IDM_SERVICE_STOP), TextKey::ServiceStop);
+            set_dialog_item_text(
+                hwnd,
+                i32::from(IDM_SERVICE_GOTOPROCESS),
+                TextKey::GoToProcess,
+            );
+        }
         IDD_PERFPAGE => {
             set_dialog_item_text(hwnd, IDC_STATIC14, TextKey::Handles);
             set_dialog_item_text(hwnd, IDC_STATIC15, TextKey::Threads);

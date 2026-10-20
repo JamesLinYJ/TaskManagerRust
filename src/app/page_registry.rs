@@ -15,10 +15,10 @@
 
 use crate::ui::localization::TextKey;
 use crate::ui::resource_ids::{
-    IDC_GPU_SELECTOR, IDC_NICTOTALS, IDC_TASKLIST, IDC_USERLIST, IDD_CPUPAGE, IDD_GPUPAGE,
-    IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_TASKPAGE, IDD_USERSPAGE, IDR_MAINMENU_CPU,
-    IDR_MAINMENU_GPU, IDR_MAINMENU_NET, IDR_MAINMENU_PERF, IDR_MAINMENU_PROC, IDR_MAINMENU_TASK,
-    IDR_MAINMENU_USER,
+    IDC_GPU_SELECTOR, IDC_NICTOTALS, IDC_SERVICELIST, IDC_TASKLIST, IDC_USERLIST, IDD_CPUPAGE,
+    IDD_GPUPAGE, IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_SERVICESPAGE, IDD_TASKPAGE,
+    IDD_USERSPAGE, IDR_MAINMENU_CPU, IDR_MAINMENU_GPU, IDR_MAINMENU_NET, IDR_MAINMENU_PERF,
+    IDR_MAINMENU_PROC, IDR_MAINMENU_SERVICE, IDR_MAINMENU_TASK, IDR_MAINMENU_USER,
 };
 
 #[repr(i32)]
@@ -31,10 +31,11 @@ pub(crate) enum PageId {
     Gpu = 4,
     Network = 5,
     Users = 6,
+    Services = 7,
 }
 
 impl PageId {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Applications,
         Self::Processes,
         Self::Performance,
@@ -42,6 +43,7 @@ impl PageId {
         Self::Gpu,
         Self::Network,
         Self::Users,
+        Self::Services,
     ];
     pub(crate) const COUNT: usize = Self::ALL.len();
 
@@ -143,6 +145,14 @@ pub(crate) const PAGE_DESCRIPTORS: [PageDescriptor; PageId::COUNT] = [
         dialog_id: IDD_USERSPAGE,
         menu_id: IDR_MAINMENU_USER,
         initial_focus: PageFocus::Control(IDC_USERLIST),
+        minimum_size: MinimumSizePolicy::CompactWhenBorderless,
+    },
+    PageDescriptor {
+        id: PageId::Services,
+        title_key: TextKey::ServicesPageTitle,
+        dialog_id: IDD_SERVICESPAGE,
+        menu_id: IDR_MAINMENU_SERVICE,
+        initial_focus: PageFocus::Control(IDC_SERVICELIST),
         minimum_size: MinimumSizePolicy::CompactWhenBorderless,
     },
 ];

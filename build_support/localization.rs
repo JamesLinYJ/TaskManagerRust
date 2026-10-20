@@ -102,6 +102,18 @@ const MENU_STATUS_HELP_KEYS: &[(&str, &str)] = &[
         "IDM_TASK_BRINGTOFRONT",
         "crate::ui::resource_ids::IDM_TASK_BRINGTOFRONT",
     ),
+    (
+        "IDM_SERVICE_START",
+        "crate::ui::resource_ids::IDM_SERVICE_START",
+    ),
+    (
+        "IDM_SERVICE_STOP",
+        "crate::ui::resource_ids::IDM_SERVICE_STOP",
+    ),
+    (
+        "IDM_SERVICE_GOTOPROCESS",
+        "crate::ui::resource_ids::IDM_SERVICE_GOTOPROCESS",
+    ),
 ];
 
 pub(crate) fn generate() {
