@@ -2303,6 +2303,8 @@ mod tests {
                 .env(CHILD_MODE, mode)
                 .env("TEMP", root.join("temp"))
                 .env("TMP", root.join("temp"))
+                // GetTempPath2 uses this variable when tests run as SYSTEM.
+                .env("SystemTemp", root.join("temp"))
                 .output()
                 .unwrap();
             assert!(
