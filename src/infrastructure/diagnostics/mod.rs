@@ -1189,7 +1189,7 @@ pub(crate) fn prepare_export_bundle() -> Result<PreparedDiagnosticBundle, String
     });
     let contains_crash_record = export_files
         .iter()
-        .any(|file| file.file_name.ends_with(".crash.json"));
+        .any(|file| is_crash_record_name(&file.file_name));
     let (created_utc, _) = utc_timestamp();
     let environment_manifest = runtime_environment_manifest();
     let manifest = json!({
@@ -1450,6 +1450,11 @@ fn allowed_export_file(name: &OsStr) -> bool {
         })
 }
 
+fn is_crash_record_name(name: &str) -> bool {
+    name.get(name.len().saturating_sub(".crash.json".len())..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".crash.json"))
+}
+
 fn directory_contains_crash(directory: &SecureDirectory) -> io::Result<bool> {
     for entry in directory.entries()? {
         if entry.attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
@@ -1468,10 +1473,7 @@ fn directory_contains_crash(directory: &SecureDirectory) -> io::Result<bool> {
         if path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("dmp"))
-            || entry
-                .name
-                .to_str()
-                .is_some_and(|name| name.ends_with(".crash.json"))
+            || entry.name.to_str().is_some_and(is_crash_record_name)
         {
             return Ok(true);
         }
@@ -2171,7 +2173,9 @@ mod tests {
         if let Some(root) = env::var_os(CHILD_ROOT) {
             // Every child owns isolated config/OnceLock state and a private TEMP fallback.
             let root = PathBuf::from(root);
-            let sensitive = env::var(CHILD_MODE).unwrap() == "sensitive";
+            let mode = env::var(CHILD_MODE).unwrap();
+            let sensitive = mode == "sensitive";
+            let crash_alias = mode == "crash-alias";
             let blocked = root.join(format!("{PRIVATE}-blocked"));
             fs::write(&blocked, b"owned regular-file blocker").unwrap();
             let mut arguments = vec![
@@ -2206,8 +2210,15 @@ mod tests {
                 // Already collected sensitive data must still require consent after disabling.
                 set_sensitive(false);
             }
+            if crash_alias {
+                fs::write(
+                    status().directory.unwrap().join("capture.CRASH.JSON"),
+                    br#"{"event":"test.crash_alias"}"#,
+                )
+                .unwrap();
+            }
             let bundle = prepare_export_bundle().unwrap();
-            assert_eq!(bundle.requires_privacy_warning(), sensitive);
+            assert_eq!(bundle.requires_privacy_warning(), sensitive || crash_alias);
             const AFTER_PLAN: &str = "private-record-after-export-plan";
             if !sensitive {
                 // Even a mode change after consent cannot add sensitive bytes to this plan.
@@ -2252,6 +2263,13 @@ mod tests {
                 assert_eq!(detail, sensitive, "{event_name}: {record}");
             }
             let bytes = fs::read(destination).unwrap();
+            if crash_alias {
+                assert!(
+                    bytes
+                        .windows("capture.CRASH.JSON".len())
+                        .any(|w| w == b"capture.CRASH.JSON")
+                );
+            }
             assert!(
                 !bytes
                     .windows(AFTER_PLAN.len())
@@ -2275,7 +2293,7 @@ mod tests {
             }
         }
         let fixture = Fixture(root);
-        for mode in ["redacted", "sensitive"] {
+        for mode in ["redacted", "sensitive", "crash-alias"] {
             let root = fixture.0.join(mode);
             fs::create_dir(&root).unwrap();
             fs::create_dir(root.join("temp")).unwrap();
@@ -2735,7 +2753,7 @@ mod tests {
         file.set_len(LOG_ROOT_LIMIT_BYTES - LOG_PART_LIMIT_BYTES + 1)
             .unwrap();
         drop(file);
-        fs::write(previous.join("previous.crash.json"), b"{}").unwrap();
+        fs::write(previous.join("previous.CRASH.JSON"), b"{}").unwrap();
         let mut sink = FileSink::open(root.clone(), active.clone(), 42).unwrap();
         sink.bytes_written = LOG_PART_LIMIT_BYTES;
 
@@ -2746,7 +2764,7 @@ mod tests {
         assert!(sink.write_line(b"new part").is_err());
         drop(old_reader);
         // A failed retention pass may already have deleted the small crash marker.
-        fs::write(previous.join("previous.crash.json"), b"{}").unwrap();
+        fs::write(previous.join("previous.CRASH.JSON"), b"{}").unwrap();
 
         let sessions = select_export_sessions(&root, &active).unwrap();
         let files = collect_export_files(&sessions).unwrap();

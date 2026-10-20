@@ -85,7 +85,8 @@ struct RawAdapterEntry {
     receive_link_speed_bps: u64,
     bytes_sent: u64,
     bytes_received: u64,
-    ipv4: String,
+    // None means the address query failed; a successful empty set is Some("-").
+    ipv4: Option<String>,
 }
 
 struct OwnedIfTable {
@@ -928,7 +929,10 @@ impl NetworkPageState {
                 bytes_total: bytes_total
                     .map(format_counter)
                     .unwrap_or_else(|| "-".to_string()),
-                ipv4: raw_adapter.ipv4,
+                ipv4: raw_adapter
+                    .ipv4
+                    .or_else(|| previous_state.as_ref().map(|state| state.ipv4.clone()))
+                    .unwrap_or_else(|| adapter_state("Unknown").to_string()),
                 current_sent: raw_adapter.bytes_sent,
                 current_received: raw_adapter.bytes_received,
                 sent_history,
@@ -976,7 +980,7 @@ impl NetworkPageState {
         let table = unsafe { OwnedIfTable::from_raw(raw_table) }
             .ok_or(windows_sys::Win32::Foundation::ERROR_INVALID_DATA)?;
 
-        let ipv4_query = query_unicast_ipv4_by_index();
+        let ipv4_query = query_unicast_ipv4_by_identity();
         let ipv4_error = ipv4_query.as_ref().err().copied();
         let ipv4_map = ipv4_query.ok();
 
@@ -1007,7 +1011,15 @@ impl NetworkPageState {
                 receive_link_speed_bps: row.ReceiveLinkSpeed,
                 bytes_sent: row.OutOctets,
                 bytes_received: row.InOctets,
-                ipv4: ipv4_label(row.InterfaceIndex, ipv4_map.as_ref()),
+                ipv4: ipv4_map.as_ref().map(|addresses| {
+                    addresses
+                        .get(&AdapterIdentity {
+                            luid: unsafe { row.InterfaceLuid.Value },
+                            interface_index: row.InterfaceIndex,
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| "-".to_string())
+                }),
             });
         }
         Ok(AdapterSample {
@@ -1411,17 +1423,7 @@ fn include_adapter(row: &MIB_IF_ROW2) -> bool {
 
 const MAX_ADAPTER_ADDRESS_BYTES: u32 = 1024 * 1024;
 
-fn ipv4_label(interface_index: u32, addresses: Option<&HashMap<u32, String>>) -> String {
-    match addresses {
-        Some(addresses) => addresses
-            .get(&interface_index)
-            .cloned()
-            .unwrap_or_else(|| "-".to_string()),
-        None => adapter_state("Unknown").to_string(),
-    }
-}
-
-fn query_unicast_ipv4_by_index() -> Result<HashMap<u32, String>, u32> {
+fn query_unicast_ipv4_by_identity() -> Result<HashMap<AdapterIdentity, String>, u32> {
     // 跳过 anycast / multicast / DNS，只留下单播地址供 FirstUnicastAddress 遍历。
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     let mut size = 16 * 1024u32;
@@ -1455,7 +1457,9 @@ fn query_unicast_ipv4_by_index() -> Result<HashMap<u32, String>, u32> {
     Err(ERROR_BUFFER_OVERFLOW)
 }
 
-fn ipv4_map_from_adapters(mut head: *const IP_ADAPTER_ADDRESSES_LH) -> HashMap<u32, String> {
+fn ipv4_map_from_adapters(
+    mut head: *const IP_ADAPTER_ADDRESSES_LH,
+) -> HashMap<AdapterIdentity, String> {
     let mut addresses = HashMap::new();
     let mut adapters_seen = 0u32;
     while !head.is_null() && adapters_seen < 4096 {
@@ -1467,8 +1471,11 @@ fn ipv4_map_from_adapters(mut head: *const IP_ADAPTER_ADDRESSES_LH) -> HashMap<u
         if text != "-" {
             // SAFETY: `Anonymous1.Anonymous` is the Length/IfIndex view that
             // `GetAdaptersAddresses` initializes for every returned adapter.
-            let interface_index = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
-            addresses.insert(interface_index, text);
+            let key = AdapterIdentity {
+                luid: unsafe { adapter.Luid.Value },
+                interface_index: unsafe { adapter.Anonymous1.Anonymous.IfIndex },
+            };
+            addresses.insert(key, text);
         }
         head = adapter.Next;
     }
@@ -2058,6 +2065,43 @@ mod tests {
         let columns = adapter_row_texts(&adapter);
         assert_eq!(columns[0], "Renamed Ethernet");
         assert_eq!(columns[4], "192.168.0.2");
+    }
+
+    #[test]
+    fn failed_ipv4_query_preserves_only_the_same_adapters_last_address() {
+        let now = Instant::now();
+        let mut page = NetworkPageState {
+            adapters: vec![test_adapter("Ethernet")],
+            last_sample_time: Some(now),
+            ..Default::default()
+        };
+        let sample = |luid, ipv4| RawAdapterEntry {
+            interface_index: 7,
+            key: AdapterIdentity {
+                luid,
+                interface_index: 7,
+            },
+            name: "Ethernet".to_string(),
+            state: "Connected".to_string(),
+            transmit_link_speed_bps: 1_000_000_000,
+            receive_link_speed_bps: 1_000_000_000,
+            bytes_sent: 100,
+            bytes_received: 200,
+            ipv4,
+        };
+        page.apply_adapter_snapshot(vec![sample(42, None)], now);
+        assert_eq!(page.adapters[0].ipv4, "192.168.0.2");
+        assert_eq!(page.adapters[0].current_received, 200);
+
+        // A successful empty address set must clear the retained value.
+        page.apply_adapter_snapshot(vec![sample(42, Some("-".to_string()))], now);
+        assert_eq!(page.adapters[0].ipv4, "-");
+        page.apply_adapter_snapshot(vec![sample(42, Some("10.1.2.3".to_string()))], now);
+        assert_eq!(page.adapters[0].ipv4, "10.1.2.3");
+
+        // Reusing an interface index does not transfer an old adapter's address.
+        page.apply_adapter_snapshot(vec![sample(43, None)], now);
+        assert_eq!(page.adapters[0].ipv4, adapter_state("Unknown"));
     }
 
     fn ipv4_text_from_sockaddr_list(nodes: &[(u16, &[u8])]) -> String {
