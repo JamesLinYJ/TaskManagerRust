@@ -120,3 +120,15 @@ and driver versions before starting.
 When a capability is genuinely absent, record **Unsupported** rather than failing the whole machine
 row. When a query unexpectedly fails, record **Error** with its native code and keep the row open
 until the cause is understood.
+
+## Startup apps
+
+The Startup page reads the native 64-bit registry view for `HKCU` and `HKLM` `\Run`, the explicit
+`WOW6432Node` Run key, and the current-user and common Startup folders from `SHGetKnownFolderPath`.
+Enabled state comes from the matching `StartupApproved` value. A missing value is enabled. Enable
+and disable rewrite that value only, then read it back; they do not delete the Run value or the
+Startup-folder file.
+
+| Check | Evidence | Status |
+| --- | --- | --- |
+| Startup enumeration, enable, and disable on a Windows device | Not run for this change. Automated model tests cover the approved-byte format, command parsing, selection identity, and failure classification. Windows CI typechecks and runs the crate tests; that is not a hands-on Startup page check. | Pending |

@@ -26,6 +26,15 @@ pub fn user_session_column_title() -> &'static str {
     text(TextKey::Session)
 }
 
+pub fn startup_column_titles() -> [&'static str; 4] {
+    [
+        text(TextKey::StartupColumnName),
+        text(TextKey::StartupColumnPublisher),
+        text(TextKey::StartupColumnLocation),
+        text(TextKey::Status),
+    ]
+}
+
 pub fn service_column_titles() -> [&'static str; 5] {
     [
         text(TextKey::ServiceColumnName),
