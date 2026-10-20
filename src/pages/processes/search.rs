@@ -185,15 +185,17 @@ fn image_file_name(path: &str) -> Option<&str> {
 fn launch_search_url(url: &str) -> Result<(), ProcessSearchFailure> {
     let verb = to_wide_null("open");
     let target = to_wide_null(url);
-    let mut execute_info = SHELLEXECUTEINFOW::default();
-    execute_info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
-    execute_info.fMask = SEE_MASK_FLAG_NO_UI;
-    execute_info.hwnd = null_mut();
-    execute_info.lpVerb = verb.as_ptr();
-    execute_info.lpFile = target.as_ptr();
-    execute_info.lpParameters = null();
-    execute_info.lpDirectory = null();
-    execute_info.nShow = SW_SHOWNORMAL;
+    let mut execute_info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_FLAG_NO_UI,
+        hwnd: null_mut(),
+        lpVerb: verb.as_ptr(),
+        lpFile: target.as_ptr(),
+        lpParameters: null(),
+        lpDirectory: null(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
+    };
     // SAFETY: the verb and URL are NUL-terminated and live for this call.
     // SEE_MASK_FLAG_NO_UI keeps the shell from opening its own error dialog on
     // the worker thread; the UI thread shows the failure dialog instead.
