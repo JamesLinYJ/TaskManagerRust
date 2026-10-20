@@ -22,15 +22,17 @@ use std::ptr::{null, null_mut};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER,
-    GetLastError, HANDLE, SetLastError,
+    GetLastError, HANDLE, HWND, SetLastError,
 };
 use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW};
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL,
+};
 
-use crate::infrastructure::native::to_wide_null;
+use crate::infrastructure::native::{record_hresult_error, to_wide_null};
 use crate::infrastructure::worker::{SingleFlightWorker, replace_pending};
 use crate::system::process_identity::{ProcIdentity, open_process_for_identity};
 use crate::ui::resource_ids::PWM_PROC_SEARCH_COMPLETE;
@@ -48,6 +50,7 @@ pub(super) struct ProcessSearchRequest {
 pub(super) enum ProcessSearchFailure {
     Win32(u32),
     Shell(i32),
+    Hresult(i32),
 }
 
 pub(super) fn search_online_menu_enabled(identity: ProcIdentity, image_name: &str) -> bool {
@@ -208,7 +211,7 @@ fn launch_search_url(url: &str) -> Result<(), ProcessSearchFailure> {
 
 struct SearchWorkerState {
     _com: Option<SearchComApartment>,
-    com_error: Option<u32>,
+    com_error: Option<ProcessSearchFailure>,
 }
 
 impl SearchWorkerState {
@@ -227,7 +230,10 @@ impl SearchWorkerState {
 
     fn run(&mut self, request: ProcessSearchRequest) -> Result<(), ProcessSearchFailure> {
         if let Some(error) = self.com_error {
-            return Err(ProcessSearchFailure::Win32(error));
+            if let ProcessSearchFailure::Hresult(code) = error {
+                record_hresult_error("process image search COM initialization", code);
+            }
+            return Err(error);
         }
         perform_process_image_search(request.identity, &request.image_name)
     }
@@ -236,7 +242,7 @@ impl SearchWorkerState {
 struct SearchComApartment;
 
 impl SearchComApartment {
-    fn initialize() -> Result<Option<Self>, u32> {
+    fn initialize() -> Result<Option<Self>, ProcessSearchFailure> {
         // SAFETY: this runs on the search worker thread before any shell call.
         // A successful result, including S_FALSE, is balanced by `Drop`.
         let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -245,7 +251,7 @@ impl SearchComApartment {
         } else if result.0 == RPC_E_CHANGED_MODE {
             Ok(None)
         } else {
-            Err(hresult_to_win32(result.0))
+            Err(classify_com_init_failure(result.0))
         }
     }
 }
@@ -258,13 +264,52 @@ impl Drop for SearchComApartment {
     }
 }
 
-fn hresult_to_win32(hr: i32) -> u32 {
+/// `FACILITY_WIN32` still yields the Win32 code. Every other HRESULT, including
+/// `E_UNEXPECTED`, stays in the COM domain.
+pub(super) fn classify_com_init_failure(hr: i32) -> ProcessSearchFailure {
     let raw = hr as u32;
     if raw & 0xFFFF_0000 == 0x8007_0000 {
         let code = raw & 0xFFFF;
-        if code == 0 { ERROR_GEN_FAILURE } else { code }
+        if code == 0 {
+            ProcessSearchFailure::Win32(ERROR_GEN_FAILURE)
+        } else {
+            ProcessSearchFailure::Win32(code)
+        }
     } else {
-        ERROR_GEN_FAILURE
+        ProcessSearchFailure::Hresult(hr)
+    }
+}
+
+pub(super) fn show_search_failure_dialog(
+    hwnd: HWND,
+    title: &str,
+    summary: &str,
+    failure: ProcessSearchFailure,
+) {
+    let message = match failure {
+        ProcessSearchFailure::Hresult(code) => {
+            format!("{summary}\r\n\r\nHRESULT: 0x{:08X}", code as u32)
+        }
+        ProcessSearchFailure::Win32(error) => format!("{summary}\r\n\r\nWin32 error: {error}"),
+        ProcessSearchFailure::Shell(code) => {
+            let error = match u32::try_from(code) {
+                Ok(error) if error != 0 => error,
+                _ => ERROR_GEN_FAILURE,
+            };
+            format!("{summary}\r\n\r\nWin32 error: {error}")
+        }
+    };
+    let title_wide = to_wide_null(title);
+    let message_wide = to_wide_null(&message);
+    // SAFETY: both UTF-16 buffers are terminated and live for this synchronous call.
+    // `hwnd` is the process page and is only borrowed.
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            message_wide.as_ptr(),
+            title_wide.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 
@@ -374,9 +419,24 @@ mod tests {
     }
 
     #[test]
-    fn hresult_win32_facility_keeps_the_code() {
-        assert_eq!(hresult_to_win32(0x8007_0005_u32 as i32), 5);
-        assert_eq!(hresult_to_win32(0x8000_4005_u32 as i32), ERROR_GEN_FAILURE);
-        assert_eq!(hresult_to_win32(0x8007_0000_u32 as i32), ERROR_GEN_FAILURE);
+    fn com_init_keeps_non_win32_hresult() {
+        let unexpected = 0x8000_FFFFu32 as i32;
+        assert_eq!(
+            classify_com_init_failure(unexpected),
+            ProcessSearchFailure::Hresult(unexpected)
+        );
+        let e_fail = 0x8000_4005_u32 as i32;
+        assert_eq!(
+            classify_com_init_failure(e_fail),
+            ProcessSearchFailure::Hresult(e_fail)
+        );
+        assert_eq!(
+            classify_com_init_failure(0x8007_0005_u32 as i32),
+            ProcessSearchFailure::Win32(5)
+        );
+        assert_eq!(
+            classify_com_init_failure(0x8007_0000_u32 as i32),
+            ProcessSearchFailure::Win32(ERROR_GEN_FAILURE)
+        );
     }
 }

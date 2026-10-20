@@ -67,7 +67,8 @@ use self::actions::load_debugger_path;
 use self::model::{DirtyColumns, ProcEntry, column_text, compare_entries, update_process_entry};
 use self::sampler::{ProcWorkerRequest, ProcWorkerResult, ProcWorkerState};
 use self::search::{
-    ProcessSearchFailure, ProcessSearchRequest, search_online_menu_enabled, spawn_search_worker,
+    ProcessSearchFailure, ProcessSearchRequest, search_online_menu_enabled,
+    show_search_failure_dialog, spawn_search_worker,
 };
 use self::tree::{
     TreeRow, expansion_ancestors, layout_process_rows, nearest_visible_identity,
@@ -1090,14 +1091,17 @@ impl ProcessPageState {
     }
 
     fn show_search_failure(&self, failure: ProcessSearchFailure) {
-        let error = match failure {
-            ProcessSearchFailure::Win32(error) => error,
-            ProcessSearchFailure::Shell(code) => match u32::try_from(code) {
-                Ok(error) if error != 0 => error,
-                _ => ERROR_GEN_FAILURE,
-            },
+        let title = if self.strings.warning.is_empty() {
+            "Task Manager".to_string()
+        } else {
+            self.strings.warning.clone()
         };
-        self.show_failure_message(&self.strings.cant_search_online, error);
+        show_search_failure_dialog(
+            self.hwnd_page,
+            &title,
+            &self.strings.cant_search_online,
+            failure,
+        );
     }
 
     // 按当前排序列和方向重排 entries；文本列直接比较预先缓存的小写字符串。
