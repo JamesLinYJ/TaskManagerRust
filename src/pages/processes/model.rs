@@ -22,6 +22,7 @@ use super::ProcessStrings;
 use crate::config::options::ColumnId;
 use crate::infrastructure::native::{ProcessArchitecture, append_architecture_suffix};
 use crate::system::process_identity::ProcIdentity;
+use crate::ui::localization::{TextKey, text};
 use crate::ui::resource_ids::NUM_COLUMN;
 
 #[derive(Clone, Copy, Default)]
@@ -82,6 +83,13 @@ pub struct ProcEntry {
     pub(super) priority_class: u32,
     pub(super) handle_count: u32,
     pub(super) thread_count: u32,
+    pub(super) command_line: Option<String>,
+    pub(super) io_read_bytes: Option<u64>,
+    pub(super) io_write_bytes: Option<u64>,
+    pub(super) io_read_count: Option<u64>,
+    pub(super) io_write_count: Option<u64>,
+    pub(super) gdi_objects: Option<u32>,
+    pub(super) user_objects: Option<u32>,
     pub(super) display_text: [String; NUM_COLUMN],
     pub(super) pass_count: u64,
     pub(super) dirty_columns: DirtyColumns,
@@ -124,6 +132,15 @@ pub(super) fn compare_entries(
         }
         ColumnId::HandleCount => left.handle_count.cmp(&right.handle_count),
         ColumnId::ThreadCount => left.thread_count.cmp(&right.thread_count),
+        ColumnId::CommandLine => {
+            cmp_option(left.command_line.as_deref(), right.command_line.as_deref())
+        }
+        ColumnId::IoReadBytes => cmp_option(left.io_read_bytes, right.io_read_bytes),
+        ColumnId::IoWriteBytes => cmp_option(left.io_write_bytes, right.io_write_bytes),
+        ColumnId::IoReadCount => cmp_option(left.io_read_count, right.io_read_count),
+        ColumnId::IoWriteCount => cmp_option(left.io_write_count, right.io_write_count),
+        ColumnId::GdiObjects => cmp_option(left.gdi_objects, right.gdi_objects),
+        ColumnId::UserObjects => cmp_option(left.user_objects, right.user_objects),
     };
 
     if ordering == Ordering::Equal {
@@ -189,6 +206,29 @@ fn format_signed_kilobytes(value: i64) -> String {
     format!("{value} K")
 }
 
+fn cmp_option<T: Ord>(left: Option<T>, right: Option<T>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+    }
+}
+
+fn format_known_or_unknown(value: Option<impl ToString>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => text(TextKey::NotAvailable).to_string(),
+    }
+}
+
+fn format_command_line(value: &Option<String>) -> String {
+    match value {
+        Some(value) => value.replace(['\r', '\n'], " "),
+        None => text(TextKey::NotAvailable).to_string(),
+    }
+}
+
 // 遍历进程树，按“子进程先于父进程”的顺序返回终止列表（后序遍历）。
 // 使用 Toolhelp 快照建立父子关系表，递归收集子进程。
 impl ProcEntry {
@@ -221,6 +261,13 @@ impl ProcEntry {
             ColumnId::BasePriority => return,
             ColumnId::HandleCount => self.handle_count.to_string(),
             ColumnId::ThreadCount => self.thread_count.to_string(),
+            ColumnId::CommandLine => format_command_line(&self.command_line),
+            ColumnId::IoReadBytes => format_known_or_unknown(self.io_read_bytes),
+            ColumnId::IoWriteBytes => format_known_or_unknown(self.io_write_bytes),
+            ColumnId::IoReadCount => format_known_or_unknown(self.io_read_count),
+            ColumnId::IoWriteCount => format_known_or_unknown(self.io_write_count),
+            ColumnId::GdiObjects => format_known_or_unknown(self.gdi_objects),
+            ColumnId::UserObjects => format_known_or_unknown(self.user_objects),
         };
         self.display_text[column_id as usize] = text;
     }
@@ -338,6 +385,34 @@ pub(super) fn update_process_entry(
     if entry.thread_count != snapshot.thread_count {
         entry.thread_count = snapshot.thread_count;
         mark_process_column_changed(entry, &mut changed, ColumnId::ThreadCount, visible_columns);
+    }
+    if entry.command_line != snapshot.command_line {
+        entry.command_line.clone_from(&snapshot.command_line);
+        mark_process_column_changed(entry, &mut changed, ColumnId::CommandLine, visible_columns);
+    }
+    if entry.io_read_bytes != snapshot.io_read_bytes {
+        entry.io_read_bytes = snapshot.io_read_bytes;
+        mark_process_column_changed(entry, &mut changed, ColumnId::IoReadBytes, visible_columns);
+    }
+    if entry.io_write_bytes != snapshot.io_write_bytes {
+        entry.io_write_bytes = snapshot.io_write_bytes;
+        mark_process_column_changed(entry, &mut changed, ColumnId::IoWriteBytes, visible_columns);
+    }
+    if entry.io_read_count != snapshot.io_read_count {
+        entry.io_read_count = snapshot.io_read_count;
+        mark_process_column_changed(entry, &mut changed, ColumnId::IoReadCount, visible_columns);
+    }
+    if entry.io_write_count != snapshot.io_write_count {
+        entry.io_write_count = snapshot.io_write_count;
+        mark_process_column_changed(entry, &mut changed, ColumnId::IoWriteCount, visible_columns);
+    }
+    if entry.gdi_objects != snapshot.gdi_objects {
+        entry.gdi_objects = snapshot.gdi_objects;
+        mark_process_column_changed(entry, &mut changed, ColumnId::GdiObjects, visible_columns);
+    }
+    if entry.user_objects != snapshot.user_objects {
+        entry.user_objects = snapshot.user_objects;
+        mark_process_column_changed(entry, &mut changed, ColumnId::UserObjects, visible_columns);
     }
 
     changed

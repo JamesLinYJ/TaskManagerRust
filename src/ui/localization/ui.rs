@@ -148,6 +148,13 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
             set_dialog_item_text(hwnd, IDC_BASEPRIORITY, TextKey::BasePriority);
             set_dialog_item_text(hwnd, IDC_HANDLECOUNT, TextKey::HandleCount);
             set_dialog_item_text(hwnd, IDC_THREADCOUNT, TextKey::ThreadCount);
+            set_dialog_item_text(hwnd, IDC_COMMANDLINE, TextKey::CommandLine);
+            set_dialog_item_text(hwnd, IDC_IOREADBYTES, TextKey::IoReadBytes);
+            set_dialog_item_text(hwnd, IDC_IOWRITEBYTES, TextKey::IoWriteBytes);
+            set_dialog_item_text(hwnd, IDC_IOREADCOUNT, TextKey::IoReadCount);
+            set_dialog_item_text(hwnd, IDC_IOWRITECOUNT, TextKey::IoWriteCount);
+            set_dialog_item_text(hwnd, IDC_GDIOBJECTS, TextKey::GdiObjects);
+            set_dialog_item_text(hwnd, IDC_USEROBJECTS, TextKey::UserObjects);
         }
         IDD_AFFINITY => {
             set_window_text(hwnd, TextKey::ProcessorAffinity);
