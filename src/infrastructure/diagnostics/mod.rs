@@ -2310,6 +2310,23 @@ mod tests {
     }
 
     #[test]
+    fn flag_driven_shutdown_does_not_leave_the_reply_waiting() {
+        let shared = Arc::new(test_shared(false));
+        shared.shutdown.store(true, Ordering::Release);
+        let (_regular, regular) = bounded(1);
+        let (_priority, priority) = bounded(1);
+        let (control_sender, controls) = bounded(1);
+        let (reply_sender, reply) = bounded(1);
+        control_sender
+            .send(WriterControl::Shutdown(reply_sender))
+            .unwrap();
+        let writer = thread::spawn(move || writer_loop(shared, None, regular, priority, controls));
+        let result = reply.recv_timeout(Duration::from_secs(1));
+        writer.join().unwrap();
+        assert_ne!(result, Err(crossbeam_channel::RecvTimeoutError::Timeout));
+    }
+
+    #[test]
     fn writer_stops_when_shutdown_control_cannot_be_queued() {
         let shared = Arc::new(test_shared(false));
         shared.shutdown.store(true, Ordering::Release);

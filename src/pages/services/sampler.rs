@@ -26,10 +26,11 @@ use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW,
     OpenSCManagerW, OpenServiceW, QueryServiceConfig2W, QueryServiceConfigW, QueryServiceStatusEx,
     SC_ENUM_PROCESS_INFO, SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE, SC_STATUS_PROCESS_INFO,
-    SERVICE_ACCEPT_STOP, SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_CONTINUE,
-    SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW, SERVICE_PAUSE_CONTINUE,
-    SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STATE_ALL, SERVICE_STATUS,
-    SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_WIN32, StartServiceW,
+    SERVICE_ACCEPT_PAUSE_CONTINUE, SERVICE_ACCEPT_STOP, SERVICE_CONFIG_DESCRIPTION,
+    SERVICE_CONTROL_CONTINUE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW,
+    SERVICE_PAUSE_CONTINUE, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_START,
+    SERVICE_STATE_ALL, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_WIN32,
+    StartServiceW,
 };
 use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -56,6 +57,7 @@ pub(super) struct ServiceRecord {
     pub(super) status: ServiceRunState,
     pub(super) startup: ServiceStartupType,
     pub(super) accepts_stop: bool,
+    pub(super) accepts_pause_continue: bool,
     pub(super) process: Option<OwningProcess>,
 }
 
@@ -191,6 +193,7 @@ fn collect_services() -> Result<ServiceCollection, u32> {
             status: entry.status,
             startup,
             accepts_stop: entry.accepts_stop,
+            accepts_pause_continue: entry.accepts_pause_continue,
             process,
         });
     }
@@ -205,6 +208,7 @@ struct EnumeratedService {
     service_name: String,
     status: ServiceRunState,
     accepts_stop: bool,
+    accepts_pause_continue: bool,
     process_id: u32,
 }
 
@@ -270,6 +274,9 @@ fn enumerate_win32_services(
                     status,
                     accepts_stop: record.ServiceStatusProcess.dwControlsAccepted
                         & SERVICE_ACCEPT_STOP
+                        != 0,
+                    accepts_pause_continue: record.ServiceStatusProcess.dwControlsAccepted
+                        & SERVICE_ACCEPT_PAUSE_CONTINUE
                         != 0,
                     // SCM does not guarantee the PID while starting/stopping, and stopped
                     // services have no valid owning PID. Do not resolve an unrelated process.

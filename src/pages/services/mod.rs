@@ -74,6 +74,7 @@ struct ServiceRow {
     status_sort: String,
     startup: ServiceStartupType,
     accepts_stop: bool,
+    accepts_pause_continue: bool,
     startup_text: String,
     startup_sort: String,
     process: Option<ProcIdentity>,
@@ -656,6 +657,7 @@ impl ServicePageState {
             status: row.status,
             startup: row.startup,
             accepts_stop: row.accepts_stop,
+            accepts_pause_continue: row.accepts_pause_continue,
             process: row.process,
         })
     }
@@ -762,6 +764,7 @@ fn service_row(record: self::sampler::ServiceRecord, pid_label: &str) -> Service
         status_text,
         startup: record.startup,
         accepts_stop: record.accepts_stop,
+        accepts_pause_continue: record.accepts_pause_continue,
         startup_sort: startup_text.to_lowercase(),
         startup_text,
         process_sort: process_text.to_lowercase(),
@@ -839,6 +842,7 @@ mod tests {
                     status: ServiceRunState::Running,
                     startup: ServiceStartupType::Manual,
                     accepts_stop: true,
+                    accepts_pause_continue: true,
                     process: Some(model::OwningProcess {
                         identity: ProcIdentity::new(44, 100),
                         image_name: Some("service.exe".to_string()),
@@ -918,6 +922,7 @@ mod tests {
                     status: ServiceRunState::Stopped,
                     startup: ServiceStartupType::Manual,
                     accepts_stop: false,
+                    accepts_pause_continue: false,
                     process: None,
                 },
                 "PID",

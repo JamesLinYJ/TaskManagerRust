@@ -391,10 +391,6 @@ impl Options {
         self.flags & FLAG_ALWAYS_ON_TOP != 0
     }
 
-    pub fn set_always_on_top(&mut self, value: bool) {
-        self.set_flag(FLAG_ALWAYS_ON_TOP, value);
-    }
-
     pub fn kernel_times(&self) -> bool {
         self.flags & FLAG_KERNEL_TIMES != 0
     }

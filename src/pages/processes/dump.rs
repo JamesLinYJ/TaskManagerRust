@@ -22,9 +22,9 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use windows_sys::Win32::Foundation::{
@@ -35,9 +35,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
-    FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT, FileDispositionInfo, FlushFileBuffers,
-    GetFileAttributesW, GetFileInformationByHandle, INVALID_FILE_ATTRIBUTES,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
+    FILE_FLAG_OPEN_REPARSE_POINT, FileDispositionInfo, FlushFileBuffers, GetFileAttributesW,
+    GetFileInformationByHandle, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{MiniDumpWithFullMemory, MiniDumpWriteDump};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
@@ -129,7 +129,7 @@ pub(super) struct DumpWorker {
     command_tx: Option<SyncSender<WorkerCommand>>,
     completion_rx: Option<Receiver<ProcessDumpReport>>,
     thread: Option<JoinHandle<()>>,
-    accepting: Arc<AtomicBool>,
+    accepting: Arc<Mutex<bool>>,
     in_flight: bool,
 }
 
@@ -137,7 +137,7 @@ impl DumpWorker {
     fn spawn() -> Result<Self, u32> {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
-        let accepting = Arc::new(AtomicBool::new(true));
+        let accepting = Arc::new(Mutex::new(true));
         let accepting_worker = Arc::clone(&accepting);
         let thread = thread::Builder::new()
             .name("taskmgr-rs-process-dump".to_string())
@@ -157,7 +157,12 @@ impl DumpWorker {
     }
 
     fn request(&mut self, request: ProcessDumpRequest, notify_hwnd: isize) -> Result<(), u32> {
-        if self.in_flight || !self.accepting.load(Ordering::Acquire) {
+        if self.in_flight
+            || !*self
+                .accepting
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        {
             return Err(ERROR_BUSY);
         }
         let sender = self.command_tx.as_ref().ok_or(ERROR_GEN_FAILURE)?;
@@ -201,7 +206,10 @@ impl DumpWorker {
 
 impl Drop for DumpWorker {
     fn drop(&mut self) {
-        self.accepting.store(false, Ordering::Release);
+        *self
+            .accepting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = false;
         // Dropping the completion receiver unblocks a worker blocked on send.
         // Dropping the command sender lets the loop exit after the current dump.
         // The join handle is detached: waiting here would freeze window destruction.
@@ -214,7 +222,7 @@ impl Drop for DumpWorker {
 fn dump_worker_loop(
     command_rx: Receiver<WorkerCommand>,
     completion_tx: SyncSender<ProcessDumpReport>,
-    accepting: Arc<AtomicBool>,
+    accepting: Arc<Mutex<bool>>,
 ) {
     while let Ok(command) = command_rx.recv() {
         match command {
@@ -223,13 +231,16 @@ fn dump_worker_loop(
                 notify_hwnd,
             } => {
                 let report = perform_dump(request);
-                if !accepting.load(Ordering::Acquire) {
+                if !*accepting.lock().unwrap_or_else(|error| error.into_inner()) {
                     break;
                 }
                 if completion_tx.send(report).is_err() {
                     break;
                 }
-                if accepting.load(Ordering::Acquire) && notify_hwnd != 0 {
+                // Serialize the final validity check and post with page teardown. An atomic
+                // check alone leaves a race where an HWND can be destroyed and reused.
+                let accepting = accepting.lock().unwrap_or_else(|error| error.into_inner());
+                if *accepting && notify_hwnd != 0 {
                     // SAFETY: `notify_hwnd` is the process page. The page sets `accepting`
                     // false before it is destroyed, and the posted handler ignores a worker
                     // that has already been dropped.
@@ -304,7 +315,11 @@ impl ProcessPageState {
         let Some(worker) = self.dump_worker.as_mut() else {
             return;
         };
-        if !worker.accepting.load(Ordering::Acquire) {
+        if !*worker
+            .accepting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+        {
             return;
         }
         for report in worker.drain() {
@@ -550,26 +565,29 @@ fn is_create_collision(error: u32) -> bool {
 fn create_partial_dump_file(path: &Path) -> Result<PartialDumpFile, u32> {
     let wide = wide_path(path);
     // SAFETY: `wide` is NUL-terminated and remains live for this synchronous call.
-    // CREATE_NEW refuses an existing name instead of truncating it. DELETE_ON_CLOSE
-    // removes the new file when this handle closes unless the disposition is cleared.
+    // CREATE_NEW refuses an existing name instead of truncating it. A reversible delete
+    // disposition is installed before writing any process memory; the create-time
+    // FILE_FLAG_DELETE_ON_CLOSE cannot be cancelled when committing the completed dump.
     // Share mode is zero so another reader cannot keep the memory dump alive.
     let raw = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            GENERIC_READ | GENERIC_WRITE | windows_sys::Win32::Storage::FileSystem::DELETE,
             0,
             null(),
             CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             null_mut(),
         )
     };
     let handle = unsafe { OwnedHandle::from_raw(raw) }.ok_or_else(last_error_or_gen_failure)?;
-    Ok(PartialDumpFile {
+    let partial = PartialDumpFile {
         path: path.to_path_buf(),
         handle: Some(handle),
         delete_on_close: true,
-    })
+    };
+    set_delete_disposition(partial.handle.as_ref().expect("new handle"), true)?;
+    Ok(partial)
 }
 
 fn handle_is_reparse(handle: &OwnedHandle) -> Result<bool, u32> {
@@ -599,7 +617,11 @@ fn commit_partial(partial: &mut PartialDumpFile, destination: &Path) -> Result<(
 }
 
 fn clear_delete_on_close(handle: &OwnedHandle) -> Result<(), u32> {
-    let info = FILE_DISPOSITION_INFO { DeleteFile: false };
+    set_delete_disposition(handle, false)
+}
+
+fn set_delete_disposition(handle: &OwnedHandle, delete: bool) -> Result<(), u32> {
+    let info = FILE_DISPOSITION_INFO { DeleteFile: delete };
     // SAFETY: `handle` is the file this call created. `info` stays live for the call
     // and matches `FileDispositionInfo`.
     if unsafe {
@@ -866,6 +888,64 @@ mod tests {
             strip_menu_accelerator("Abbilddatei erstellen (&F)"),
             "Abbilddatei erstellen"
         );
+    }
+
+    #[test]
+    fn partial_file_commit_preserves_bytes_and_failure_removes_temporary_file() {
+        use std::fs;
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+        let root = std::env::temp_dir().join(format!(
+            "taskmgr-dump-commit-{}-{}",
+            std::process::id(),
+            super::next_partial_unique(),
+        ));
+        fs::create_dir(&root).expect("create private test directory");
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let temporary = root.join("synthetic.partial");
+        let destination = root.join("synthetic.dmp");
+        let mut partial = super::create_partial_dump_file(&temporary).expect("create temporary");
+        let bytes = b"synthetic test bytes, not process memory";
+        let mut written = 0;
+        // SAFETY: the test owns this file and both buffers remain live for the synchronous write.
+        assert_ne!(
+            unsafe {
+                WriteFile(
+                    partial.handle.as_ref().unwrap().as_raw(),
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(written as usize, bytes.len());
+        assert!(super::commit_partial(&mut partial, &destination).is_ok());
+        drop(partial);
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert!(!temporary.exists());
+
+        let mut partial = super::create_partial_dump_file(&temporary).expect("create again");
+        let failure = super::commit_partial(&mut partial, &root.join("missing/output.dmp"));
+        assert!(failure.is_err());
+        assert!(failure.unwrap_err().cleanup_error.is_none());
+        drop(partial);
+        assert!(!temporary.exists());
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+
+        let partial = super::create_partial_dump_file(&temporary).expect("create abandoned file");
+        drop(partial);
+        assert!(!temporary.exists());
+        fs::write(&temporary, b"existing file").unwrap();
+        assert!(super::create_partial_dump_file(&temporary).is_err());
+        assert_eq!(fs::read(&temporary).unwrap(), b"existing file");
     }
 
     #[test]

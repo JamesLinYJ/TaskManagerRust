@@ -3188,6 +3188,50 @@ mod tests {
     }
 
     #[test]
+    fn name_filter_reveals_collapsed_children_and_restores_tree_selection() {
+        let parent = ProcIdentity::new(1, 10);
+        let child = ProcIdentity::new(2, 20);
+        let mut state = ProcessPageState {
+            selected_identity: Some(parent),
+            ..Default::default()
+        };
+        state.apply_process_snapshot(
+            vec![
+                tree_entry("parent.exe", parent, None),
+                tree_entry("child.exe", child, Some(parent)),
+            ],
+            None,
+        );
+        state.collapsed.insert(parent);
+        state.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
+        assert_eq!(visible_pids(&state), vec![1]);
+        state.name_filter = ProcessNameFilter::from_text("child");
+        state.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
+        assert_eq!(visible_pids(&state), vec![2]);
+        assert_eq!(state.selected_identity, Some(parent));
+        assert_eq!(state.visible_rows[0].depth, 0);
+        state.apply_process_snapshot(
+            vec![
+                tree_entry("parent.exe", parent, None),
+                tree_entry("child.exe", child, Some(parent)),
+            ],
+            None,
+        );
+        assert_eq!(state.selected_identity, Some(parent));
+        state.clear_name_filter();
+        state.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
+        assert_eq!(visible_pids(&state), vec![1]);
+        assert_eq!(state.selected_identity, Some(parent));
+        assert!(state.collapsed.contains(&parent));
+        state.name_filter = ProcessNameFilter::from_text("parent");
+        state.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
+        assert!(state.find_process(child));
+        assert!(state.name_filter.is_empty());
+        assert_eq!(state.selected_identity, Some(child));
+        assert_eq!(visible_pids(&state), vec![1, 2]);
+    }
+
+    #[test]
     fn find_process_shows_the_committed_snapshot_before_refreshing_a_missing_target() {
         let mut alpha = empty_process_entry("alpha.exe");
         alpha.identity = ProcIdentity::new(1, 11);

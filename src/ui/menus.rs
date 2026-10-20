@@ -136,14 +136,12 @@ fn build_common_help_menu() -> MenuResult<PopupMenu> {
 fn build_common_options_menu(include_confirmations: bool) -> MenuResult<PopupMenu> {
     if include_confirmations {
         build_options_menu(&[
-            (IDM_ALWAYSONTOP, TextKey::AlwaysOnTop),
             (IDM_MINIMIZEONUSE, TextKey::MinimizeOnUse),
             (IDM_CONFIRMATIONS, TextKey::Confirmations),
             (IDM_HIDEWHENMIN, TextKey::HideWhenMinimized),
         ])
     } else {
         build_options_menu(&[
-            (IDM_ALWAYSONTOP, TextKey::AlwaysOnTop),
             (IDM_MINIMIZEONUSE, TextKey::MinimizeOnUse),
             (IDM_HIDEWHENMIN, TextKey::HideWhenMinimized),
         ])
@@ -303,6 +301,7 @@ fn build_startup_main_menu() -> MenuResult<MenuBar> {
     let mut view = PopupMenu::new()?;
     append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
     view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
+    append_view_always_on_top(&mut view)?;
     append_common_main_menus(
         &mut bar,
         build_file_menu()?,
@@ -335,7 +334,6 @@ fn build_service_command_menu() -> MenuResult<PopupMenu> {
 fn build_users_main_menu() -> MenuResult<MenuBar> {
     let mut bar = MenuBar::new()?;
     let options = build_options_menu(&[
-        (IDM_ALWAYSONTOP, TextKey::AlwaysOnTop),
         (IDM_MINIMIZEONUSE, TextKey::MinimizeOnUse),
         (IDM_HIDEWHENMIN, TextKey::HideWhenMinimized),
         (IDM_SHOWDOMAINNAMES, TextKey::ShowFullAccountName),
@@ -470,6 +468,9 @@ mod tests {
 
     #[test]
     fn view_menu_toggles_always_on_top_command() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CheckMenuItem, GetMenuState, MF_BYCOMMAND, MF_CHECKED, MF_UNCHECKED,
+        };
         for resource_id in [
             IDR_MAINMENU_TASK,
             IDR_MAINMENU_PROC,
@@ -479,6 +480,7 @@ mod tests {
             IDR_MAINMENU_NET,
             IDR_MAINMENU_USER,
             IDR_MAINMENU_SERVICE,
+            IDR_MAINMENU_STARTUP,
         ] {
             let menu = build_main_menu(resource_id, 2).expect("main menu should build");
             unsafe {
@@ -496,6 +498,15 @@ mod tests {
                     found,
                     "view menu {resource_id} should contain always on top"
                 );
+                // The main-window command searches by ID from the menu bar. A duplicate in
+                // Options would intercept it and leave the View checkmark unchanged.
+                for state in [MF_CHECKED, MF_UNCHECKED] {
+                    CheckMenuItem(menu.as_raw(), IDM_ALWAYSONTOP as u32, MF_BYCOMMAND | state);
+                    assert_eq!(
+                        GetMenuState(view, IDM_ALWAYSONTOP as u32, MF_BYCOMMAND) & MF_CHECKED,
+                        state,
+                    );
+                }
             }
         }
     }

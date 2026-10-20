@@ -96,6 +96,7 @@ pub(crate) struct ServiceCommandInput {
     pub(crate) status: ServiceRunState,
     pub(crate) startup: ServiceStartupType,
     pub(crate) accepts_stop: bool,
+    pub(crate) accepts_pause_continue: bool,
     pub(crate) process: Option<ProcIdentity>,
 }
 
@@ -154,8 +155,9 @@ pub(crate) fn command_state(selected: Option<ServiceCommandInput>) -> ServiceCom
             ),
         go_to_process: service_has_valid_process_id(selected.status)
             && selected.process.is_some_and(ProcIdentity::is_verified),
-        pause: selected.status == ServiceRunState::Running,
-        continue_service: selected.status == ServiceRunState::Paused,
+        pause: selected.accepts_pause_continue && selected.status == ServiceRunState::Running,
+        continue_service: selected.accepts_pause_continue
+            && selected.status == ServiceRunState::Paused,
     }
 }
 
@@ -266,6 +268,7 @@ mod tests {
             status,
             startup,
             accepts_stop: true,
+            accepts_pause_continue: true,
             process,
         }
     }
@@ -382,6 +385,20 @@ mod tests {
             ServiceRunState::ContinuePending,
         ] {
             assert!(service_has_valid_process_id(status));
+        }
+    }
+
+    #[test]
+    fn pause_and_continue_require_scm_acceptance() {
+        for status in [ServiceRunState::Running, ServiceRunState::Paused] {
+            let mut selected = input(status, ServiceStartupType::Automatic, None);
+            selected.accepts_pause_continue = false;
+            let state = command_state(Some(selected));
+            assert!(!state.pause && !state.continue_service);
+            selected.accepts_pause_continue = true;
+            let state = command_state(Some(selected));
+            assert_eq!(state.pause, status == ServiceRunState::Running);
+            assert_eq!(state.continue_service, status == ServiceRunState::Paused);
         }
     }
 

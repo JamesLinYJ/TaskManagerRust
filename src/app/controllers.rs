@@ -298,6 +298,7 @@ mod tests {
             handle_count: 0,
             thread_count: 0,
             process_count: 17,
+            disk: crate::system::disk::DiskActivityUpdate::NoRate,
         }
     }
 
