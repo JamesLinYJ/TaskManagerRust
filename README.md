@@ -16,7 +16,7 @@ This is not a copy of the modern Task Manager. CPU and GPU details come from sys
 - **CPU** shows the processor name, effective frequency, topology, caches, virtualization, ISA features, system rates, and a 60-second utilization graph.
 - **GPU** handles multiple adapters and engines, dedicated and shared memory, temperature, driver details, and DirectX information.
 - **Networking and Users** show adapter throughput history and Windows session state.
-- **Services** lists Win32 services with description, status, startup type, and the owning process. Start, stop, and Go to Process run only when the current row allows them. Go to Process requires a process id plus creation time.
+- **Services** lists Win32 services with description, status, startup type, and the owning process. Start, stop, pause, continue, and Go to Process run only when the current row allows them. Go to Process requires a process id plus creation time.
 
 ## Download
 

@@ -1187,6 +1187,8 @@ impl App {
                 .unwrap_or_default();
             self.enable_menu_item(menu, IDM_SERVICE_START, commands.start);
             self.enable_menu_item(menu, IDM_SERVICE_STOP, commands.stop);
+            self.enable_menu_item(menu, IDM_SERVICE_PAUSE, commands.pause);
+            self.enable_menu_item(menu, IDM_SERVICE_CONTINUE, commands.continue_service);
             self.enable_menu_item(menu, IDM_SERVICE_GOTOPROCESS, commands.go_to_process);
         }
         if self.options.current_page == PageId::Processes.persisted() {
@@ -2299,7 +2301,11 @@ impl App {
                         MessageBeep(0);
                     }
                 }
-                IDM_SERVICE_START | IDM_SERVICE_STOP | IDM_SERVICE_GOTOPROCESS => {
+                IDM_SERVICE_START
+                | IDM_SERVICE_STOP
+                | IDM_SERVICE_PAUSE
+                | IDM_SERVICE_CONTINUE
+                | IDM_SERVICE_GOTOPROCESS => {
                     if self.options.current_page == PageId::Services.persisted() {
                         let handled =
                             self.pages[PageId::Services.index()].handle_service_command(command_id);
