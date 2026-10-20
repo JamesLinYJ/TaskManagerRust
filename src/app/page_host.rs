@@ -303,6 +303,15 @@ impl PageState {
         }
     }
 
+    fn process_view_command_state(
+        &self,
+    ) -> Option<crate::pages::processes::ProcessViewCommandState> {
+        match self {
+            Self::Process(state) => Some(state.view_command_state()),
+            _ => None,
+        }
+    }
+
     fn user_show_domain_names(&self) -> Option<bool> {
         match self {
             Self::Users(state) => Some(state.show_domain_names()),
@@ -910,6 +919,12 @@ impl DialogPage {
 
     pub fn service_command_state(&self) -> Option<crate::pages::services::ServiceCommandState> {
         self.state.service_command_state()
+    }
+
+    pub fn process_view_command_state(
+        &self,
+    ) -> Option<crate::pages::processes::ProcessViewCommandState> {
+        self.state.process_view_command_state()
     }
 
     pub fn user_show_domain_names(&self) -> Option<bool> {

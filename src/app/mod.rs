@@ -1180,6 +1180,14 @@ impl App {
             self.enable_menu_item(menu, IDM_SERVICE_STOP, commands.stop);
             self.enable_menu_item(menu, IDM_SERVICE_GOTOPROCESS, commands.go_to_process);
         }
+        if self.options.current_page == PageId::Processes.persisted() {
+            let commands = self.pages[PageId::Processes.index()]
+                .process_view_command_state()
+                .unwrap_or_default();
+            self.check_menu(menu, IDM_PROC_TREE, commands.tree_mode);
+            self.enable_menu_item(menu, IDM_PROC_EXPAND, commands.can_expand);
+            self.enable_menu_item(menu, IDM_PROC_COLLAPSE, commands.can_collapse);
+        }
 
         // 安全性: same menu handle as above.
         unsafe {
@@ -2264,6 +2272,15 @@ impl App {
                     if self.options.current_page == PageId::Processes.persisted() {
                         self.pages[PageId::Processes.index()]
                             .handle_process_command(command_id, Some(&mut self.options));
+                    } else {
+                        MessageBeep(0);
+                    }
+                }
+                IDM_PROC_TREE | IDM_PROC_EXPAND | IDM_PROC_COLLAPSE => {
+                    if self.options.current_page == PageId::Processes.persisted() {
+                        self.pages[PageId::Processes.index()]
+                            .handle_process_command(command_id, Some(&mut self.options));
+                        self.update_menu_states();
                     } else {
                         MessageBeep(0);
                     }

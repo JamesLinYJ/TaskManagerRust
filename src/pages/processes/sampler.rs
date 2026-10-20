@@ -42,6 +42,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::model::{DirtyColumns, ProcEntry, ProcStaticMetadata};
+use super::tree::{ProcessLink, resolve_parent_identities};
 use crate::infrastructure::native::{
     OwnedHandle, OwnedWtsMemory, query_process_architecture_handle, widestr_ptr_to_string,
 };
@@ -583,6 +584,8 @@ const _: () = {
 struct ParsedProcess {
     pid: u32,
     creation_time_100ns: u64,
+    /// Parent PID from this same `SystemProcessInformation` buffer.
+    parent_pid: Option<u32>,
     cpu_time_100ns: Option<u64>,
     image_name: String,
     session_id: u32,
@@ -711,6 +714,10 @@ fn parsed_process(
     } else {
         header.create_time as u64
     };
+    let parent_pid = u32::try_from(header.inherited_from_unique_process_id).ok();
+    if parent_pid.is_none() {
+        row_error.get_or_insert(ERROR_INVALID_DATA);
+    }
     let image_name = match image_name_from_process_buffer(buffer, header.image_name) {
         Ok(name) => name,
         Err(error) => {
@@ -721,6 +728,7 @@ fn parsed_process(
     Some(ParsedProcess {
         pid,
         creation_time_100ns,
+        parent_pid,
         cpu_time_100ns: cpu_time_from_counters(header.kernel_time, header.user_time, row_error),
         image_name,
         session_id: header.session_id,
@@ -824,6 +832,7 @@ fn build_process_entries(
         };
         let mut entry = ProcEntry {
             identity,
+            parent: None,
             pid: row.pid,
             image_name: image_name.clone(),
             image_name_lower: image_name.to_lowercase(),
@@ -886,6 +895,19 @@ fn build_process_entries(
             );
         }
         entries.push(entry);
+    }
+    // Parent links come only from this snapshot. A row that failed to parse was
+    // already omitted, so its children stay roots and the other rows remain.
+    let links = rows
+        .iter()
+        .zip(entries.iter())
+        .map(|(row, entry)| ProcessLink {
+            identity: entry.identity,
+            parent_pid: row.parent_pid,
+        })
+        .collect::<Vec<_>>();
+    for (entry, parent) in entries.iter_mut().zip(resolve_parent_identities(&links)) {
+        entry.parent = parent;
     }
     CollectedProcessEntries {
         entries,
@@ -1278,6 +1300,55 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_parent_links_reject_a_reused_pid_and_a_missing_parent() {
+        let rows = [
+            sample_row(10, 200, Some(1), "new-parent.exe", 8),
+            sample_row(20, 100, Some(1), "old-child.exe", 8),
+            sample_row(30, 250, Some(1), "new-child.exe", 8),
+            sample_row(40, 260, Some(1), "orphan.exe", 8),
+        ];
+        let mut rows = rows;
+        rows[0].parent_pid = None;
+        rows[1].parent_pid = Some(10);
+        rows[2].parent_pid = Some(10);
+        rows[3].parent_pid = Some(99);
+        let built = build_process_entries(&rows, &HashMap::new(), None);
+        let parent_of = |pid: u32| {
+            built
+                .entries
+                .iter()
+                .find(|entry| entry.pid == pid)
+                .expect("row")
+                .parent
+        };
+        assert_eq!(parent_of(20), None);
+        assert_eq!(parent_of(30), Some(ProcIdentity::new(10, 200)));
+        assert_eq!(parent_of(40), None);
+        assert_eq!(built.entries.len(), 4);
+
+        let buffer = system_process_buffer(&[
+            BufferSpec {
+                pid: 4,
+                creation_time: 50,
+                name: Some("System".to_string()),
+                ..BufferSpec::default()
+            },
+            BufferSpec {
+                pid: 100,
+                creation_time: 80,
+                parent_pid: 4,
+                name: Some("smss.exe".to_string()),
+                ..BufferSpec::default()
+            },
+        ]);
+        let (parsed, _) =
+            parse_system_process_information(&buffer).expect("parent pid should round-trip");
+        assert_eq!(parsed[1].parent_pid, Some(4));
+        let built = build_process_entries(&parsed, &HashMap::new(), None);
+        assert_eq!(built.entries[1].parent, Some(ProcIdentity::new(4, 50)));
+    }
+
+    #[test]
     fn system_process_buffer_reports_idle_counters_and_keeps_a_bad_sibling() {
         let buffer = system_process_buffer(&[
             BufferSpec {
@@ -1304,6 +1375,7 @@ mod tests {
                 commit: 2_048,
                 paged_pool: 1_024,
                 nonpaged_pool: 3_072,
+                parent_pid: 0,
             },
             BufferSpec {
                 pid: 55,
@@ -1413,6 +1485,7 @@ mod tests {
         ParsedProcess {
             pid,
             creation_time_100ns,
+            parent_pid: None,
             cpu_time_100ns,
             image_name: image_name.to_string(),
             session_id: 1,
@@ -1452,6 +1525,7 @@ mod tests {
         commit: usize,
         paged_pool: usize,
         nonpaged_pool: usize,
+        parent_pid: u32,
     }
 
     impl Default for BufferSpec {
@@ -1471,6 +1545,7 @@ mod tests {
                 commit: 0,
                 paged_pool: 0,
                 nonpaged_pool: 0,
+                parent_pid: 0,
             }
         }
     }
@@ -1513,6 +1588,7 @@ mod tests {
                 },
                 base_priority: spec.base_priority,
                 unique_process_id: usize::try_from(spec.pid).unwrap(),
+                inherited_from_unique_process_id: usize::try_from(spec.parent_pid).unwrap(),
                 handle_count: spec.handles,
                 session_id: spec.session_id,
                 page_fault_count: spec.page_faults,

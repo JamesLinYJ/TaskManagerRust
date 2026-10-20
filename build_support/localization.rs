@@ -114,6 +114,15 @@ const MENU_STATUS_HELP_KEYS: &[(&str, &str)] = &[
         "IDM_SERVICE_GOTOPROCESS",
         "crate::ui::resource_ids::IDM_SERVICE_GOTOPROCESS",
     ),
+    ("IDM_PROC_TREE", "crate::ui::resource_ids::IDM_PROC_TREE"),
+    (
+        "IDM_PROC_EXPAND",
+        "crate::ui::resource_ids::IDM_PROC_EXPAND",
+    ),
+    (
+        "IDM_PROC_COLLAPSE",
+        "crate::ui::resource_ids::IDM_PROC_COLLAPSE",
+    ),
 ];
 
 pub(crate) fn generate() {
