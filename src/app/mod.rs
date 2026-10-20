@@ -87,9 +87,9 @@ use crate::config::options::{Options, update_speed_timer_interval};
 use crate::infrastructure::diagnostics::{self, Field, Level};
 use crate::infrastructure::native::{
     OwnedIcon, call_window_proc, enable_debug_privilege, format_resource_string, height, hiword,
-    loword, process_is_elevated, record_hresult_error, record_startup_timing, record_win32_error,
-    sanitize_task_manager_menu, set_dialog_msg_result, set_style, set_window_userdata_ptr,
-    to_wide_null, width, window_userdata_non_null,
+    loword, new_task_allowed, process_is_elevated, record_hresult_error, record_startup_timing,
+    record_win32_error, sanitize_task_manager_menu, set_dialog_msg_result, set_style,
+    set_window_userdata_ptr, to_wide_null, width, window_userdata_non_null,
 };
 use crate::system::cpu_topology::CpuTopologyError;
 use crate::system::process_identity::{ProcIdentity, find_proc_identity};
@@ -2300,7 +2300,9 @@ impl App {
                     }
                 }
                 IDM_RUN => {
-                    if let Err(error) = new_task::show(self.hinstance, hwnd) {
+                    if !new_task_allowed() {
+                        MessageBeep(0);
+                    } else if let Err(error) = new_task::show(self.hinstance, hwnd) {
                         record_win32_error("new task dialog", error);
                         let title = to_wide_null(text(TextKey::NewTaskTitle));
                         let message = to_wide_null(&format!(

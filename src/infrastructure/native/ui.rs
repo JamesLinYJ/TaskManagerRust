@@ -214,6 +214,12 @@ pub fn hiword(value: usize) -> u16 {
     ((value >> 16) & 0xFFFF) as u16
 }
 
+pub fn new_task_allowed() -> bool {
+    // The same shell policy that removes File → New Task applies to every other entry point.
+    // Safety: SHRestricted is a process-local policy query with no pointer inputs.
+    unsafe { SHRestricted(REST_NORUN) == 0 }
+}
+
 pub fn sanitize_task_manager_menu(menu: HMENU, processor_count: usize) {
     // 某些菜单项是否可见由系统策略和 CPU 数量决定。
     // 这里在每次加载菜单后做一次裁剪，避免资源文件里维护多套变体。

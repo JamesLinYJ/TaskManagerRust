@@ -19,7 +19,7 @@ use std::ffi::OsString;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStringExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr::null;
+use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -27,6 +27,9 @@ use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUn
 use windows_sys::Win32::Foundation::{
     ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
     GetLastError, HINSTANCE, HWND, LPARAM, SetLastError, WPARAM,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SearchPathW,
 };
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::UI::Controls::Dialogs::{
@@ -277,7 +280,7 @@ fn launch_new_task(
         record_win32_error("new task environment expansion", error);
         NewTaskError::Win32(error)
     })?;
-    let Some(target) = split_shell_command(&expanded) else {
+    let Some(target) = resolve_shell_target(&expanded, probe_shell_resource) else {
         record_win32_error("new task command line", ERROR_INVALID_PARAMETER);
         return Err(NewTaskError::Win32(ERROR_INVALID_PARAMETER));
     };
@@ -536,6 +539,121 @@ fn context<'a>(hwnd: HWND) -> &'a mut NewTaskDialog {
     unsafe { &mut *(get_window_userdata(hwnd) as *mut NewTaskDialog) }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellResource {
+    Missing,
+    File,
+    Directory,
+}
+
+/// Resolves a command before `ShellExecuteExW` sees it.
+///
+/// An unquoted value that is itself a file or directory, including `C:\Program Files` and an
+/// expanded `%ProgramFiles%\App\app.exe`, stays one shell resource. Arguments are split off only
+/// after the longest existing file prefix is known. A path that does not exist is still passed
+/// whole, so the first space is not treated as the end of the program name.
+fn resolve_shell_target(
+    command_line: &str,
+    mut probe: impl FnMut(&str) -> ShellResource,
+) -> Option<ShellTarget> {
+    let trimmed = command_line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('"') {
+        return split_shell_command(trimmed);
+    }
+    match probe(trimmed) {
+        ShellResource::File | ShellResource::Directory => {
+            return Some(ShellTarget {
+                file: trimmed.to_string(),
+                parameters: String::new(),
+            });
+        }
+        ShellResource::Missing => {}
+    }
+    if let Some(target) = longest_existing_file(trimmed, &mut probe) {
+        return Some(target);
+    }
+    if looks_like_filesystem_path(trimmed) {
+        return Some(ShellTarget {
+            file: trimmed.to_string(),
+            parameters: String::new(),
+        });
+    }
+    split_shell_command(trimmed)
+}
+
+fn longest_existing_file(
+    command_line: &str,
+    probe: &mut impl FnMut(&str) -> ShellResource,
+) -> Option<ShellTarget> {
+    let mut search_end = command_line.len();
+    while let Some(space) = command_line[..search_end].rfind(' ') {
+        let file = command_line[..space].trim_end();
+        let parameters = command_line[space + 1..].trim_start();
+        if !file.is_empty() && probe(file) == ShellResource::File {
+            return Some(ShellTarget {
+                file: file.to_string(),
+                parameters: parameters.to_string(),
+            });
+        }
+        search_end = space;
+    }
+    None
+}
+
+fn looks_like_filesystem_path(value: &str) -> bool {
+    value.contains(['\\', '/'])
+}
+
+fn probe_shell_resource(candidate: &str) -> ShellResource {
+    if candidate.is_empty() {
+        return ShellResource::Missing;
+    }
+    let wide = to_wide_null(candidate);
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes != INVALID_FILE_ATTRIBUTES {
+        return if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            ShellResource::Directory
+        } else {
+            ShellResource::File
+        };
+    }
+    if !candidate.contains([' ', '\\', '/']) && search_path_finds_file(wide.as_ptr()) {
+        ShellResource::File
+    } else {
+        ShellResource::Missing
+    }
+}
+
+fn search_path_finds_file(file_name: *const u16) -> bool {
+    let mut buffer = vec![0u16; 1024];
+    loop {
+        let written = unsafe {
+            SearchPathW(
+                null(),
+                file_name,
+                null(),
+                buffer.len() as u32,
+                buffer.as_mut_ptr(),
+                null_mut(),
+            )
+        };
+        if written == 0 {
+            return false;
+        }
+        let written = written as usize;
+        if written < buffer.len() {
+            return true;
+        }
+        if written > MAX_EXPANDED_COMMAND {
+            return false;
+        }
+        buffer.resize(written, 0);
+    }
+}
+
 /// Splits a command the way `PathGetArgs` / `PathUnquoteSpaces` do.
 ///
 /// Spaces inside quotes stay with the program path. The returned file has one surrounding quote
@@ -614,7 +732,10 @@ fn classify_shell_execute(
 
 #[cfg(test)]
 mod tests {
-    use super::{NewTaskError, classify_shell_execute, command_text_for_path, split_shell_command};
+    use super::{
+        NewTaskError, ShellResource, classify_shell_execute, command_text_for_path,
+        resolve_shell_target, split_shell_command,
+    };
 
     #[test]
     fn command_lines_split_on_unquoted_spaces() {
@@ -637,6 +758,39 @@ mod tests {
         let quoted_only = split_shell_command(r#""C:\Program Files\app.exe""#).unwrap();
         assert_eq!(quoted_only.file, r"C:\Program Files\app.exe");
         assert!(quoted_only.parameters.is_empty());
+    }
+
+    #[test]
+    fn unquoted_paths_with_spaces_stay_one_shell_resource() {
+        let mut resources = |candidate: &str| match candidate {
+            r"C:\Program Files" => ShellResource::Directory,
+            r"C:\Program Files\App\app.exe" => ShellResource::File,
+            r"C:\Program Files\app.exe" => ShellResource::File,
+            _ => ShellResource::Missing,
+        };
+
+        let folder = resolve_shell_target(r"C:\Program Files", &mut resources).unwrap();
+        assert_eq!(folder.file, r"C:\Program Files");
+        assert!(folder.parameters.is_empty());
+
+        let expanded =
+            resolve_shell_target(r"C:\Program Files\App\app.exe", &mut resources).unwrap();
+        assert_eq!(expanded.file, r"C:\Program Files\App\app.exe");
+        assert!(expanded.parameters.is_empty());
+
+        let with_args =
+            resolve_shell_target(r"C:\Program Files\app.exe /foo", &mut resources).unwrap();
+        assert_eq!(with_args.file, r"C:\Program Files\app.exe");
+        assert_eq!(with_args.parameters, "/foo");
+
+        let missing =
+            resolve_shell_target(r"C:\Program Files\missing.exe", &mut resources).unwrap();
+        assert_eq!(missing.file, r"C:\Program Files\missing.exe");
+        assert!(missing.parameters.is_empty());
+
+        let command = resolve_shell_target("notepad file.txt", &mut resources).unwrap();
+        assert_eq!(command.file, "notepad");
+        assert_eq!(command.parameters, "file.txt");
     }
 
     #[test]

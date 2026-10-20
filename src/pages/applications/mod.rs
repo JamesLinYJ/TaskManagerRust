@@ -51,13 +51,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetKeyState, SetFocus, VK_CONTROL,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, CascadeWindows, CheckMenuRadioItem, DeferWindowPos, DrawMenuBar,
-    EnableMenuItem, EndDeferWindowPos, GetClientRect, GetDesktopWindow, GetDlgItem, GetWindowLongW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, MB_ICONERROR, MB_OK, MDITILE_HORIZONTAL,
-    MDITILE_VERTICAL, MF_BYCOMMAND, MF_DISABLED, MF_GRAYED, MessageBoxW, SW_MAXIMIZE, SW_MINIMIZE,
-    SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetMenuDefaultItem, SetWindowLongW, SetWindowPos, ShowWindow,
-    ShowWindowAsync, TPM_RETURNCMD, TileWindows, TrackPopupMenuEx, WM_COMMAND, WM_SETREDRAW,
+    BeginDeferWindowPos, CascadeWindows, CheckMenuRadioItem, DeferWindowPos, DeleteMenu,
+    DrawMenuBar, EnableMenuItem, EndDeferWindowPos, GetClientRect, GetDesktopWindow, GetDlgItem,
+    GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow, MB_ICONERROR, MB_OK,
+    MDITILE_HORIZONTAL, MDITILE_VERTICAL, MF_BYCOMMAND, MF_DISABLED, MF_GRAYED, MessageBoxW,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SendMessageW, SetForegroundWindow, SetMenuDefaultItem, SetWindowLongW, SetWindowPos,
+    ShowWindow, ShowWindowAsync, TPM_RETURNCMD, TileWindows, TrackPopupMenuEx, WM_COMMAND,
+    WM_SETREDRAW,
 };
 use windows_sys::core::BOOL;
 
@@ -69,8 +70,8 @@ use self::sampler::{TaskSamplerCache, TaskWorkerResult, collect_tasks_worker};
 use crate::config::options::{Options, ViewMode};
 use crate::infrastructure::native::{
     ProcessArchitecture, append_architecture_suffix, copy_text_to_callback_buffer,
-    finish_list_view_update, record_win32_error, subclass_list_view, to_wide_null,
-    window_rect_relative_to_page,
+    finish_list_view_update, new_task_allowed, record_win32_error, subclass_list_view,
+    to_wide_null, window_rect_relative_to_page,
 };
 use crate::infrastructure::worker::{SingleFlightWorker, keep_pending};
 use crate::system::process_identity::{
@@ -299,6 +300,7 @@ impl TaskPageState {
                 SetFocus(list_hwnd);
             }
         }
+        self.update_ui_state();
         0
     }
 
@@ -417,8 +419,13 @@ impl TaskPageState {
         // Win32 enumeration or this page's own controls.
         unsafe {
             match command_id {
-                IDM_LARGEICONS | IDM_SMALLICONS | IDM_DETAILS | IDM_RUN => {
+                IDM_LARGEICONS | IDM_SMALLICONS | IDM_DETAILS => {
                     SendMessageW(self.main_hwnd, WM_COMMAND, command_id as usize, 0);
+                }
+                IDM_RUN => {
+                    if new_task_allowed() {
+                        SendMessageW(self.main_hwnd, WM_COMMAND, command_id as usize, 0);
+                    }
                 }
                 id if id == IDM_TASK_SWITCHTO || id == IDC_SWITCHTO as u16 => {
                     if let Some(hwnd) = self.selected_hwnds(true).first().copied() {
@@ -552,6 +559,9 @@ impl TaskPageState {
                     u32::from(checked_id),
                     MF_BYCOMMAND,
                 );
+                if !new_task_allowed() {
+                    DeleteMenu(popup_handle, u32::from(IDM_RUN), MF_BYCOMMAND);
+                }
             } else {
                 SetMenuDefaultItem(popup_handle, u32::from(IDM_TASK_SWITCHTO), 0);
                 if selected_hwnds.is_empty() {
@@ -1213,6 +1223,10 @@ impl TaskPageState {
                 if !hwnd.is_null() {
                     EnableWindow(hwnd, i32::from(enabled));
                 }
+            }
+            let run_button = GetDlgItem(self.hwnd_page, i32::from(IDM_RUN));
+            if !run_button.is_null() {
+                EnableWindow(run_button, i32::from(new_task_allowed()));
             }
         }
     }
