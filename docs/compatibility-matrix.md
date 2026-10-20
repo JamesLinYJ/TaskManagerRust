@@ -120,3 +120,11 @@ and driver versions before starting.
 When a capability is genuinely absent, record **Unsupported** rather than failing the whole machine
 row. When a query unexpectedly fails, record **Error** with its native code and keep the row open
 until the cause is understood.
+
+## Disk activity history
+
+The Performance page samples physical disks with `DeviceIoControl(IOCTL_DISK_PERFORMANCE)` on
+`\\.\PhysicalDriveN`. The system sampler worker keeps those handles open. It does not open
+processes. Unit tests cover the first sample, a counter reset, a zero query interval, a rate that
+does not fit in `u64`, and a failed read that leaves the baseline unchanged. Hands-on Windows UI
+for the disk graph is **pending**. A Linux cross typecheck is not a device test.

@@ -118,6 +118,8 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
             set_control_text(dlg_item(hwnd, IDC_CPUUSAGEFRAME), TextKey::CpuUsage);
             set_control_text(dlg_item(hwnd, IDC_MEMBARFRAME), TextKey::MemUsage);
             set_control_text(dlg_item(hwnd, IDC_MEMFRAME), TextKey::MemoryUsageHistory);
+            set_control_text(dlg_item(hwnd, IDC_DISKBARFRAME), TextKey::DiskUsage);
+            set_control_text(dlg_item(hwnd, IDC_DISKFRAME), TextKey::DiskActivityHistory);
             set_control_text(dlg_item(hwnd, IDC_STATIC1), TextKey::PhysicalMemoryK);
             set_control_text(dlg_item(hwnd, IDC_STATIC5), TextKey::CommitChargeK);
             set_control_text(dlg_item(hwnd, IDC_STATIC10), TextKey::KernelMemoryK);

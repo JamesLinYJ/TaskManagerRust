@@ -55,11 +55,12 @@ use crate::ui::dialogs::create_dialog;
 use crate::ui::localization::{localize_dialog, text};
 use crate::ui::menus::build_main_menu;
 use crate::ui::resource_ids::{
-    IDC_CPU_DETAIL_GRAPH, IDC_CPUMETER, IDC_GPU_SELECTOR, IDC_MEMGRAPH, IDC_MEMMETER,
-    IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_TASKLIST, IDC_USERLIST,
-    PWM_CPU_FIRMWARE_WORKER_COMPLETE, PWM_CPU_WORKER_COMPLETE, PWM_GPU_METADATA_WORKER_COMPLETE,
-    PWM_GPU_WORKER_COMPLETE, PWM_NET_WORKER_COMPLETE, PWM_PROC_WORKER_COMPLETE,
-    PWM_SERVICE_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE, PWM_USER_WORKER_COMPLETE,
+    IDC_CPU_DETAIL_GRAPH, IDC_CPUMETER, IDC_DISKGRAPH, IDC_DISKMETER, IDC_GPU_SELECTOR,
+    IDC_MEMGRAPH, IDC_MEMMETER, IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_TASKLIST,
+    IDC_USERLIST, PWM_CPU_FIRMWARE_WORKER_COMPLETE, PWM_CPU_WORKER_COMPLETE,
+    PWM_GPU_METADATA_WORKER_COMPLETE, PWM_GPU_WORKER_COMPLETE, PWM_NET_WORKER_COMPLETE,
+    PWM_PROC_WORKER_COMPLETE, PWM_SERVICE_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE,
+    PWM_USER_WORKER_COMPLETE,
 };
 use crate::ui::runtime_menu::MenuBar;
 
@@ -556,6 +557,14 @@ impl PageState {
                                 }
                                 IDC_MEMGRAPH => {
                                     state.draw_mem_graph(draw_item.hDC, draw_item.rcItem);
+                                    1
+                                }
+                                IDC_DISKGRAPH => {
+                                    state.draw_disk_graph(draw_item.hDC, draw_item.rcItem);
+                                    1
+                                }
+                                IDC_DISKMETER => {
+                                    state.draw_disk_meter(draw_item.hDC, draw_item.rcItem);
                                     1
                                 }
                                 _ => 0,

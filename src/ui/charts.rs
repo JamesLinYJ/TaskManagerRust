@@ -45,6 +45,7 @@ pub enum ChartColor {
     Green,
     Yellow,
     Red,
+    Cyan,
     Grid,
 }
 
@@ -67,6 +68,7 @@ struct Direct2DRenderer {
     green: ID2D1SolidColorBrush,
     yellow: ID2D1SolidColorBrush,
     red: ID2D1SolidColorBrush,
+    cyan: ID2D1SolidColorBrush,
     grid: ID2D1SolidColorBrush,
 }
 
@@ -163,6 +165,9 @@ impl Direct2DRenderer {
             let red = target
                 .CreateSolidColorBrush(&color(255, 0, 0), None)
                 .map_err(windows_error_code)?;
+            let cyan = target
+                .CreateSolidColorBrush(&color(0, 200, 255), None)
+                .map_err(windows_error_code)?;
             let grid = target
                 .CreateSolidColorBrush(&color(0, 128, 64), None)
                 .map_err(windows_error_code)?;
@@ -172,6 +177,7 @@ impl Direct2DRenderer {
                 green,
                 yellow,
                 red,
+                cyan,
                 grid,
             })
         }
@@ -283,6 +289,7 @@ impl ChartFrame<'_> {
             ChartColor::Green => &self.renderer.green,
             ChartColor::Yellow => &self.renderer.yellow,
             ChartColor::Red => &self.renderer.red,
+            ChartColor::Cyan => &self.renderer.cyan,
             ChartColor::Grid => &self.renderer.grid,
         }
     }

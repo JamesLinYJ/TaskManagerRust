@@ -325,4 +325,13 @@ pub enum TextKey {
     ServiceStopFailed,
     ServiceStateUnchanged,
     ServiceProcessPid,
+    DiskActivityHistory,
+    DiskUsage,
+    DiskRead,
+    DiskWrite,
+    DiskRateBytes,
+    DiskRateKilobytes,
+    DiskRateMegabytes,
+    DiskRateGigabytes,
+    DiskRateTerabytes,
 }
