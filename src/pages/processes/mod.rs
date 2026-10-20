@@ -1756,7 +1756,7 @@ impl ProcessPageState {
     }
 
     fn set_row_expanded(&mut self, identity: ProcIdentity, expanded: bool) {
-        if !self.tree_mode {
+        if !self.tree_mode || !self.name_filter.is_empty() {
             return;
         }
         let changed = if expanded {
@@ -1779,7 +1779,7 @@ impl ProcessPageState {
     }
 
     fn handle_tree_key(&mut self, key: u16) {
-        if !self.tree_mode {
+        if !self.tree_mode || !self.name_filter.is_empty() {
             return;
         }
         let Some(identity) = self.current_selected_identity().or(self.selected_identity) else {
@@ -1831,7 +1831,7 @@ impl ProcessPageState {
     }
 
     fn handle_tree_click(&mut self, item: i32, subitem: i32, x: i32, double_click: bool) {
-        if !self.tree_mode || item < 0 || subitem != 0 {
+        if !self.tree_mode || !self.name_filter.is_empty() || item < 0 || subitem != 0 {
             return;
         }
         let Some(row) = self.visible_rows.get(item as usize).copied() else {

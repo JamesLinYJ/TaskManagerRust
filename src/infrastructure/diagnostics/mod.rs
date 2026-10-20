@@ -529,6 +529,21 @@ impl Diagnostics {
         }
     }
 
+    /// The shutdown flag is already set. Wake an idle writer without waiting for space;
+    /// a full control queue also wakes it. Joining is the completion signal: a queued reply
+    /// sender can outlive the flag-driven writer while this runtime still owns the queue.
+    fn finish_shutdown(&self) {
+        let (sender, _receiver) = bounded(1);
+        let _ = self
+            .control_sender
+            .try_send(WriterControl::Shutdown(sender));
+        if let Ok(mut thread) = self.writer_thread.lock()
+            && let Some(thread) = thread.take()
+        {
+            let _ = thread.join();
+        }
+    }
+
     fn flush(&self, timeout: Duration) -> Result<(), String> {
         let (sender, receiver) = bounded(1);
         self.control_sender
@@ -1110,16 +1125,7 @@ pub(crate) fn shutdown() {
     if runtime.shared.shutdown.swap(true, Ordering::AcqRel) {
         return;
     }
-    let (sender, receiver) = bounded(1);
-    let _ = runtime
-        .control_sender
-        .send_timeout(WriterControl::Shutdown(sender), CONTROL_TIMEOUT);
-    let _ = receiver.recv_timeout(CONTROL_TIMEOUT);
-    if let Ok(mut thread) = runtime.writer_thread.lock()
-        && let Some(thread) = thread.take()
-    {
-        let _ = thread.join();
-    }
+    runtime.finish_shutdown();
 }
 
 pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
@@ -2313,17 +2319,38 @@ mod tests {
     fn flag_driven_shutdown_does_not_leave_the_reply_waiting() {
         let shared = Arc::new(test_shared(false));
         shared.shutdown.store(true, Ordering::Release);
-        let (_regular, regular) = bounded(1);
-        let (_priority, priority) = bounded(1);
+        let (regular_sender, regular) = bounded(1);
+        let (priority_sender, priority) = bounded(1);
         let (control_sender, controls) = bounded(1);
-        let (reply_sender, reply) = bounded(1);
-        control_sender
-            .send(WriterControl::Shutdown(reply_sender))
-            .unwrap();
-        let writer = thread::spawn(move || writer_loop(shared, None, regular, priority, controls));
-        let result = reply.recv_timeout(Duration::from_secs(1));
-        writer.join().unwrap();
-        assert_ne!(result, Err(crossbeam_channel::RecvTimeoutError::Timeout));
+        let queue_observer = control_sender.clone();
+        let (start_sender, start) = bounded(1);
+        let worker_shared = Arc::clone(&shared);
+        let writer = thread::spawn(move || {
+            start.recv().unwrap();
+            writer_loop(worker_shared, None, regular, priority, controls);
+        });
+        let runtime = Diagnostics {
+            shared,
+            regular_sender,
+            priority_sender,
+            control_sender,
+            writer_thread: Mutex::new(Some(writer)),
+            sampling_fault: SamplingFaultInjection::new(false),
+        };
+        let (finished, done) = bounded(1);
+        let caller = thread::spawn(move || {
+            runtime.finish_shutdown();
+            finished.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while queue_observer.is_empty() && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        // Force the flag branch to run after shutdown has queued its wakeup message.
+        start_sender.send(()).unwrap();
+        let result = done.recv_timeout(Duration::from_secs(1));
+        caller.join().unwrap();
+        assert!(result.is_ok(), "shutdown waited for an unconsumed reply");
     }
 
     #[test]
