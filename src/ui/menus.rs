@@ -206,6 +206,7 @@ fn build_process_main_menu() -> MenuResult<MenuBar> {
     append_item(&mut view, IDM_PROC_EXPAND, TextKey::ExpandProcess)?;
     append_item(&mut view, IDM_PROC_COLLAPSE, TextKey::CollapseProcess)?;
     append_separator(&mut view)?;
+    append_item(&mut view, IDM_PROC_FILTER, TextKey::ProcessNameFilterMenu)?;
     append_item(&mut view, IDM_PROCCOLS, TextKey::SelectColumnsMenu)?;
     append_view_always_on_top(&mut view)?;
     append_common_main_menus(

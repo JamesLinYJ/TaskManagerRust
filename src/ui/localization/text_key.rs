@@ -388,4 +388,6 @@ pub enum TextKey {
     HresultPrefix,
     StartupStaleStatus,
     StartupPartialNotice,
+    ProcessNameFilterLabel,
+    ProcessNameFilterMenu,
 }

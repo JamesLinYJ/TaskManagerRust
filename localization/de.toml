@@ -380,6 +380,8 @@ StartupEntryMissing = "Die Autostart-App ist nicht mehr vorhanden."
 StartupStaleStatus = "%s (nicht aktualisiert)"
 StartupPartialNotice = "Einige Autostart-Speicherorte konnten nicht gelesen werden. Einträge von diesen Speicherorten sind unverändert."
 HresultPrefix = "HRESULT:"
+ProcessNameFilterLabel = "Filter:"
+ProcessNameFilterMenu = "Nach &Name filtern\tStrg+F"
 
 [menu_status_help]
 IDM_RUN = "Öffnet das Dialogfeld „Neue Aufgabe“, um ein Programm auszuführen"
@@ -424,3 +426,4 @@ IDM_PROC_DUMP = "Schreibt ein vollständiges Speicherabbild dieses Prozesses in 
 IDM_PROC_SEARCHONLINE = "Sucht im Web nach dem Abbildnamen des ausgewählten Prozesses"
 IDM_STARTUP_ENABLE = "Aktiviert die ausgewählte Autostart-App"
 IDM_STARTUP_DISABLE = "Deaktiviert die ausgewählte Autostart-App, ohne sie zu löschen"
+IDM_PROC_FILTER = "Zeigt nur Prozesse, deren Abbildname den eingegebenen Text enthält"

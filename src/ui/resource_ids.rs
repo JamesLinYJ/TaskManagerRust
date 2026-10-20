@@ -272,6 +272,8 @@ pub const IDC_NEWTASK_ADMIN: i32 = 5503;
 pub const IDC_SERVICELIST: i32 = 4303;
 pub const IDC_STARTUPLIST: i32 = 4403;
 pub const IDC_STARTUP_NOTICE: i32 = 4404;
+pub const IDC_PROCESS_FILTER: i32 = 4310;
+pub const IDC_PROCESS_FILTER_LABEL: i32 = 4311;
 pub const IDC_MESSAGE_TITLE: i32 = 251;
 pub const IDC_MESSAGE_MESSAGE: i32 = 252;
 pub const IDC_CPU0: i32 = 2000;
@@ -400,6 +402,7 @@ pub const IDM_PROC_COLLAPSE: u16 = 40132;
 pub const IDM_PROC_DUMP: u16 = 40140;
 pub const IDM_STARTUP_ENABLE: u16 = 40160;
 pub const IDM_STARTUP_DISABLE: u16 = 40161;
+pub const IDM_PROC_FILTER: u16 = 40170;
 
 pub const IDC_NEXTTAB: u16 = 40100;
 pub const IDC_PREVTAB: u16 = 40101;

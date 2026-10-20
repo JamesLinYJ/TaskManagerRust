@@ -380,6 +380,8 @@ StartupEntryMissing = "La aplicación de inicio ya no está presente."
 StartupStaleStatus = "%s (no actualizado)"
 StartupPartialNotice = "No se pudieron leer algunas ubicaciones de inicio. Las entradas de esas ubicaciones no han cambiado."
 HresultPrefix = "HRESULT:"
+ProcessNameFilterLabel = "Filtro:"
+ProcessNameFilterMenu = "Filtrar por &nombre\tCtrl+F"
 
 [menu_status_help]
 IDM_RUN = "Abre el cuadro de diálogo Nueva tarea para ejecutar un programa"
@@ -424,3 +426,4 @@ IDM_PROC_DUMP = "Escribe un volcado de memoria completo de este proceso en un ar
 IDM_PROC_SEARCHONLINE = "Busca en la web el nombre de imagen del proceso seleccionado"
 IDM_STARTUP_ENABLE = "Habilita la aplicación de inicio seleccionada"
 IDM_STARTUP_DISABLE = "Deshabilita la aplicación de inicio seleccionada sin eliminarla"
+IDM_PROC_FILTER = "Muestra solo los procesos cuyo nombre de imagen contiene el texto escrito"

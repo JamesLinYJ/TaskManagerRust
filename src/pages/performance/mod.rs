@@ -1819,6 +1819,7 @@ mod tests {
             handle_count: 0,
             thread_count: 0,
             process_count: 0,
+            disk: DiskActivityUpdate::NoRate,
         };
         page.apply_system_sample(null_mut(), &sample, false)
             .unwrap();

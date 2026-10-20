@@ -380,6 +380,8 @@ StartupEntryMissing = "O aplicativo de inicialização não está mais presente.
 StartupStaleStatus = "%s (não atualizado)"
 StartupPartialNotice = "Não foi possível ler alguns locais de inicialização. As entradas desses locais permanecem inalteradas."
 HresultPrefix = "HRESULT:"
+ProcessNameFilterLabel = "Filtro:"
+ProcessNameFilterMenu = "Filtrar por &nome\tCtrl+F"
 
 [menu_status_help]
 IDM_RUN = "Abre a caixa de diálogo Nova tarefa para executar um programa"
@@ -424,3 +426,4 @@ IDM_PROC_DUMP = "Grava um despejo de memória completo deste processo em um arqu
 IDM_PROC_SEARCHONLINE = "Pesquisa na web o nome da imagem do processo selecionado"
 IDM_STARTUP_ENABLE = "Ativa o aplicativo de inicialização selecionado"
 IDM_STARTUP_DISABLE = "Desativa o aplicativo de inicialização selecionado sem excluí-lo"
+IDM_PROC_FILTER = "Mostra apenas os processos cujo nome de imagem contém o texto digitado"

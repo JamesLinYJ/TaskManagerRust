@@ -57,12 +57,11 @@ use crate::ui::localization::{localize_dialog, text};
 use crate::ui::menus::build_main_menu;
 use crate::ui::resource_ids::{
     IDC_CPU_DETAIL_GRAPH, IDC_CPUMETER, IDC_DISKGRAPH, IDC_DISKMETER, IDC_GPU_SELECTOR,
-    IDC_MEMGRAPH, IDC_MEMMETER, IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_TASKLIST,
-    IDC_USERLIST, PWM_CPU_FIRMWARE_WORKER_COMPLETE, PWM_CPU_WORKER_COMPLETE,
+    IDC_MEMGRAPH, IDC_MEMMETER, IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_STARTUPLIST,
+    IDC_TASKLIST, IDC_USERLIST, PWM_CPU_FIRMWARE_WORKER_COMPLETE, PWM_CPU_WORKER_COMPLETE,
     PWM_GPU_METADATA_WORKER_COMPLETE, PWM_GPU_WORKER_COMPLETE, PWM_NET_WORKER_COMPLETE,
-    PWM_PROC_DUMP_COMPLETE, PWM_PROC_SEARCH_COMPLETE,
-    PWM_PROC_WORKER_COMPLETE, PWM_SERVICE_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE,
-    IDC_STARTUPLIST, PWM_STARTUP_WORKER_COMPLETE,
+    PWM_PROC_DUMP_COMPLETE, PWM_PROC_SEARCH_COMPLETE, PWM_PROC_WORKER_COMPLETE,
+    PWM_SERVICE_WORKER_COMPLETE, PWM_STARTUP_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE,
     PWM_USER_WORKER_COMPLETE,
 };
 use crate::ui::runtime_menu::MenuBar;
@@ -562,11 +561,10 @@ impl PageState {
         match msg {
             WM_COMMAND => match self {
                 Self::Gpu(state) => Some(state.handle_command(wparam)),
-                Self::Task(_)
-                | Self::Process(_)
-                | Self::Users(_)
-                | Self::Services(_)
-                | Self::Startup(_) => Some(self.handle_page_command((wparam & 0xFFFF) as u16)),
+                Self::Process(state) => Some(state.handle_window_command(wparam)),
+                Self::Task(_) | Self::Users(_) | Self::Services(_) | Self::Startup(_) => {
+                    Some(self.handle_page_command((wparam & 0xFFFF) as u16))
+                }
                 _ => None,
             },
             WM_NOTIFY => match self {
@@ -987,6 +985,12 @@ impl DialogPage {
         options: Option<&mut Options>,
     ) -> bool {
         self.state.handle_process_command(command_id, options)
+    }
+
+    pub fn focus_process_name_filter(&mut self) {
+        if let PageState::Process(state) = &mut self.state {
+            state.focus_name_filter();
+        }
     }
 
     pub fn handle_user_command(&mut self, command_id: u16) -> bool {

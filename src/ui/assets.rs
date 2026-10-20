@@ -29,7 +29,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::infrastructure::native::OwnedIcon;
 use crate::ui::resource_ids::{
     IDB_METER_LIT_GREEN, IDB_METER_LIT_RED, IDB_METER_UNLIT, IDC_ENDTASK, IDC_NEXTTAB, IDC_PREVTAB,
-    IDC_SWITCHTO, IDI_APPLICATION, IDI_DEFAULT_PROCESS, IDM_HIDE, IDM_REFRESH, TRAY_ICON_IDS,
+    IDC_SWITCHTO, IDI_APPLICATION, IDI_DEFAULT_PROCESS, IDM_HIDE, IDM_PROC_FILTER, IDM_REFRESH,
+    TRAY_ICON_IDS,
 };
 
 pub const APPLICATION_ICON_RESOURCE: u16 = IDI_APPLICATION;
@@ -118,6 +119,11 @@ pub fn create_accelerator_table() -> HACCEL {
             fVirt: FVIRTKEY | FNOINVERT,
             key: VK_F5,
             cmd: IDM_REFRESH,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL | FNOINVERT,
+            key: u16::from(b'F'),
+            cmd: IDM_PROC_FILTER,
         },
         ACCEL {
             fVirt: FVIRTKEY | FNOINVERT,

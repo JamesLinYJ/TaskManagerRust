@@ -377,6 +377,8 @@ StartupEntryMissing = "该启动项已不存在。"
 StartupStaleStatus = "%s（未刷新）"
 StartupPartialNotice = "部分启动位置无法读取。这些位置上已显示的项目保持不变。"
 HresultPrefix = "HRESULT:"
+ProcessNameFilterLabel = "筛选:"
+ProcessNameFilterMenu = "按名称筛选(&N)\tCtrl+F"
 
 [menu_status_help]
 IDM_RUN = "打开“新建任务”对话框以运行程序"
@@ -421,3 +423,4 @@ IDM_PROC_DUMP = "将此进程的完整内存转储写入所选文件"
 IDM_PROC_SEARCHONLINE = "在 Web 上搜索所选进程的映像名称"
 IDM_STARTUP_ENABLE = "启用所选启动项"
 IDM_STARTUP_DISABLE = "禁用所选启动项，不删除它"
+IDM_PROC_FILTER = "只显示映像名称包含所输入文本的进程"

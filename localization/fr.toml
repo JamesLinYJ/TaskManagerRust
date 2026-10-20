@@ -380,6 +380,8 @@ StartupEntryMissing = "L'application de démarrage n'est plus présente."
 StartupStaleStatus = "%s (non actualisé)"
 StartupPartialNotice = "Certains emplacements de démarrage n'ont pas pu être lus. Les entrées de ces emplacements sont inchangées."
 HresultPrefix = "HRESULT :"
+ProcessNameFilterLabel = "Filtre :"
+ProcessNameFilterMenu = "Filtrer par &nom\tCtrl+F"
 
 [menu_status_help]
 IDM_RUN = "Ouvre la boîte de dialogue Nouvelle tâche pour exécuter un programme"
@@ -424,3 +426,4 @@ IDM_PROC_DUMP = "Écrit un vidage mémoire complet de ce processus dans un fichi
 IDM_PROC_SEARCHONLINE = "Recherche sur le web le nom d'image du processus sélectionné"
 IDM_STARTUP_ENABLE = "Active l'application de démarrage sélectionnée"
 IDM_STARTUP_DISABLE = "Désactive l'application de démarrage sélectionnée sans la supprimer"
+IDM_PROC_FILTER = "Affiche uniquement les processus dont le nom d'image contient le texte saisi"

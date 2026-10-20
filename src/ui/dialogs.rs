@@ -46,6 +46,8 @@ const CBS_DROPDOWNLIST_STYLE: u32 = CBS_DROPDOWNLIST as u32;
 const SS_RIGHT_STYLE: u32 = 0x0000_0002;
 const SS_ENDELLIPSIS_STYLE: u32 = 0x0000_4000;
 const SS_NOPREFIX_STYLE: u32 = 0x0000_0080;
+const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
+const ES_AUTOHSCROLL_STYLE: u32 = ES_AUTOHSCROLL as u32;
 const DIALOG_FONT_NAME: &str = "MS Shell Dlg";
 const DIALOG_FONT_SIZE: u16 = 8;
 const CPU_LABELS: [&str; 64] = [
@@ -690,6 +692,16 @@ fn build_process_dialog() -> DialogSpec<'static> {
         font_name: DIALOG_FONT_NAME,
         font_size: DIALOG_FONT_SIZE,
         controls: vec![
+            static_text(
+                "Filter:",
+                IDC_PROCESS_FILTER_LABEL,
+                SS_CENTERIMAGE_STYLE,
+                9,
+                8,
+                52,
+                10,
+            ),
+            edit_text(IDC_PROCESS_FILTER, ES_AUTOHSCROLL_STYLE, 64, 7, 321, 12),
             ControlSpec {
                 class_name: "SysListView32",
                 text: "List2",
@@ -703,9 +715,9 @@ fn build_process_dialog() -> DialogSpec<'static> {
                     | LVS_OWNERDATA,
                 ex_style: 0,
                 x: 9,
-                y: 9,
+                y: 22,
                 cx: 376,
-                cy: 131,
+                cy: 118,
             },
             button("&End Process", IDC_TERMINATE, 0, 320, 144, 66, 14),
         ],
@@ -1563,11 +1575,10 @@ mod tests {
     use super::{DialogTemplateBuilder, dialog_spec};
     use crate::ui::resource_ids::{
         IDC_AFFINITY_GROUP_SELECTOR, IDC_NEWTASK_ADMIN, IDC_NEWTASK_BROWSE, IDC_NEWTASK_COMMAND,
-        IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_TASKLIST, IDD_AFFINITY, IDD_CPUPAGE,
-        IDD_DIAGNOSTICS, IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_NEWTASK,
-        IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_SERVICESPAGE, IDD_TASKPAGE,
-        IDD_USERSPAGE,
-        IDC_STARTUPLIST, IDD_STARTUPPAGE,
+        IDC_NICTOTALS, IDC_PROCESS_FILTER, IDC_PROCESS_FILTER_LABEL, IDC_PROCLIST, IDC_SERVICELIST,
+        IDC_STARTUPLIST, IDC_TASKLIST, IDD_AFFINITY, IDD_CPUPAGE, IDD_DIAGNOSTICS, IDD_GPUPAGE,
+        IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_NEWTASK, IDD_PERFPAGE, IDD_PROCPAGE,
+        IDD_SELECTPROCCOLS, IDD_SERVICESPAGE, IDD_STARTUPPAGE, IDD_TASKPAGE, IDD_USERSPAGE,
     };
     use windows_sys::Win32::UI::Controls::LVS_OWNERDATA;
 
@@ -1597,6 +1608,29 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn process_page_places_the_name_filter_above_the_list() {
+        let spec = dialog_spec(IDD_PROCPAGE).unwrap();
+        let filter = spec
+            .controls
+            .iter()
+            .find(|control| control.id == IDC_PROCESS_FILTER as u16)
+            .unwrap();
+        let list = spec
+            .controls
+            .iter()
+            .find(|control| control.id == IDC_PROCLIST as u16)
+            .unwrap();
+        assert_eq!(filter.class_name, "Edit");
+        assert!(
+            spec.controls
+                .iter()
+                .any(|control| control.id == IDC_PROCESS_FILTER_LABEL as u16)
+        );
+        assert!(filter.y < list.y);
+        assert_eq!(list.style & LVS_OWNERDATA, LVS_OWNERDATA);
     }
 
     #[test]

@@ -1171,6 +1171,9 @@ impl App {
                     .unwrap_or(false),
             );
         }
+        if self.options.current_page == PageId::Processes.persisted() {
+            self.enable_menu_item(menu, IDM_PROC_FILTER, true);
+        }
         if self.options.current_page == PageId::Services.persisted() {
             let commands = self.pages[PageId::Services.index()]
                 .service_command_state()
@@ -2251,6 +2254,13 @@ impl App {
                     let task_hwnd = self.pages[PageId::Applications.index()].hwnd();
                     if !task_hwnd.is_null() {
                         SendMessageW(task_hwnd, WM_COMMAND, command_id as usize, 0);
+                    }
+                }
+                IDM_PROC_FILTER => {
+                    if self.options.current_page == PageId::Processes.persisted() {
+                        self.pages[PageId::Processes.index()].focus_process_name_filter();
+                    } else {
+                        MessageBeep(0);
                     }
                 }
                 IDM_PROCCOLS
