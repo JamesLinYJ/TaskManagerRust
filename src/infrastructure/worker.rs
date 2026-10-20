@@ -18,7 +18,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
@@ -58,11 +61,59 @@ struct SubmitError<Request> {
     request: Request,
 }
 
+/// Cooperative cancellation for collectors that may wait inside external providers.
+/// The notification gate prevents any message to a page after its owner retires the worker.
+#[derive(Clone, Default)]
+pub(crate) struct WorkerStopSignal {
+    cancelled: Arc<AtomicBool>,
+    notifications_closed: Arc<Mutex<bool>>,
+}
+
+impl WorkerStopSignal {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.close_notifications(true);
+    }
+
+    fn close_notifications(&self, cancel: bool) {
+        let mut closed = self
+            .notifications_closed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *closed = true;
+        if cancel {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn notify(&self, hwnd: HWND, message: u32) -> Option<u32> {
+        let closed = self
+            .notifications_closed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *closed || hwnd.is_null() {
+            return None;
+        }
+        // SAFETY: the owner closes this gate before page destruction; no pointer payload is sent.
+        if unsafe { PostMessageW(hwnd, message, 0, 0) } == 0 {
+            let error = unsafe { GetLastError() };
+            Some(if error == 0 { ERROR_GEN_FAILURE } else { error })
+        } else {
+            None
+        }
+    }
+}
+
 pub(crate) struct BackgroundWorker<Request, Completion> {
     command_sender: Sender<WorkerCommand<Request>>,
     completion_receiver: Option<Receiver<WorkerEvent<Completion>>>,
     thread: Option<JoinHandle<()>>,
     name: String,
+    stop: WorkerStopSignal,
+    retire_async: bool,
 }
 
 impl<Request, Completion> BackgroundWorker<Request, Completion>
@@ -91,6 +142,7 @@ where
     }
 
     /// Constructs collector state on the worker thread before receiving requests.
+    #[cfg(test)]
     fn spawn_initialized<Initialize, Collect>(
         thread_name: &str,
         completion_message: u32,
@@ -100,10 +152,30 @@ where
         Initialize: Fn() -> Collect + Send + Sync + 'static,
         Collect: FnMut(Request) -> Completion + 'static,
     {
+        Self::spawn_with_stop(
+            thread_name,
+            completion_message,
+            Arc::new(move |_| initialize()),
+            false,
+        )
+    }
+
+    fn spawn_with_stop<Initialize, Collect>(
+        thread_name: &str,
+        completion_message: u32,
+        initialize: Arc<Initialize>,
+        retire_async: bool,
+    ) -> Result<Self, u32>
+    where
+        Initialize: Fn(WorkerStopSignal) -> Collect + Send + Sync + 'static,
+        Collect: FnMut(Request) -> Completion + 'static,
+    {
         let (command_sender, command_receiver) = bounded::<WorkerCommand<Request>>(1);
         let (completion_sender, completion_receiver) = bounded::<WorkerEvent<Completion>>(1);
         let name = thread_name.to_string();
         let worker_name = name.clone();
+        let stop = WorkerStopSignal::default();
+        let worker_stop = stop.clone();
         let thread = thread::Builder::new()
             .name(name.clone())
             .spawn(move || {
@@ -123,6 +195,9 @@ where
                             notify_hwnd,
                             operation_id,
                         } => {
+                            if worker_stop.is_cancelled() {
+                                break;
+                            }
                             let started = Instant::now();
                             diagnostics::event_with(
                                 Level::Trace,
@@ -135,7 +210,7 @@ where
                             );
                             let completion = catch_unwind(AssertUnwindSafe(|| {
                                 let collect = collect.get_or_insert_with(|| {
-                                    let initialized = initialize();
+                                    let initialized = initialize(worker_stop.clone());
                                     if restarting {
                                         diagnostics::event_with(
                                             Level::Info,
@@ -149,12 +224,17 @@ where
                                     }
                                     initialized
                                 });
-                                diagnostics::with_operation_id(operation_id, || collect(request))
+                                (!worker_stop.is_cancelled()).then(|| {
+                                    diagnostics::with_operation_id(operation_id, || collect(request))
+                                })
                             }));
                             let duration_ms =
                                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            if worker_stop.is_cancelled() {
+                                break;
+                            }
                             let event = match completion {
-                                Ok(value) => {
+                                Ok(Some(value)) => {
                                     restarting = false;
                                     diagnostics::event_with(
                                         Level::Trace,
@@ -170,6 +250,7 @@ where
                                         value,
                                     })
                                 }
+                                Ok(None) => break,
                                 Err(_) => {
                                     collect = None;
                                     restarting = true;
@@ -189,15 +270,8 @@ where
                                 break;
                             }
                             let notify_hwnd = notify_hwnd as HWND;
-                            if !notify_hwnd.is_null()
-                                && unsafe { PostMessageW(notify_hwnd, completion_message, 0, 0) }
-                                    == 0
-                            {
-                                let error = unsafe { GetLastError() };
-                                record_win32_error(
-                                    "background worker completion notification",
-                                    if error == 0 { ERROR_GEN_FAILURE } else { error },
-                                );
+                            if let Some(error) = worker_stop.notify(notify_hwnd, completion_message) {
+                                record_win32_error("background worker completion notification", error);
                             }
                         }
                         WorkerCommand::Shutdown => {
@@ -222,6 +296,8 @@ where
             completion_receiver: Some(completion_receiver),
             thread: Some(thread),
             name,
+            stop,
+            retire_async,
         })
     }
 
@@ -293,18 +369,63 @@ impl<Request, Completion> Drop for BackgroundWorker<Request, Completion> {
         // Disconnect completion first so a worker blocked on the capacity-one result channel can
         // leave before `join`. This makes teardown independent of whether the UI drained the last
         // completion.
+        self.stop.close_notifications(self.retire_async);
         self.completion_receiver.take();
-        let _ = self.command_sender.send(WorkerCommand::Shutdown);
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
-            record_win32_error("background worker shutdown join", ERROR_GEN_FAILURE);
+        if self.retire_async {
+            // A provider may still be inside ConnectServer or an RPC call. Its state is owned
+            // entirely by that worker, and cancellation closes notifications before UI teardown.
+            // Reap it outside the UI; never force-terminate a thread that owns COM resources.
+            let _ = self.command_sender.try_send(WorkerCommand::Shutdown);
+            if let Some(worker) = self.thread.take() {
+                if worker.is_finished() {
+                    if worker.join().is_err() {
+                        record_win32_error("background worker shutdown join", ERROR_GEN_FAILURE);
+                    }
+                } else {
+                    let name = self.name.clone();
+                    if let Err(error) = thread::Builder::new()
+                        .name("taskmgr-rs-worker-reaper".to_string())
+                        .spawn(move || {
+                            if worker.join().is_err() {
+                                record_win32_error(
+                                    "retired worker shutdown join",
+                                    ERROR_GEN_FAILURE,
+                                );
+                            }
+                            diagnostics::event(
+                                Level::Debug,
+                                "worker.stopped",
+                                "worker",
+                                "retired background worker released its collector",
+                                &[Field::text("worker", &name)],
+                            );
+                        })
+                    {
+                        record_win32_error("retired worker reaper", thread_spawn_error(error));
+                    }
+                }
+            }
+        } else {
+            let _ = self.command_sender.send(WorkerCommand::Shutdown);
+            if let Some(thread) = self.thread.take()
+                && thread.join().is_err()
+            {
+                record_win32_error("background worker shutdown join", ERROR_GEN_FAILURE);
+            }
         }
         diagnostics::event(
             Level::Debug,
-            "worker.stopped",
+            if self.retire_async {
+                "worker.retired"
+            } else {
+                "worker.stopped"
+            },
             "worker",
-            "background worker stopped",
+            if self.retire_async {
+                "provider worker no longer accepts work or UI notifications"
+            } else {
+                "background worker stopped"
+            },
             &[Field::text("worker", &self.name)],
         );
     }
@@ -377,19 +498,64 @@ where
         Initialize: Fn() -> Collect + Send + Sync + 'static,
         Collect: FnMut(Request) -> Completion + 'static,
     {
+        Self::spawn_initialized_policy(
+            thread_name,
+            completion_message,
+            merge_pending,
+            move |_| initialize(),
+            false,
+        )
+    }
+
+    /// Only provider collectors with cooperative cancellation use asynchronous retirement.
+    pub(crate) fn spawn_cancellable_initialized<Initialize, Collect>(
+        thread_name: &str,
+        completion_message: u32,
+        merge_pending: fn(&mut Request, Request),
+        initialize: Initialize,
+    ) -> Result<Self, u32>
+    where
+        Initialize: Fn(WorkerStopSignal) -> Collect + Send + Sync + 'static,
+        Collect: FnMut(Request) -> Completion + 'static,
+    {
+        Self::spawn_initialized_policy(
+            thread_name,
+            completion_message,
+            merge_pending,
+            initialize,
+            true,
+        )
+    }
+
+    fn spawn_initialized_policy<Initialize, Collect>(
+        thread_name: &str,
+        completion_message: u32,
+        merge_pending: fn(&mut Request, Request),
+        initialize: Initialize,
+        retire_async: bool,
+    ) -> Result<Self, u32>
+    where
+        Initialize: Fn(WorkerStopSignal) -> Collect + Send + Sync + 'static,
+        Collect: FnMut(Request) -> Completion + 'static,
+    {
         let initialize = Arc::new(initialize);
         let name = thread_name.to_string();
         let restart_name = name.clone();
         let restart_initialize = Arc::clone(&initialize);
         let restart: WorkerSpawner<Request, Completion> = Box::new(move || {
-            BackgroundWorker::spawn_initialized(
+            BackgroundWorker::spawn_with_stop(
                 &restart_name,
                 completion_message,
                 Arc::clone(&restart_initialize),
+                retire_async,
             )
         });
-        let worker =
-            BackgroundWorker::spawn_initialized(thread_name, completion_message, initialize)?;
+        let worker = BackgroundWorker::spawn_with_stop(
+            thread_name,
+            completion_message,
+            initialize,
+            retire_async,
+        )?;
         Ok(Self::new(worker, restart, name, merge_pending))
     }
 
@@ -835,5 +1001,138 @@ mod tests {
         }
 
         assert!(completed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancelled_provider_is_reaped_off_ui_and_cannot_notify_the_destroyed_page() {
+        use crate::infrastructure::native::to_wide_null;
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE,
+        };
+        let class = to_wide_null("STATIC");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                0,
+                0,
+                1,
+                1,
+                HWND_MESSAGE,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        struct Window(HWND);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                unsafe {
+                    DestroyWindow(self.0);
+                }
+            }
+        }
+        let window = Window(hwnd);
+        let (started_tx, started_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let (dropped_tx, dropped_rx) = bounded(1);
+        let (signal_tx, signal_rx) = bounded(1);
+        struct Owner {
+            thread: u32,
+            dropped: Sender<()>,
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { GetCurrentThreadId() }, self.thread);
+                let _ = self.dropped.send(());
+            }
+        }
+        let mut worker = SingleFlightWorker::spawn_cancellable_initialized(
+            "taskmgr-provider-stop-test",
+            0x8001,
+            keep_pending,
+            move |stop| {
+                signal_tx.send(stop.clone()).unwrap();
+                let owner = Owner {
+                    thread: unsafe { GetCurrentThreadId() },
+                    dropped: dropped_tx.clone(),
+                };
+                let started = started_tx.clone();
+                let release = release_rx.clone();
+                move |(): ()| {
+                    let _owned_on_worker = &owner;
+                    started.send(()).unwrap();
+                    // A bounded fixture models a native call that is still blocked at teardown.
+                    let _ = release.recv_timeout(Duration::from_secs(3));
+                }
+            },
+        )
+        .unwrap();
+        worker.request((), hwnd).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let signal = signal_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        drop(worker);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "UI waited for the blocked provider"
+        );
+        drop(window);
+        assert!(signal.is_cancelled());
+        unsafe {
+            SetLastError(0x1234);
+        }
+        assert_eq!(signal.notify(hwnd, 0x8001), None);
+        assert_eq!(
+            unsafe { GetLastError() },
+            0x1234,
+            "closed gate called PostMessageW"
+        );
+        release_tx.send(()).unwrap();
+        dropped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("collector resources must be reclaimed on its own thread");
+    }
+
+    #[test]
+    fn cancellation_during_provider_initialization_skips_collection() {
+        let (started_tx, started_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let (dropped_tx, dropped_rx) = bounded(1);
+        let collected = Arc::new(AtomicBool::new(false));
+        let captured = Arc::clone(&collected);
+        struct Owner(Sender<()>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let mut worker = SingleFlightWorker::spawn_cancellable_initialized(
+            "taskmgr-provider-init-stop-test",
+            0,
+            keep_pending,
+            move |_| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+                let owner = Owner(dropped_tx.clone());
+                let captured = Arc::clone(&captured);
+                move |(): ()| {
+                    let _owner = &owner;
+                    captured.store(true, Ordering::Release);
+                }
+            },
+        )
+        .unwrap();
+        worker.request((), null_mut()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(worker);
+        release_tx.send(()).unwrap();
+        dropped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!collected.load(Ordering::Acquire));
     }
 }

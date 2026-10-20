@@ -12,10 +12,10 @@
 //! Direct2D 与 GDI 都是受支持的图表后端。初始化时明确选择后端，运行期绘制错误会
 //! 记录 HRESULT，调用方只在已知的 GDI 后端或已记录的帧失败后使用 GDI 绘制器。
 
-use std::cell::Cell;
+use std::cell::{Cell, Ref, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::Win32::Foundation::RECT as WinRect;
+use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, RECT as WinRect};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -51,8 +51,9 @@ pub enum ChartColor {
 
 pub struct ChartRenderer {
     // `ChartRenderer` 是页面能看到的唯一渲染入口。
-    backend: RendererBackend,
+    backend: RefCell<RendererBackend>,
     last_frame_error: Cell<Option<i32>>,
+    recreate_pending: Cell<bool>,
 }
 
 enum RendererBackend {
@@ -74,8 +75,9 @@ struct Direct2DRenderer {
 
 pub struct ChartFrame<'a> {
     // `ChartFrame` 代表一帧有效的绘制上下文，结束时由调用方显式提交。
-    renderer: &'a Direct2DRenderer,
+    renderer: Ref<'a, Direct2DRenderer>,
     last_frame_error: &'a Cell<Option<i32>>,
+    recreate_pending: &'a Cell<bool>,
     rect: WinRect,
     ended: bool,
 }
@@ -90,38 +92,81 @@ impl ChartRenderer {
             }
         };
         Self {
-            backend,
+            backend: RefCell::new(backend),
             last_frame_error: Cell::new(None),
+            recreate_pending: Cell::new(false),
         }
     }
 
     pub fn begin_frame(&self, hdc: SysHdc, rect: SysRect) -> Option<ChartFrame<'_>> {
-        // 只有后端可用并且本帧成功绑定到目标 DC 时才返回可绘制帧。
-        match &self.backend {
-            RendererBackend::Direct2D(renderer) => {
-                match renderer.begin_frame(hdc, rect, &self.last_frame_error) {
-                    Ok(frame) => Some(frame),
-                    Err(error) => {
-                        record_frame_error(&self.last_frame_error, "Direct2D chart BindDC", error);
-                        None
-                    }
-                }
-            }
+        if !self.recover_target_with(Direct2DRenderer::new) {
+            return None;
+        }
+        let renderer = Ref::filter_map(self.backend.borrow(), |backend| match backend {
+            RendererBackend::Direct2D(renderer) => Some(renderer),
             RendererBackend::Gdi => None,
+        })
+        .ok()?;
+        match renderer.bind_frame(hdc, rect) {
+            Ok(rect) => Some(ChartFrame {
+                renderer,
+                last_frame_error: &self.last_frame_error,
+                recreate_pending: &self.recreate_pending,
+                rect,
+                ended: false,
+            }),
+            Err(error) => {
+                self.frame_failed("Direct2D chart BindDC", error);
+                None
+            }
         }
     }
 
+    fn frame_failed(&self, context: &'static str, error: i32) {
+        record_frame_error(&self.last_frame_error, context, error);
+        if error == D2DERR_RECREATE_TARGET.0 {
+            self.recreate_pending.set(true);
+        }
+    }
+
+    fn recover_target_with(&self, create: impl FnOnce() -> Result<Direct2DRenderer, i32>) -> bool {
+        if !self.recreate_pending.get() {
+            return true;
+        }
+        // An outstanding frame owns a shared Ref: keep its COM resources alive until it ends.
+        let Ok(mut backend) = self.backend.try_borrow_mut() else {
+            return false;
+        };
+        *backend = match create() {
+            Ok(renderer) => RendererBackend::Direct2D(renderer),
+            Err(error) => {
+                record_backend_fallback(error);
+                RendererBackend::Gdi
+            }
+        };
+        self.recreate_pending.set(false);
+        self.last_frame_error.set(None);
+        true
+    }
+
     pub fn is_available(&self) -> bool {
-        matches!(self.backend, RendererBackend::Direct2D(_))
+        !self.recreate_pending.get()
+            && matches!(*self.backend.borrow(), RendererBackend::Direct2D(_))
     }
 
     #[cfg(debug_assertions)]
     #[allow(dead_code)]
     pub fn debug_backend_name(&self) -> &'static str {
-        match self.backend {
+        match *self.backend.borrow() {
             RendererBackend::Direct2D(_) => "direct2d",
             RendererBackend::Gdi => "gdi",
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_failed_recreation(&self) {
+        self.frame_failed("test target lost", D2DERR_RECREATE_TARGET.0);
+        assert!(self.recover_target_with(|| Err(0x80004005u32 as i32)));
     }
 }
 
@@ -185,12 +230,7 @@ impl Direct2DRenderer {
         }
     }
 
-    fn begin_frame<'a>(
-        &'a self,
-        hdc: SysHdc,
-        rect: SysRect,
-        last_frame_error: &'a Cell<Option<i32>>,
-    ) -> Result<ChartFrame<'a>, i32> {
+    fn bind_frame(&self, hdc: SysHdc, rect: SysRect) -> Result<WinRect, i32> {
         // 安全性: `hdc` and `rect` come from the current paint operation; D2D calls are
         // synchronous and brushes are owned by the returned frame until `end`.
         unsafe {
@@ -207,12 +247,7 @@ impl Direct2DRenderer {
                 .map_err(windows_error_code)?;
             self.target.BeginDraw();
 
-            Ok(ChartFrame {
-                renderer: self,
-                last_frame_error,
-                rect: local_rect,
-                ended: false,
-            })
+            Ok(local_rect)
         }
     }
 }
@@ -312,6 +347,9 @@ impl ChartFrame<'_> {
                     "Direct2D chart EndDraw",
                     error.code().0,
                 );
+                if error.code() == D2DERR_RECREATE_TARGET {
+                    self.recreate_pending.set(true);
+                }
                 false
             }
         }
@@ -403,8 +441,136 @@ fn color(red: u8, green: u8, blue: u8) -> D2D1_COLOR_F {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::ptr::null_mut;
+    use windows::core::Interface;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, HBITMAP,
+        HGDIOBJ, ReleaseDC, SelectObject,
+    };
+
+    pub(crate) struct TestSurface {
+        pub(crate) dc: SysHdc,
+        bitmap: HBITMAP,
+        previous: HGDIOBJ,
+    }
+
+    impl TestSurface {
+        pub(crate) fn new() -> Self {
+            unsafe {
+                let screen = GetDC(null_mut());
+                assert!(!screen.is_null());
+                let dc = CreateCompatibleDC(screen);
+                let bitmap = CreateCompatibleBitmap(screen, 64, 64);
+                ReleaseDC(null_mut(), screen);
+                assert!(!dc.is_null() && !bitmap.is_null());
+                let previous = SelectObject(dc, bitmap as HGDIOBJ);
+                assert!(!previous.is_null());
+                Self {
+                    dc,
+                    bitmap,
+                    previous,
+                }
+            }
+        }
+    }
+
+    impl Drop for TestSurface {
+        fn drop(&mut self) {
+            // SAFETY: restore the fixture's selection before deleting its owned GDI resources.
+            unsafe {
+                SelectObject(self.dc, self.previous);
+                DeleteObject(self.bitmap as HGDIOBJ);
+                DeleteDC(self.dc);
+            }
+        }
+    }
+
+    fn rect() -> SysRect {
+        SysRect {
+            left: 0,
+            top: 0,
+            right: 64,
+            bottom: 64,
+        }
+    }
+
+    #[test]
+    fn target_loss_rebuilds_native_target_and_brushes_after_the_frame_releases_them() {
+        let surface = TestSurface::new();
+        let renderer = ChartRenderer::new();
+        assert!(
+            renderer.is_available(),
+            "fixture requires a working D2D DC backend: {:?}",
+            Direct2DRenderer::new().err()
+        );
+        let old_target = match &*renderer.backend.borrow() {
+            RendererBackend::Direct2D(r) => r.target.clone(),
+            RendererBackend::Gdi => unreachable!(),
+        };
+        let frame = renderer.begin_frame(surface.dc, rect()).unwrap();
+        frame.clear_black();
+        renderer.frame_failed("test target lost", D2DERR_RECREATE_TARGET.0);
+        assert!(!renderer.is_available());
+        assert!(!renderer.recover_target_with(|| panic!("outstanding frame resources replaced")));
+        assert!(frame.end());
+        let frame = renderer
+            .begin_frame(surface.dc, rect())
+            .expect("target should recover");
+        assert_ne!(old_target.as_raw(), frame.renderer.target.as_raw());
+        frame.clear_black();
+        for color in [
+            ChartColor::Green,
+            ChartColor::Yellow,
+            ChartColor::Red,
+            ChartColor::Grid,
+        ] {
+            frame.fill_color(
+                WinRect {
+                    left: 2,
+                    top: 2,
+                    right: 8,
+                    bottom: 8,
+                },
+                color,
+            );
+        }
+        assert!(frame.end());
+        assert_eq!(
+            unsafe { windows_sys::Win32::Graphics::Gdi::GetPixel(surface.dc, 4, 4) },
+            0x00408000
+        );
+        assert!(renderer.is_available());
+    }
+
+    #[test]
+    fn dc_target_rejects_the_old_unknown_pixel_format() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+        let factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }.unwrap();
+        let properties = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_UNKNOWN,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            },
+            dpiX: 0.0,
+            dpiY: 0.0,
+            usage: D2D1_RENDER_TARGET_USAGE_NONE,
+            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        assert!(unsafe { factory.CreateDCRenderTarget(&properties) }.is_err());
+    }
+
+    #[test]
+    fn failed_recreation_selects_gdi_without_retrying_the_failed_target_every_frame() {
+        let renderer = ChartRenderer::new();
+        renderer.simulate_failed_recreation();
+        assert!(!renderer.is_available());
+        assert!(renderer.recover_target_with(|| panic!("GDI fallback rebuilt each frame")));
+        assert!(renderer.begin_frame(null_mut(), rect()).is_none());
+    }
 
     #[test]
     fn dc_render_target_creates_with_a_gdi_compatible_pixel_format() {

@@ -487,6 +487,7 @@ impl PerformancePageState {
 
             let width = (rect.right - rect.left).max(1);
             let height = (rect.bottom - rect.top).max(1);
+            self.ensure_graph_surface(hdc, width, height);
             let use_backbuffer = !self.graph_dc.is_null()
                 && self.graph_bitmap_width >= width
                 && self.graph_bitmap_height >= height;
@@ -617,6 +618,7 @@ impl PerformancePageState {
 
             let width = (rect.right - rect.left).max(1);
             let height = (rect.bottom - rect.top).max(1);
+            self.ensure_graph_surface(hdc, width, height);
             let use_backbuffer = !self.graph_dc.is_null()
                 && self.graph_bitmap_width >= width
                 && self.graph_bitmap_height >= height;
@@ -1185,11 +1187,15 @@ impl PerformancePageState {
             if self.chart_renderer.is_available() {
                 self.destroy_graph_surface();
             } else {
-                self.ensure_graph_surface(
-                    hwnd_page,
-                    layout.graph_surface_width,
-                    layout.graph_surface_height,
-                );
+                let dc = GetDC(hwnd_page);
+                if !dc.is_null() {
+                    self.ensure_graph_surface(
+                        dc,
+                        layout.graph_surface_width,
+                        layout.graph_surface_height,
+                    );
+                    ReleaseDC(hwnd_page, dc);
+                }
             }
         }
     }
@@ -1541,7 +1547,7 @@ impl PerformancePageState {
         }
     }
 
-    fn ensure_graph_surface(&mut self, hwnd_page: HWND, width: i32, height: i32) {
+    fn ensure_graph_surface(&mut self, page_dc: HDC, width: i32, height: i32) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 图表表面的目标尺寸由布局层决定；
@@ -1574,19 +1580,16 @@ impl PerformancePageState {
                 GRAPH_SURFACE_HEIGHT_QUANTUM,
             );
 
-            let page_dc = GetDC(hwnd_page);
             if page_dc.is_null() {
                 return;
             }
 
             let graph_dc = CreateCompatibleDC(page_dc);
             if graph_dc.is_null() {
-                ReleaseDC(hwnd_page, page_dc);
                 return;
             }
 
             let graph_bitmap = CreateCompatibleBitmap(page_dc, target_width, target_height);
-            ReleaseDC(hwnd_page, page_dc);
             if graph_bitmap.is_null() {
                 DeleteDC(graph_dc);
                 return;
@@ -1974,5 +1977,31 @@ mod disk_tests {
     fn byte_rate_text_uses_binary_units() {
         assert_eq!(format_byte_rate(1536), "1.5 KB/s");
         assert_eq!(format_byte_rate(0), "0 B/s");
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_d2d_fallback_allocates_gdi_backbuffer_without_another_layout() {
+        let surface = crate::ui::charts::tests::TestSurface::new();
+        let mut page = PerformancePageState::default();
+        assert!(page.graph_dc.is_null());
+        page.chart_renderer.simulate_failed_recreation();
+        page.draw_mem_graph(
+            surface.dc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 64,
+                bottom: 64,
+            },
+        );
+        assert!(!page.graph_dc.is_null());
+        assert!(page.graph_bitmap_width >= 64 && page.graph_bitmap_height >= 64);
+        page.destroy();
+        assert!(page.graph_dc.is_null());
     }
 }

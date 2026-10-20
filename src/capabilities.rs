@@ -45,7 +45,11 @@ enum CapabilityCommand {
 }
 
 pub(crate) fn run_from_environment() -> Option<i32> {
-    let destination = match parse_arguments(env::args_os()) {
+    run_with_arguments(env::args_os())
+}
+
+pub(crate) fn run_with_arguments(arguments: impl IntoIterator<Item = OsString>) -> Option<i32> {
+    let destination = match parse_arguments(arguments) {
         CapabilityCommand::NotRequested => return None,
         CapabilityCommand::Export(destination) => destination,
         CapabilityCommand::Invalid(reason) => {
@@ -91,7 +95,7 @@ pub(crate) fn run_from_environment() -> Option<i32> {
                 "hardware capability report export failed",
                 &[
                     Field::sensitive_text("destination", destination.to_string_lossy()),
-                    Field::text("error", error),
+                    Field::sensitive_text("error", error),
                 ],
             );
             let _ = diagnostics::flush();

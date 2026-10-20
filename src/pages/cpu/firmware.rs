@@ -13,6 +13,7 @@
 //! WMI 失败只影响固件来源；用户主动刷新才重建失败的 provider。
 
 use std::mem::ManuallyDrop;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::RPC_E_TOO_LATE;
 use windows::Win32::System::Com::{
@@ -24,10 +25,11 @@ use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Variant::{VARIANT, VT_BSTR, VT_EMPTY, VT_I4, VT_NULL, VariantClear};
 use windows::Win32::System::Wmi::{
     CIM_STRING, CIM_UINT16, CIM_UINT32, IWbemClassObject, IWbemLocator, IWbemServices,
-    WBEM_E_NOT_FOUND, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
-    WbemLocator,
+    WBEM_E_NOT_FOUND, WBEM_FLAG_CONNECT_USE_MAX_WAIT, WBEM_FLAG_FORWARD_ONLY,
+    WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_S_FALSE, WBEM_S_TIMEDOUT, WbemLocator,
 };
 use windows::core::{BSTR, PCWSTR};
+use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, ERROR_TIMEOUT};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
 use super::model::{
@@ -36,6 +38,10 @@ use super::model::{
 };
 use crate::infrastructure::diagnostics::{self, Field, Level};
 use crate::infrastructure::native::{record_hresult_error, record_startup_timing, to_wide_null};
+use crate::infrastructure::worker::WorkerStopSignal;
+
+const WMI_NEXT_WAIT_MS: i32 = 100;
+const WMI_QUERY_DEADLINE: Duration = Duration::from_secs(5);
 
 pub(crate) struct CpuFirmwareCollector {
     provider: Result<CpuWmiProvider, CpuDetailError>,
@@ -44,12 +50,22 @@ pub(crate) struct CpuFirmwareCollector {
     firmware_failed: bool,
     startup_started_ms: u64,
     timing_recorded: bool,
+    stop: WorkerStopSignal,
 }
 
 impl CpuFirmwareCollector {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_stop(WorkerStopSignal::default())
+    }
+
+    pub(crate) fn with_stop(stop: WorkerStopSignal) -> Self {
         let startup_started_ms = unsafe { GetTickCount64() };
-        let provider = CpuWmiProvider::connect();
+        let provider = if stop.is_cancelled() {
+            Err(cancelled_query())
+        } else {
+            CpuWmiProvider::connect()
+        };
         record_startup_timing(
             "CPU WMI initialization",
             unsafe { GetTickCount64() }.wrapping_sub(startup_started_ms),
@@ -61,10 +77,17 @@ impl CpuFirmwareCollector {
             firmware_failed: false,
             startup_started_ms,
             timing_recorded: false,
+            stop,
         }
     }
 
     pub(crate) fn collect(&mut self, request: CpuDetailRequest) -> CpuFirmwareSnapshot {
+        if self.stop.is_cancelled() {
+            return CpuFirmwareSnapshot {
+                topology_key: request.topology_key,
+                firmware: CpuComponentUpdate::Failed(cancelled_query()),
+            };
+        }
         if self.topology_key.as_ref() != Some(&request.topology_key) {
             self.topology_key = Some(request.topology_key.clone());
             self.firmware_done = false;
@@ -83,7 +106,7 @@ impl CpuFirmwareCollector {
                 .provider
                 .as_ref()
                 .map_err(Clone::clone)
-                .and_then(CpuWmiProvider::query_processors);
+                .and_then(|provider| provider.query_processors(&self.stop));
             if !self.timing_recorded {
                 record_startup_timing(
                     "CPU WMI firmware query",
@@ -180,7 +203,7 @@ impl CpuWmiProvider {
                 &empty,
                 &empty,
                 &empty,
-                0,
+                WBEM_FLAG_CONNECT_USE_MAX_WAIT.0,
                 &empty,
                 None,
             )
@@ -211,7 +234,12 @@ impl CpuWmiProvider {
         })
     }
 
-    fn query_processors(&self) -> Result<Vec<CpuFirmwareProcessor>, CpuDetailError> {
+    fn query_processors(
+        &self,
+        stop: &WorkerStopSignal,
+    ) -> Result<Vec<CpuFirmwareProcessor>, CpuDetailError> {
+        let started = Instant::now();
+        check_query_budget(stop, started.elapsed(), WMI_QUERY_DEADLINE)?;
         let query = BSTR::from(
             "SELECT DeviceID, Name, Manufacturer, SocketDesignation, ProcessorId, Family, Level, \
          Revision, Stepping, AddressWidth, DataWidth, MaxClockSpeed FROM Win32_Processor",
@@ -232,21 +260,16 @@ impl CpuWmiProvider {
         let mut processors = Vec::new();
         let mut row_index = 0u64;
         loop {
+            check_query_budget(stop, started.elapsed(), WMI_QUERY_DEADLINE)?;
             let mut objects: [Option<IWbemClassObject>; 1] = [None];
             let mut returned = 0u32;
-            let result = unsafe { enumerator.Next(WBEM_INFINITE, &mut objects, &mut returned) };
-            if result.is_err() {
-                return Err(CpuDetailError::HResult {
-                    context: "IEnumWbemClassObject::Next Win32_Processor",
-                    code: result.0,
-                });
-            }
-            if returned == 0 {
-                break;
-            }
-            if returned != 1 {
-                return invalid("Win32_Processor enumerator returned count");
-            }
+            let result = unsafe { enumerator.Next(WMI_NEXT_WAIT_MS, &mut objects, &mut returned) };
+            check_query_budget(stop, started.elapsed(), WMI_QUERY_DEADLINE)?;
+            let finished = match classify_next(result.0, returned)? {
+                NextStep::Retry => continue,
+                NextStep::Finished => break,
+                NextStep::Row { finished } => finished,
+            };
             let object = objects[0]
                 .take()
                 .ok_or_else(|| invalid_error("Win32_Processor null object"))?;
@@ -268,6 +291,9 @@ impl CpuWmiProvider {
                         Field::unsigned("row_index", current_row),
                     ],
                 );
+                if finished {
+                    break;
+                }
                 continue;
             };
             processors.push(CpuFirmwareProcessor {
@@ -284,6 +310,9 @@ impl CpuWmiProvider {
                 data_width: get_wmi_u16(&object, "DataWidth", current_row)?,
                 max_clock_mhz: get_wmi_u32(&object, "MaxClockSpeed", current_row)?,
             });
+            if finished {
+                break;
+            }
         }
         if processors.is_empty() {
             return invalid("Win32_Processor empty result");
@@ -296,6 +325,61 @@ impl CpuWmiProvider {
             return invalid("Win32_Processor duplicate DeviceID");
         }
         Ok(processors)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NextStep {
+    Retry,
+    Finished,
+    Row { finished: bool },
+}
+
+fn cancelled_query() -> CpuDetailError {
+    CpuDetailError::Win32 {
+        context: "CPU WMI query cancelled",
+        code: ERROR_OPERATION_ABORTED,
+    }
+}
+
+fn check_query_budget(
+    stop: &WorkerStopSignal,
+    elapsed: Duration,
+    budget: Duration,
+) -> Result<(), CpuDetailError> {
+    if stop.is_cancelled() {
+        Err(cancelled_query())
+    } else if elapsed >= budget {
+        Err(CpuDetailError::Win32 {
+            context: "CPU WMI query deadline",
+            code: ERROR_TIMEOUT,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn classify_next(status: i32, returned: u32) -> Result<NextStep, CpuDetailError> {
+    if status < 0 {
+        return Err(CpuDetailError::HResult {
+            context: "IEnumWbemClassObject::Next Win32_Processor",
+            code: status,
+        });
+    }
+    if returned > 1 {
+        return invalid("Win32_Processor enumerator returned count");
+    }
+    if returned == 1 {
+        return Ok(NextStep::Row {
+            finished: status == WBEM_S_FALSE.0,
+        });
+    }
+    if status == WBEM_S_TIMEDOUT.0 {
+        Ok(NextStep::Retry)
+    } else if status == WBEM_S_FALSE.0 {
+        Ok(NextStep::Finished)
+    } else {
+        invalid("Win32_Processor zero count without completion or timeout")
     }
 }
 
@@ -520,4 +604,54 @@ pub(super) fn wmi_i4_to_u16(value: i32) -> Result<u16, CpuDetailError> {
 
 pub(super) fn wmi_i4_to_u32(value: i32) -> u32 {
     u32::from_ne_bytes(value.to_ne_bytes())
+}
+
+#[cfg(test)]
+mod polling_tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_are_not_the_end_of_a_successful_enumeration() {
+        assert_eq!(
+            classify_next(WBEM_S_TIMEDOUT.0, 0).unwrap(),
+            NextStep::Retry
+        );
+        assert_eq!(
+            classify_next(0, 1).unwrap(),
+            NextStep::Row { finished: false }
+        );
+        assert_eq!(
+            classify_next(WBEM_S_FALSE.0, 1).unwrap(),
+            NextStep::Row { finished: true }
+        );
+        assert_eq!(
+            classify_next(WBEM_S_FALSE.0, 0).unwrap(),
+            NextStep::Finished
+        );
+        assert!(classify_next(0, 0).is_err());
+        assert!(classify_next(0, 2).is_err());
+        assert!(matches!(classify_next(0x80004005u32 as i32, 0),
+            Err(CpuDetailError::HResult { code, .. }) if code == 0x80004005u32 as i32));
+    }
+
+    #[test]
+    fn cancelled_and_timed_out_queries_cannot_commit_partial_rows() {
+        let stop = WorkerStopSignal::default();
+        assert!(check_query_budget(&stop, Duration::ZERO, WMI_QUERY_DEADLINE).is_ok());
+        assert!(matches!(
+            check_query_budget(&stop, WMI_QUERY_DEADLINE, WMI_QUERY_DEADLINE),
+            Err(CpuDetailError::Win32 {
+                code: ERROR_TIMEOUT,
+                ..
+            })
+        ));
+        stop.cancel();
+        assert!(matches!(
+            check_query_budget(&stop, Duration::ZERO, WMI_QUERY_DEADLINE),
+            Err(CpuDetailError::Win32 {
+                code: ERROR_OPERATION_ABORTED,
+                ..
+            })
+        ));
+    }
 }

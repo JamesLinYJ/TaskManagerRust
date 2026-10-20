@@ -27,7 +27,7 @@ use std::ffi::{OsStr, OsString};
 #[cfg(test)]
 use std::fs;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::Location;
@@ -371,7 +371,10 @@ pub(crate) fn initialize_from_env() {
     if DIAGNOSTICS.get().is_some() {
         return;
     }
-    let config = DiagnosticConfig::from_environment();
+    initialize(DiagnosticConfig::from_environment());
+}
+
+fn initialize(config: DiagnosticConfig) {
     let parse_warnings = config.parse_warnings.clone();
     let sampling_fault_requested = sampling_fault_requested(config.level);
     let diagnostics = Diagnostics::new(config, sampling_fault_requested);
@@ -415,8 +418,11 @@ pub(crate) fn initialize_from_env() {
             Level::Warn,
             "diagnostics.storage_degraded",
             "diagnostics",
-            &error,
-            &[Field::boolean("file_logging_active", status().file_active)],
+            "diagnostic file storage is degraded",
+            &[
+                Field::boolean("file_logging_active", status().file_active),
+                Field::sensitive_text("error", &error),
+            ],
         );
     }
     for warning in parse_warnings {
@@ -424,8 +430,8 @@ pub(crate) fn initialize_from_env() {
             Level::Warn,
             "diagnostics.argument_ignored",
             "diagnostics",
-            &warning,
-            &[],
+            "a diagnostic argument was ignored; expected supported flags and absolute paths",
+            &[Field::sensitive_text("detail", &warning)],
         );
     }
     if crash::test_crash_requested(enabled(Level::Debug), status().minidump) {
@@ -891,7 +897,12 @@ fn flush_sink(shared: &SharedState, sink: &mut Option<FileSink>) -> Result<(), S
 }
 
 fn disable_sink(shared: &SharedState, sink: &mut Option<FileSink>, message: String) {
-    debug_output(&format!("taskmgr-rs [error] {message}\r\n"));
+    let detail = if shared.sensitive.load(Ordering::Acquire) {
+        message.as_str()
+    } else {
+        "diagnostic file storage is unavailable"
+    };
+    debug_output(&format!("taskmgr-rs [error] {detail}\r\n"));
     *sink = None;
     shared.file_active.store(false, Ordering::Release);
     if let Ok(mut error) = shared.sink_error.lock() {
@@ -1128,7 +1139,25 @@ pub(crate) fn shutdown() {
     runtime.finish_shutdown();
 }
 
-pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
+/// A completed private ZIP in an exclusive, delete-on-close temporary file. No retention-root
+/// handles remain open while the UI asks for privacy confirmation or a destination.
+pub(crate) struct PreparedDiagnosticBundle {
+    archive: File,
+    file_count: usize,
+    contains_dump: bool,
+    requires_privacy_warning: bool,
+}
+
+struct DiagnosticBundleContent {
+    export_files: Vec<ExportFile>,
+    manifest_bytes: Vec<u8>,
+    environment_bytes: Vec<u8>,
+    summary: String,
+    contains_dump: bool,
+    requires_privacy_warning: bool,
+}
+
+pub(crate) fn prepare_export_bundle() -> Result<PreparedDiagnosticBundle, String> {
     flush()?;
     let runtime = DIAGNOSTICS
         .get()
@@ -1145,7 +1174,7 @@ pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
         .ok_or_else(|| "no diagnostic log root is available".to_string())?;
     let export_sessions =
         select_export_sessions(root_directory, session_directory).map_err(io_error)?;
-    let mut export_files = collect_export_files(&export_sessions).map_err(io_error)?;
+    let export_files = collect_export_files(&export_sessions).map_err(io_error)?;
     let executable_hash =
         executable_sha256().unwrap_or_else(|error| format!("unavailable: {error}"));
     let current_status = status();
@@ -1187,8 +1216,8 @@ pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
         "privacy_notice": "Process memory dumps and logs collected with sensitive mode may contain private information. No data is uploaded automatically."
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
-    let environment_bytes = serde_json::to_vec_pretty(&runtime_environment_manifest())
-        .map_err(|error| error.to_string())?;
+    let environment_bytes =
+        serde_json::to_vec_pretty(&environment_manifest).map_err(|error| error.to_string())?;
     let summary = format!(
         "taskmgr-rs diagnostic bundle\r\n\
          Version: {}\r\n\
@@ -1205,47 +1234,87 @@ pub(crate) fn export_bundle(destination: &Path) -> Result<(), String> {
         executable_hash,
     );
 
-    let (destination_directory, destination_name) =
-        open_export_destination(destination).map_err(io_error)?;
-    let (mut temporary, temporary_name) =
-        create_temporary_bundle(&destination_directory).map_err(io_error)?;
-    let result = (|| -> Result<(), String> {
-        let mut archive = StoredZipWriter::from_file(&mut temporary);
-        archive
-            .add_bytes("manifest.json", &manifest_bytes)
-            .map_err(io_error)?;
-        archive
-            .add_bytes("summary.txt", summary.as_bytes())
-            .map_err(io_error)?;
-        archive
-            .add_bytes("environment.json", &environment_bytes)
-            .map_err(io_error)?;
-        for export in &mut export_files {
-            archive
-                .add_open_file_prefix(&export.archive_name, &mut export.source, export.length)
-                .map_err(io_error)?;
-        }
-        archive.finish().map_err(io_error)?;
-        rename_within_directory(&temporary, &destination_directory, &destination_name, true)
-            .map_err(io_error)
-    })();
-    if result.is_err() {
-        let _ = mark_delete(&temporary);
-    } else {
-        event(
-            Level::Info,
-            "diagnostics.bundle_exported",
-            "diagnostics",
-            "diagnostic bundle exported",
-            &[
-                Field::sensitive_text("destination", destination.to_string_lossy()),
-                Field::unsigned("file_count", export_files.len() as u64),
-                Field::boolean("contains_minidump", contains_dump),
-                Field::text("temporary_name", temporary_name.to_string_lossy()),
-            ],
-        );
+    DiagnosticBundleContent {
+        export_files,
+        manifest_bytes,
+        environment_bytes,
+        summary,
+        contains_dump,
+        requires_privacy_warning: sensitive_ever_enabled || contains_dump || contains_crash_record,
     }
-    result
+    .freeze()
+}
+
+impl DiagnosticBundleContent {
+    fn freeze(mut self) -> Result<PreparedDiagnosticBundle, String> {
+        let temporary_directory =
+            SecureDirectory::open_absolute(&env::temp_dir()).map_err(io_error)?;
+        let (mut temporary, _) = create_temporary_bundle(&temporary_directory).map_err(io_error)?;
+        // This exclusive handle survives the prompt; cancellation, failure, and process exit
+        // all close it and remove the private temporary file without reopening its pathname.
+        mark_delete(&temporary).map_err(io_error)?;
+        {
+            let mut archive = StoredZipWriter::from_file(&mut temporary);
+            archive
+                .add_bytes("manifest.json", &self.manifest_bytes)
+                .map_err(io_error)?;
+            archive
+                .add_bytes("summary.txt", self.summary.as_bytes())
+                .map_err(io_error)?;
+            archive
+                .add_bytes("environment.json", &self.environment_bytes)
+                .map_err(io_error)?;
+            for export in &mut self.export_files {
+                archive
+                    .add_open_file_prefix(&export.archive_name, &mut export.source, export.length)
+                    .map_err(io_error)?;
+            }
+            archive.finish().map_err(io_error)?;
+        }
+        temporary.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        Ok(PreparedDiagnosticBundle {
+            archive: temporary,
+            file_count: self.export_files.len(),
+            contains_dump: self.contains_dump,
+            requires_privacy_warning: self.requires_privacy_warning,
+        })
+    }
+}
+
+impl PreparedDiagnosticBundle {
+    pub(crate) fn requires_privacy_warning(&self) -> bool {
+        self.requires_privacy_warning
+    }
+
+    pub(crate) fn export_to(mut self, destination: &Path) -> Result<(), String> {
+        let (destination_directory, destination_name) =
+            open_export_destination(destination).map_err(io_error)?;
+        let (mut temporary, temporary_name) =
+            create_temporary_bundle(&destination_directory).map_err(io_error)?;
+        let result = (|| -> Result<(), String> {
+            io::copy(&mut self.archive, &mut temporary).map_err(io_error)?;
+            temporary.sync_all().map_err(io_error)?;
+            rename_within_directory(&temporary, &destination_directory, &destination_name, true)
+                .map_err(io_error)
+        })();
+        if result.is_err() {
+            let _ = mark_delete(&temporary);
+        } else {
+            event(
+                Level::Info,
+                "diagnostics.bundle_exported",
+                "diagnostics",
+                "diagnostic bundle exported",
+                &[
+                    Field::sensitive_text("destination", destination.to_string_lossy()),
+                    Field::unsigned("file_count", self.file_count as u64),
+                    Field::boolean("contains_minidump", self.contains_dump),
+                    Field::text("temporary_name", temporary_name.to_string_lossy()),
+                ],
+            );
+        }
+        result
+    }
 }
 
 /// Atomically writes one user-requested diagnostic attachment without following a pathname after
@@ -1408,32 +1477,6 @@ fn directory_contains_crash(directory: &SecureDirectory) -> io::Result<bool> {
         }
     }
     Ok(false)
-}
-
-pub(crate) fn export_contains_crash_artifact() -> bool {
-    let Some(runtime) = DIAGNOSTICS.get() else {
-        return false;
-    };
-    let (Some(root), Some(current)) = (
-        runtime.shared.root_directory.as_ref(),
-        runtime.shared.session_directory.as_ref(),
-    ) else {
-        return false;
-    };
-    select_export_sessions(root, current).is_ok_and(|sessions| {
-        sessions
-            .iter()
-            .any(|session| directory_contains_crash(&session.directory).unwrap_or(false))
-    })
-}
-
-pub(crate) fn export_requires_privacy_warning() -> bool {
-    DIAGNOSTICS.get().is_some_and(|runtime| {
-        runtime
-            .shared
-            .sensitive_ever_enabled
-            .load(Ordering::Acquire)
-    }) || export_contains_crash_artifact()
 }
 
 pub(crate) fn default_bundle_name() -> String {
@@ -2117,6 +2160,143 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn path_errors_stay_sensitive_through_real_jsonl_and_bundle_export() {
+        use std::process::Command;
+        const CHILD_ROOT: &str = "TASKMGR_DIAGNOSTIC_PRIVACY_TEST_ROOT";
+        const CHILD_MODE: &str = "TASKMGR_DIAGNOSTIC_PRIVACY_TEST_MODE";
+        const TEST: &str = "infrastructure::diagnostics::tests::path_errors_stay_sensitive_through_real_jsonl_and_bundle_export";
+        const PRIVATE: &str = "private-path-私有";
+
+        if let Some(root) = env::var_os(CHILD_ROOT) {
+            // Every child owns isolated config/OnceLock state and a private TEMP fallback.
+            let root = PathBuf::from(root);
+            let sensitive = env::var(CHILD_MODE).unwrap() == "sensitive";
+            let blocked = root.join(format!("{PRIVATE}-blocked"));
+            fs::write(&blocked, b"owned regular-file blocker").unwrap();
+            let mut arguments = vec![
+                OsString::from(format!(
+                    "--diagnostic-dir={}",
+                    blocked.join("logs").display()
+                )),
+                OsString::from(format!(r#"--diagnostic=\\{PRIVATE}\share\"secret""#)),
+            ];
+            if sensitive {
+                arguments.push(OsString::from("--diagnostic-sensitive"));
+            }
+            initialize(DiagnosticConfig::parse(arguments));
+            assert!(status().file_active, "TEMP fallback must work");
+            assert!(
+                status()
+                    .directory
+                    .as_ref()
+                    .unwrap()
+                    .starts_with(root.join("temp"))
+            );
+            let command = [
+                OsString::from("taskmgr.exe"),
+                OsString::from(format!(
+                    "--diagnostic-capabilities={}",
+                    blocked.join("output.json").display()
+                )),
+            ];
+            assert_eq!(crate::capabilities::run_with_arguments(command), Some(2));
+            flush().unwrap();
+            if sensitive {
+                // Already collected sensitive data must still require consent after disabling.
+                set_sensitive(false);
+            }
+            let bundle = prepare_export_bundle().unwrap();
+            assert_eq!(bundle.requires_privacy_warning(), sensitive);
+            const AFTER_PLAN: &str = "private-record-after-export-plan";
+            if !sensitive {
+                // Even a mode change after consent cannot add sensitive bytes to this plan.
+                set_sensitive(true);
+                event(
+                    Level::Info,
+                    "test.after_plan",
+                    "test",
+                    "post-plan event",
+                    &[Field::sensitive_text("secret", AFTER_PLAN)],
+                );
+                flush().unwrap();
+                set_sensitive(false);
+                assert!(prepare_export_bundle().unwrap().requires_privacy_warning());
+            }
+            let destination = root.join("bundle.zip");
+            bundle.export_to(&destination).unwrap();
+            flush().unwrap();
+            let session = status().directory.unwrap();
+            shutdown();
+            let mut records = Vec::new();
+            for entry in fs::read_dir(session).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "jsonl") {
+                    for line in fs::read_to_string(path).unwrap().lines() {
+                        records.push(serde_json::from_str::<Value>(line).unwrap());
+                    }
+                }
+            }
+            for event_name in [
+                "diagnostics.storage_degraded",
+                "diagnostics.argument_ignored",
+                "capabilities.report_failed",
+            ] {
+                let record = records.iter().find(|r| r["event"] == event_name).unwrap();
+                assert!(!record["message"].as_str().unwrap().contains(PRIVATE));
+                let detail = record["fields"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|v| v.as_str().is_some_and(|s| s.contains(PRIVATE)));
+                assert_eq!(detail, sensitive, "{event_name}: {record}");
+            }
+            let bytes = fs::read(destination).unwrap();
+            assert!(
+                !bytes
+                    .windows(AFTER_PLAN.len())
+                    .any(|w| w == AFTER_PLAN.as_bytes())
+            );
+            assert_eq!(
+                bytes
+                    .windows(PRIVATE.len())
+                    .any(|w| w == PRIVATE.as_bytes()),
+                sensitive
+            );
+            return;
+        }
+
+        let root = temporary_test_directory("privacy-children");
+        fs::create_dir(&root).unwrap();
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).expect("remove only owned privacy fixtures");
+            }
+        }
+        let fixture = Fixture(root);
+        for mode in ["redacted", "sensitive"] {
+            let root = fixture.0.join(mode);
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(root.join("temp")).unwrap();
+            let output = Command::new(env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD_ROOT, &root)
+                .env(CHILD_MODE, mode)
+                .env("TEMP", root.join("temp"))
+                .env("TMP", root.join("temp"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
     fn create_test_directory_link(link: &Path, target: &Path) -> bool {
         match symlink_dir(target, link) {
             Ok(()) => true,
@@ -2540,6 +2720,60 @@ mod tests {
         assert!(part_path(&session, 42, 1).is_file());
         drop(sink);
         fs::remove_dir_all(root).expect("test directory should be removable");
+    }
+
+    #[test]
+    fn export_snapshot_does_not_block_retention_during_log_rotation() {
+        let root = temporary_test_directory("export-retention");
+        let previous = root.join("session-previous");
+        let active = root.join("session-active");
+        fs::create_dir_all(&previous).unwrap();
+        fs::create_dir(&active).unwrap();
+        let previous_log = previous.join("previous.jsonl");
+        let mut file = File::create(&previous_log).unwrap();
+        file.write_all(b"captured prefix").unwrap();
+        file.set_len(LOG_ROOT_LIMIT_BYTES - LOG_PART_LIMIT_BYTES + 1)
+            .unwrap();
+        drop(file);
+        fs::write(previous.join("previous.crash.json"), b"{}").unwrap();
+        let mut sink = FileSink::open(root.clone(), active.clone(), 42).unwrap();
+        sink.bytes_written = LOG_PART_LIMIT_BYTES;
+
+        // Positive control: the former export sharing mode prevents the required deletion.
+        let directory = SecureDirectory::open_absolute(&previous).unwrap();
+        let old_reader = directory.open_file(OsStr::new("previous.jsonl")).unwrap();
+        drop(directory);
+        assert!(sink.write_line(b"new part").is_err());
+        drop(old_reader);
+        // A failed retention pass may already have deleted the small crash marker.
+        fs::write(previous.join("previous.crash.json"), b"{}").unwrap();
+
+        let sessions = select_export_sessions(&root, &active).unwrap();
+        let files = collect_export_files(&sessions).unwrap();
+        drop(sessions);
+        let snapshot = DiagnosticBundleContent {
+            export_files: files,
+            manifest_bytes: b"{}".to_vec(),
+            environment_bytes: b"{}".to_vec(),
+            summary: "controlled retention fixture".to_string(),
+            contains_dump: false,
+            requires_privacy_warning: true,
+        }
+        .freeze()
+        .unwrap();
+        sink.write_line(b"new part")
+            .expect("held export must allow rotation retention");
+        assert_eq!(sink.part, 1);
+        assert!(!previous.exists());
+        let destination = root.join("snapshot.zip");
+        snapshot.export_to(&destination).unwrap();
+        let mut archive = File::open(destination).unwrap();
+        let mut prefix = [0; 512];
+        archive.read_exact(&mut prefix).unwrap();
+        assert!(prefix.windows(15).any(|bytes| bytes == b"captured prefix"));
+        drop(archive);
+        drop(sink);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

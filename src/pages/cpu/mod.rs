@@ -301,12 +301,12 @@ impl CpuPageState {
                 move |request| collector.collect(request)
             },
         )?;
-        let firmware_worker = SingleFlightWorker::spawn_initialized(
+        let firmware_worker = SingleFlightWorker::spawn_cancellable_initialized(
             "taskmgr-rs-cpu-firmware-worker",
             PWM_CPU_FIRMWARE_WORKER_COMPLETE,
             merge_cpu_requests,
-            || {
-                let mut collector = CpuFirmwareCollector::new();
+            |stop| {
+                let mut collector = CpuFirmwareCollector::with_stop(stop);
                 move |request| collector.collect(request)
             },
         )?;
