@@ -35,6 +35,11 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
         }
         IDD_PROCPAGE => {
             set_dialog_item_text(hwnd, IDC_TERMINATE, TextKey::EndProcess);
+            set_dialog_item_text(
+                hwnd,
+                IDC_PROCESS_FILTER_LABEL,
+                TextKey::ProcessNameFilterLabel,
+            );
         }
         IDD_NETPAGE => {
             set_dialog_item_text(hwnd, IDC_NOADAPTERS, TextKey::NoActiveNetworkAdaptersFound);
@@ -95,10 +100,24 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
         IDD_SERVICESPAGE => {
             set_dialog_item_text(hwnd, i32::from(IDM_SERVICE_START), TextKey::ServiceStart);
             set_dialog_item_text(hwnd, i32::from(IDM_SERVICE_STOP), TextKey::ServiceStop);
+            set_dialog_item_text(hwnd, i32::from(IDM_SERVICE_PAUSE), TextKey::ServicePause);
+            set_dialog_item_text(
+                hwnd,
+                i32::from(IDM_SERVICE_CONTINUE),
+                TextKey::ServiceContinue,
+            );
             set_dialog_item_text(
                 hwnd,
                 i32::from(IDM_SERVICE_GOTOPROCESS),
                 TextKey::GoToProcess,
+            );
+        }
+        IDD_STARTUPPAGE => {
+            set_dialog_item_text(hwnd, i32::from(IDM_STARTUP_ENABLE), TextKey::StartupEnable);
+            set_dialog_item_text(
+                hwnd,
+                i32::from(IDM_STARTUP_DISABLE),
+                TextKey::StartupDisable,
             );
         }
         IDD_PERFPAGE => {
@@ -118,6 +137,8 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
             set_control_text(dlg_item(hwnd, IDC_CPUUSAGEFRAME), TextKey::CpuUsage);
             set_control_text(dlg_item(hwnd, IDC_MEMBARFRAME), TextKey::MemUsage);
             set_control_text(dlg_item(hwnd, IDC_MEMFRAME), TextKey::MemoryUsageHistory);
+            set_control_text(dlg_item(hwnd, IDC_DISKBARFRAME), TextKey::DiskUsage);
+            set_control_text(dlg_item(hwnd, IDC_DISKFRAME), TextKey::DiskActivityHistory);
             set_control_text(dlg_item(hwnd, IDC_STATIC1), TextKey::PhysicalMemoryK);
             set_control_text(dlg_item(hwnd, IDC_STATIC5), TextKey::CommitChargeK);
             set_control_text(dlg_item(hwnd, IDC_STATIC10), TextKey::KernelMemoryK);
@@ -148,6 +169,13 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
             set_dialog_item_text(hwnd, IDC_BASEPRIORITY, TextKey::BasePriority);
             set_dialog_item_text(hwnd, IDC_HANDLECOUNT, TextKey::HandleCount);
             set_dialog_item_text(hwnd, IDC_THREADCOUNT, TextKey::ThreadCount);
+            set_dialog_item_text(hwnd, IDC_COMMANDLINE, TextKey::CommandLine);
+            set_dialog_item_text(hwnd, IDC_IOREADBYTES, TextKey::IoReadBytes);
+            set_dialog_item_text(hwnd, IDC_IOWRITEBYTES, TextKey::IoWriteBytes);
+            set_dialog_item_text(hwnd, IDC_IOREADCOUNT, TextKey::IoReadCount);
+            set_dialog_item_text(hwnd, IDC_IOWRITECOUNT, TextKey::IoWriteCount);
+            set_dialog_item_text(hwnd, IDC_GDIOBJECTS, TextKey::GdiObjects);
+            set_dialog_item_text(hwnd, IDC_USEROBJECTS, TextKey::UserObjects);
         }
         IDD_AFFINITY => {
             set_window_text(hwnd, TextKey::ProcessorAffinity);

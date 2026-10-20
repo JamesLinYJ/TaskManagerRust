@@ -120,3 +120,28 @@ and driver versions before starting.
 When a capability is genuinely absent, record **Unsupported** rather than failing the whole machine
 row. When a query unexpectedly fails, record **Error** with its native code and keep the row open
 until the cause is understood.
+
+## Disk activity history
+
+The Performance page samples physical disks with `DeviceIoControl(IOCTL_DISK_PERFORMANCE)` on
+`\\.\PhysicalDriveN`. Each successful call increments the driver's enable reference. The sampler
+keeps one enable while the handle is open and issues `IOCTL_DISK_PERFORMANCE_OFF` for every other
+success, then for the last enable when that drive is dropped (worker shutdown or the drive
+disappearing). The system sampler worker keeps those handles open. It does not open processes.
+Unit tests cover the first sample, a counter reset, a zero query interval, a rate that does not
+fit in `u64`, a failed read that leaves the baseline unchanged, and enable/disable balance.
+Hands-on Windows UI for the disk graph is **pending**. A Linux cross typecheck is not a device test.
+## Startup apps
+
+The Startup page reads the native 64-bit registry view for `HKCU` and `HKLM` `\Run`, the explicit
+`WOW6432Node` Run key, and the current-user and common Startup folders from `SHGetKnownFolderPath`.
+Enabled state comes from the matching `StartupApproved` value. A missing value is enabled. The
+first dword is enabled for 2 and 6, and disabled for 1, 3, and 7. Disabling a 6 writes 7, and
+enabling a 7 writes 6. Enable and disable rewrite that value only, then read it back; they do not
+delete the Run value or the Startup-folder file. If one source fails while another succeeds, the
+page keeps the previous rows for the failed source, marks them not refreshed, and shows a notice.
+A source error that exists only in diagnostics is not treated as a complete snapshot.
+
+| Check | Evidence | Status |
+| --- | --- | --- |
+| Startup enumeration, enable, and disable on a Windows device | Not run for this change. Automated model tests cover the approved-byte format, command parsing, selection identity, and failure classification. Windows CI typechecks and runs the crate tests; that is not a hands-on Startup page check. | Pending |

@@ -52,7 +52,7 @@ use windows_sys::Win32::UI::Controls::{
     TCN_SELCHANGE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DELETE, VK_RETURN,
 };
 use windows_sys::Win32::UI::Shell::{NIM_ADD, NIM_DELETE, ShellAboutW, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -71,10 +71,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TrackPopupMenuEx,
     TranslateAcceleratorW, TranslateMessage, WINDOWPLACEMENT, WM_CLOSE, WM_COMMAND, WM_CREATE,
     WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITDIALOG, WM_INITMENU,
-    WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN,
-    WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETICON, WM_SETREDRAW, WM_SIZE,
-    WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_DLGFRAME, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TILEDWINDOW, WS_VISIBLE,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
+    WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETICON,
+    WM_SETREDRAW, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_DLGFRAME, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_TILEDWINDOW, WS_VISIBLE,
 };
 
 use self::controllers::{
@@ -191,6 +192,7 @@ pub struct App {
     last_cpu_topology_error: Option<CpuTopologyError>,
     last_system_worker_error: Option<u32>,
     window_mode: WindowModeController,
+    session_always_on_top: bool,
     min_width: i32,
     min_height: i32,
     already_applied_initial_position: bool,
@@ -400,6 +402,7 @@ impl App {
             last_cpu_topology_error: None,
             last_system_worker_error: None,
             window_mode: WindowModeController::default(),
+            session_always_on_top: false,
             min_width: 0,
             min_height: 0,
             already_applied_initial_position: false,
@@ -554,24 +557,32 @@ impl App {
                     break 1;
                 }
 
-                let page_hwnd = active_page_id(self.options.current_page)
+                let page_id = active_page_id(self.options.current_page);
+                let page_hwnd = page_id
                     .map(|page_id| self.pages[page_id.index()].hwnd())
                     .unwrap_or(null_mut());
 
-                let mut handled = !self.accelerator_table.is_null()
-                    && TranslateAcceleratorW(
-                        self.main_hwnd,
-                        self.accelerator_table,
-                        &raw const message,
-                    ) != 0;
-
-                if !handled && !page_hwnd.is_null() && !self.accelerator_table.is_null() {
-                    handled = TranslateAcceleratorW(
-                        page_hwnd,
-                        self.accelerator_table,
-                        &raw const message,
-                    ) != 0;
-                }
+                // Delete and Enter belong to the Applications list. Translating the complete
+                // table against the main dialog first consumes them even though that dialog
+                // does not handle their commands. Other controls must receive their own keys.
+                let task_list = if page_id == Some(PageId::Applications) && !page_hwnd.is_null() {
+                    GetDlgItem(page_hwnd, IDC_TASKLIST)
+                } else {
+                    null_mut()
+                };
+                let target = match accelerator_scope(
+                    message.message,
+                    message.wParam,
+                    !task_list.is_null() && message.hwnd == task_list,
+                ) {
+                    AcceleratorScope::Main => self.main_hwnd,
+                    AcceleratorScope::ApplicationsList => page_hwnd,
+                    AcceleratorScope::Control => null_mut(),
+                };
+                let handled = !target.is_null()
+                    && !self.accelerator_table.is_null()
+                    && TranslateAcceleratorW(target, self.accelerator_table, &raw const message)
+                        != 0;
 
                 if !handled && IsDialogMessageW(self.main_hwnd, &raw const message) == 0 {
                     TranslateMessage(&raw const message);
@@ -805,19 +816,7 @@ impl App {
                 ],
             );
 
-            SetWindowPos(
-                hwnd,
-                if self.options.always_on_top() {
-                    HWND_TOPMOST
-                } else {
-                    HWND_NOTOPMOST
-                },
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE,
-            );
+            self.apply_session_always_on_top(hwnd);
 
             if let Err(error) = self.create_status_bar() {
                 self.initialization_error = Some(error);
@@ -1157,7 +1156,7 @@ impl App {
             );
         }
 
-        self.check_menu(menu, IDM_ALWAYSONTOP, self.options.always_on_top());
+        self.check_menu(menu, IDM_ALWAYSONTOP, self.session_always_on_top);
         self.check_menu(menu, IDM_MINIMIZEONUSE, self.options.minimize_on_use());
         self.check_menu(menu, IDM_CONFIRMATIONS, self.options.confirmations());
         self.check_menu(menu, IDM_KERNELTIMES, self.options.kernel_times());
@@ -1172,12 +1171,17 @@ impl App {
                     .unwrap_or(false),
             );
         }
+        if self.options.current_page == PageId::Processes.persisted() {
+            self.enable_menu_item(menu, IDM_PROC_FILTER, true);
+        }
         if self.options.current_page == PageId::Services.persisted() {
             let commands = self.pages[PageId::Services.index()]
                 .service_command_state()
                 .unwrap_or_default();
             self.enable_menu_item(menu, IDM_SERVICE_START, commands.start);
             self.enable_menu_item(menu, IDM_SERVICE_STOP, commands.stop);
+            self.enable_menu_item(menu, IDM_SERVICE_PAUSE, commands.pause);
+            self.enable_menu_item(menu, IDM_SERVICE_CONTINUE, commands.continue_service);
             self.enable_menu_item(menu, IDM_SERVICE_GOTOPROCESS, commands.go_to_process);
         }
         if self.options.current_page == PageId::Processes.persisted() {
@@ -1187,6 +1191,13 @@ impl App {
             self.check_menu(menu, IDM_PROC_TREE, commands.tree_mode);
             self.enable_menu_item(menu, IDM_PROC_EXPAND, commands.can_expand);
             self.enable_menu_item(menu, IDM_PROC_COLLAPSE, commands.can_collapse);
+        }
+        if self.options.current_page == PageId::Startup.persisted() {
+            let commands = self.pages[PageId::Startup.index()]
+                .startup_command_state()
+                .unwrap_or_default();
+            self.enable_menu_item(menu, IDM_STARTUP_ENABLE, commands.enable);
+            self.enable_menu_item(menu, IDM_STARTUP_DISABLE, commands.disable);
         }
 
         // 安全性: same menu handle as above.
@@ -1222,6 +1233,27 @@ impl App {
                 menu,
                 u32::from(item_id),
                 MF_BYCOMMAND | if checked { MF_CHECKED } else { MF_UNCHECKED },
+            );
+        }
+    }
+
+    fn apply_session_always_on_top(&self, hwnd: HWND) {
+        // Session-only WS_EX_TOPMOST. SetWindowPos is the documented way to set or clear it.
+        // The choice is not written into Options.
+        // Safety: hwnd is the main window owned by this App on the UI thread.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                if self.session_always_on_top {
+                    HWND_TOPMOST
+                } else {
+                    HWND_NOTOPMOST
+                },
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE,
             );
         }
     }
@@ -1822,24 +1854,12 @@ impl App {
     }
 
     fn show_running_instance(&self) {
-        // 恢复窗口时顺带重新应用 topmost 状态，保持和当前选项一致。
+        // 恢复窗口时重新应用本会话的置顶状态。
         // 安全性: operations target the main HWND owned by this App.
         unsafe {
             OpenIcon(self.main_hwnd);
             SetForegroundWindow(self.main_hwnd);
-            SetWindowPos(
-                self.main_hwnd,
-                if self.options.always_on_top() {
-                    HWND_TOPMOST
-                } else {
-                    HWND_NOTOPMOST
-                },
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE,
-            );
+            self.apply_session_always_on_top(self.main_hwnd);
         }
     }
 
@@ -1875,7 +1895,7 @@ impl App {
                         SetMenuDefaultItem(popup_handle, u32::from(IDM_RESTORETASKMAN), 0);
                     }
 
-                    self.check_menu(popup_handle, IDM_ALWAYSONTOP, self.options.always_on_top());
+                    self.check_menu(popup_handle, IDM_ALWAYSONTOP, self.session_always_on_top);
                     SetForegroundWindow(self.main_hwnd);
                     self.menu.enter_popup();
                     let command = TrackPopupMenuEx(
@@ -2023,7 +2043,7 @@ impl App {
         unsafe {
             if self.menu.can_temporarily_hide()
                 && !self.window_mode.is_temporarily_hidden()
-                && self.options.always_on_top()
+                && self.session_always_on_top
             {
                 ShowWindow(hwnd, SW_HIDE);
                 SetCapture(hwnd);
@@ -2099,21 +2119,8 @@ impl App {
                     self.switch_tabs(command_id == IDC_NEXTTAB);
                 }
                 IDM_ALWAYSONTOP => {
-                    let always_on_top = !self.options.always_on_top();
-                    self.options.set_always_on_top(always_on_top);
-                    SetWindowPos(
-                        hwnd,
-                        if always_on_top {
-                            HWND_TOPMOST
-                        } else {
-                            HWND_NOTOPMOST
-                        },
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE,
-                    );
+                    self.session_always_on_top = !self.session_always_on_top;
+                    self.apply_session_always_on_top(hwnd);
                     self.update_menu_states();
                 }
                 IDM_HIDEWHENMIN => {
@@ -2249,12 +2256,21 @@ impl App {
                         SendMessageW(task_hwnd, WM_COMMAND, command_id as usize, 0);
                     }
                 }
+                IDM_PROC_FILTER => {
+                    if self.options.current_page == PageId::Processes.persisted() {
+                        self.pages[PageId::Processes.index()].focus_process_name_filter();
+                    } else {
+                        MessageBeep(0);
+                    }
+                }
                 IDM_PROCCOLS
                 | IDM_AFFINITY
                 | IDM_PROC_DEBUG
                 | IDM_PROC_TERMINATE
                 | IDM_PROC_ENDTREE
                 | IDM_PROC_OPENFILELOCATION
+                | IDM_PROC_DUMP
+                | IDM_PROC_SEARCHONLINE
                 | IDM_PROC_REALTIME
                 | IDM_PROC_HIGH
                 | IDM_PROC_ABOVENORMAL
@@ -2288,10 +2304,25 @@ impl App {
                         MessageBeep(0);
                     }
                 }
-                IDM_SERVICE_START | IDM_SERVICE_STOP | IDM_SERVICE_GOTOPROCESS => {
+                IDM_SERVICE_START
+                | IDM_SERVICE_STOP
+                | IDM_SERVICE_PAUSE
+                | IDM_SERVICE_CONTINUE
+                | IDM_SERVICE_GOTOPROCESS => {
                     if self.options.current_page == PageId::Services.persisted() {
                         let handled =
                             self.pages[PageId::Services.index()].handle_service_command(command_id);
+                        if handled {
+                            self.update_menu_states();
+                        }
+                    } else {
+                        MessageBeep(0);
+                    }
+                }
+                IDM_STARTUP_ENABLE | IDM_STARTUP_DISABLE => {
+                    if self.options.current_page == PageId::Startup.persisted() {
+                        let handled =
+                            self.pages[PageId::Startup.index()].handle_startup_command(command_id);
                         if handled {
                             self.update_menu_states();
                         }
@@ -2534,6 +2565,31 @@ fn active_page_id(current_page: i32) -> Option<PageId> {
     PageId::from_persisted(current_page)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceleratorScope {
+    Main,
+    ApplicationsList,
+    Control,
+}
+
+fn accelerator_scope(
+    message: u32,
+    key: WPARAM,
+    applications_list_has_focus: bool,
+) -> AcceleratorScope {
+    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN)
+        && (key == usize::from(VK_DELETE) || key == usize::from(VK_RETURN))
+    {
+        if applications_list_has_focus {
+            AcceleratorScope::ApplicationsList
+        } else {
+            AcceleratorScope::Control
+        }
+    } else {
+        AcceleratorScope::Main
+    }
+}
+
 fn is_active_page(current_page: i32, page_id: PageId) -> bool {
     active_page_id(current_page) == Some(page_id)
 }
@@ -2758,9 +2814,43 @@ unsafe extern "system" fn main_window_proc(
 mod tests {
     use super::page_registry::PageId;
     use super::{
-        ShellExecuteFailure, active_page_id, active_page_uses_normal_minimum, clamped_window_size,
-        help_documentation_url, is_active_page, page_uses_normal_minimum, shell_execute_failure,
+        AcceleratorScope, ShellExecuteFailure, accelerator_scope, active_page_id,
+        active_page_uses_normal_minimum, clamped_window_size, help_documentation_url,
+        is_active_page, page_uses_normal_minimum, shell_execute_failure,
     };
+
+    #[test]
+    fn task_action_keys_reach_the_applications_list_only() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+
+        for key in [VK_DELETE, VK_RETURN] {
+            assert_eq!(
+                accelerator_scope(WM_KEYDOWN, usize::from(key), true),
+                AcceleratorScope::ApplicationsList,
+            );
+            // An edit, button, tab, or another page must retain its normal key processing.
+            assert_eq!(
+                accelerator_scope(WM_KEYDOWN, usize::from(key), false),
+                AcceleratorScope::Control,
+            );
+        }
+    }
+
+    #[test]
+    fn global_shortcuts_keep_main_dialog_routing_with_list_or_edit_focus() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F5, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+
+        for key in [VK_F5, VK_TAB, VK_ESCAPE, u16::from(b'F')] {
+            for list_has_focus in [true, false] {
+                assert_eq!(
+                    accelerator_scope(WM_KEYDOWN, usize::from(key), list_has_focus),
+                    AcceleratorScope::Main,
+                );
+            }
+        }
+    }
 
     #[test]
     fn help_uses_fixed_https_project_documentation() {

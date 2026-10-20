@@ -39,7 +39,12 @@ const LEGACY_TASKMAN_KEY: &str = "Software\\Microsoft\\Windows NT\\CurrentVersio
 const LEGACY_OPTIONS_VALUE: &str = "Preferences";
 const OPTIONS_STORAGE_MAGIC: [u8; 8] = *b"TMGRRS01";
 const OPTIONS_STORAGE_VERSION: u32 = 1;
-const OPTIONS_SCHEMA_VERSION: i32 = 2;
+const OPTIONS_SCHEMA_VERSION: i32 = 3;
+const SCHEMA_2_VERSION: i32 = 2;
+// Schema 2 stored 16 process columns plus the terminating sentinel. Those two arrays stay at
+// this length so later fields keep their offsets. Schema 3 appends the extra slots below.
+const SCHEMA2_COLUMN_SLOTS: usize = 17;
+const EXTENDED_COLUMN_SLOTS: usize = (NUM_COLUMN + 1) - SCHEMA2_COLUMN_SLOTS;
 const SCHEMA_0_NETWORK_PAGE: i32 = 3;
 const SCHEMA_0_USERS_PAGE: i32 = 4;
 const SCHEMA_1_GPU_PAGE: i32 = 3;
@@ -130,6 +135,13 @@ pub enum ColumnId {
     BasePriority = 13,
     HandleCount = 14,
     ThreadCount = 15,
+    CommandLine = 16,
+    IoReadBytes = 17,
+    IoWriteBytes = 18,
+    IoReadCount = 19,
+    IoWriteCount = 20,
+    GdiObjects = 21,
+    UserObjects = 22,
 }
 
 #[repr(C)]
@@ -143,11 +155,30 @@ pub struct Options {
     pub update_speed: i32,
     pub window_rect: RECT,
     pub current_page: i32,
-    pub active_process_columns: [i32; NUM_COLUMN + 1],
-    pub column_widths: [i32; NUM_COLUMN + 1],
+    pub active_process_columns: [i32; SCHEMA2_COLUMN_SLOTS],
+    pub column_widths: [i32; SCHEMA2_COLUMN_SLOTS],
     flags: u32,
     pub unused: i32,
     pub unused2: i32,
+    pub extended_process_columns: [i32; EXTENDED_COLUMN_SLOTS],
+    pub extended_column_widths: [i32; EXTENDED_COLUMN_SLOTS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OptionsV2 {
+    cb_size: u32,
+    timer_interval: u32,
+    view_mode: i32,
+    cpu_history_mode: i32,
+    update_speed: i32,
+    window_rect: RECT,
+    current_page: i32,
+    active_process_columns: [i32; SCHEMA2_COLUMN_SLOTS],
+    column_widths: [i32; SCHEMA2_COLUMN_SLOTS],
+    flags: u32,
+    unused: i32,
+    unused2: i32,
 }
 
 #[repr(C)]
@@ -190,7 +221,16 @@ impl StoredOptions {
 unsafe trait RegistryPod: Copy {}
 
 unsafe impl RegistryPod for Options {}
+unsafe impl RegistryPod for OptionsV2 {}
 unsafe impl RegistryPod for StoredOptions {}
+
+const _: () = {
+    assert!(SCHEMA2_COLUMN_SLOTS == 17);
+    assert!(EXTENDED_COLUMN_SLOTS == 7);
+    assert!(ColumnId::ThreadCount as i32 == 15);
+    assert!(ColumnId::UserObjects as i32 == 22);
+    assert!(size_of::<Options>() == size_of::<OptionsV2>() + EXTENDED_COLUMN_SLOTS * 2 * 4);
+};
 
 impl Default for Options {
     fn default() -> Self {
@@ -208,11 +248,13 @@ impl Default for Options {
                 bottom: 0,
             },
             current_page: -1,
-            active_process_columns: [-1; NUM_COLUMN + 1],
-            column_widths: [-1; NUM_COLUMN + 1],
+            active_process_columns: [-1; SCHEMA2_COLUMN_SLOTS],
+            column_widths: [-1; SCHEMA2_COLUMN_SLOTS],
             flags: 0,
             unused: OPTIONS_SCHEMA_VERSION,
             unused2: 0,
+            extended_process_columns: [-1; EXTENDED_COLUMN_SLOTS],
+            extended_column_widths: [-1; EXTENDED_COLUMN_SLOTS],
         };
 
         options.set_minimize_on_use(true);
@@ -256,9 +298,9 @@ impl Options {
             return false;
         }
 
-        match read_registry_binary::<StoredOptions>(OPTIONS_KEY, OPTIONS_VALUE) {
-            Ok(Some(stored)) => {
-                let loaded = match stored.into_options() {
+        match read_registry_bytes(OPTIONS_KEY, OPTIONS_VALUE) {
+            Ok(Some(bytes)) => {
+                let loaded = match decode_stored_options(&bytes) {
                     Ok(loaded) => loaded,
                     Err(error) => {
                         record_win32_error("taskmgr-rs options envelope", error);
@@ -276,11 +318,15 @@ impl Options {
             }
         }
 
-        match read_registry_binary::<Options>(LEGACY_TASKMAN_KEY, LEGACY_OPTIONS_VALUE) {
-            Ok(Some(legacy)) if legacy_options_is_taskmgr_rs(&legacy) => {
-                self.apply_loaded_options(legacy, min_width, min_height, true)
-            }
-            Ok(Some(_)) | Ok(None) => {
+        match read_registry_bytes(LEGACY_TASKMAN_KEY, LEGACY_OPTIONS_VALUE) {
+            Ok(Some(bytes)) => match decode_legacy_taskmgr_rs_options(&bytes) {
+                Some(legacy) => self.apply_loaded_options(legacy, min_width, min_height, true),
+                None => {
+                    self.set_default_values(min_width, min_height);
+                    false
+                }
+            },
+            Ok(None) => {
                 self.set_default_values(min_width, min_height);
                 false
             }
@@ -342,11 +388,9 @@ impl Options {
     }
 
     pub fn always_on_top(&self) -> bool {
+        // The stored flag remains in the registry layout. View → Always on Top is session-only
+        // and does not write it.
         self.flags & FLAG_ALWAYS_ON_TOP != 0
-    }
-
-    pub fn set_always_on_top(&mut self, value: bool) {
-        self.set_flag(FLAG_ALWAYS_ON_TOP, value);
     }
 
     pub fn kernel_times(&self) -> bool {
@@ -398,7 +442,7 @@ impl Options {
             && self.flags & !ALL_VALID_FLAGS == 0
             && self.unused == OPTIONS_SCHEMA_VERSION
             && self.unused2 == 0
-            && process_columns_are_valid(&self.active_process_columns, &self.column_widths)
+            && self.process_columns_are_valid()
     }
 
     fn migrate_schema(&mut self) -> Result<bool, ()> {
@@ -409,8 +453,7 @@ impl Options {
                     SCHEMA_0_USERS_PAGE => 6,
                     page => page,
                 };
-                self.unused = OPTIONS_SCHEMA_VERSION;
-                self.unused2 = 0;
+                self.finish_column_schema_migration();
                 Ok(true)
             }
             1 => {
@@ -420,13 +463,24 @@ impl Options {
                 ) {
                     self.current_page += 1;
                 }
-                self.unused = OPTIONS_SCHEMA_VERSION;
-                self.unused2 = 0;
+                self.finish_column_schema_migration();
+                Ok(true)
+            }
+            SCHEMA_2_VERSION => {
+                self.finish_column_schema_migration();
                 Ok(true)
             }
             OPTIONS_SCHEMA_VERSION => Ok(false),
             _ => Err(()),
         }
+    }
+
+    fn finish_column_schema_migration(&mut self) {
+        self.cb_size = size_of::<Self>() as u32;
+        self.unused = OPTIONS_SCHEMA_VERSION;
+        self.unused2 = 0;
+        self.extended_process_columns = [-1; EXTENDED_COLUMN_SLOTS];
+        self.extended_column_widths = [-1; EXTENDED_COLUMN_SLOTS];
     }
 
     fn normalize(&mut self, min_width: i32, min_height: i32) {
@@ -475,7 +529,103 @@ impl Options {
             self.window_rect = defaults.window_rect;
         }
 
-        normalize_process_columns(&mut self.active_process_columns, &mut self.column_widths);
+        let (mut columns, mut widths) = self.logical_process_columns();
+        normalize_process_columns(&mut columns, &mut widths);
+        self.store_logical_process_columns(&columns, &widths);
+    }
+
+    pub(crate) fn clear_process_column_slots(&mut self) {
+        self.active_process_columns = [-1; SCHEMA2_COLUMN_SLOTS];
+        self.column_widths = [-1; SCHEMA2_COLUMN_SLOTS];
+        self.extended_process_columns = [-1; EXTENDED_COLUMN_SLOTS];
+        self.extended_column_widths = [-1; EXTENDED_COLUMN_SLOTS];
+    }
+
+    pub(crate) fn process_column_id(&self, index: usize) -> i32 {
+        self.column_slot(index)
+            .map(|(column, _)| column)
+            .unwrap_or(-1)
+    }
+
+    pub(crate) fn process_column_width(&self, index: usize) -> i32 {
+        self.column_slot(index)
+            .map(|(_, width)| width)
+            .unwrap_or(-1)
+    }
+
+    pub(crate) fn set_process_column_slot(&mut self, index: usize, column: i32, width: i32) {
+        if index < SCHEMA2_COLUMN_SLOTS {
+            self.active_process_columns[index] = column;
+            self.column_widths[index] = width;
+        } else if index - SCHEMA2_COLUMN_SLOTS < EXTENDED_COLUMN_SLOTS {
+            let extended = index - SCHEMA2_COLUMN_SLOTS;
+            self.extended_process_columns[extended] = column;
+            self.extended_column_widths[extended] = width;
+        }
+    }
+
+    fn column_slot(&self, index: usize) -> Option<(i32, i32)> {
+        if index < SCHEMA2_COLUMN_SLOTS {
+            Some((
+                self.active_process_columns[index],
+                self.column_widths[index],
+            ))
+        } else {
+            let extended = index - SCHEMA2_COLUMN_SLOTS;
+            (extended < EXTENDED_COLUMN_SLOTS).then_some((
+                self.extended_process_columns[extended],
+                self.extended_column_widths[extended],
+            ))
+        }
+    }
+
+    fn process_columns_are_valid(&self) -> bool {
+        let (columns, widths) = self.logical_process_columns();
+        process_columns_are_valid(&columns, &widths)
+    }
+
+    fn logical_process_columns(&self) -> ([i32; NUM_COLUMN + 1], [i32; NUM_COLUMN + 1]) {
+        let mut columns = [-1; NUM_COLUMN + 1];
+        let mut widths = [-1; NUM_COLUMN + 1];
+        columns[..SCHEMA2_COLUMN_SLOTS].copy_from_slice(&self.active_process_columns);
+        widths[..SCHEMA2_COLUMN_SLOTS].copy_from_slice(&self.column_widths);
+        columns[SCHEMA2_COLUMN_SLOTS..].copy_from_slice(&self.extended_process_columns);
+        widths[SCHEMA2_COLUMN_SLOTS..].copy_from_slice(&self.extended_column_widths);
+        (columns, widths)
+    }
+
+    fn store_logical_process_columns(
+        &mut self,
+        columns: &[i32; NUM_COLUMN + 1],
+        widths: &[i32; NUM_COLUMN + 1],
+    ) {
+        self.active_process_columns
+            .copy_from_slice(&columns[..SCHEMA2_COLUMN_SLOTS]);
+        self.column_widths
+            .copy_from_slice(&widths[..SCHEMA2_COLUMN_SLOTS]);
+        self.extended_process_columns
+            .copy_from_slice(&columns[SCHEMA2_COLUMN_SLOTS..]);
+        self.extended_column_widths
+            .copy_from_slice(&widths[SCHEMA2_COLUMN_SLOTS..]);
+    }
+
+    fn from_v2(old: OptionsV2) -> Self {
+        Self {
+            cb_size: size_of::<Self>() as u32,
+            timer_interval: old.timer_interval,
+            view_mode: old.view_mode,
+            cpu_history_mode: old.cpu_history_mode,
+            update_speed: old.update_speed,
+            window_rect: old.window_rect,
+            current_page: old.current_page,
+            active_process_columns: old.active_process_columns,
+            column_widths: old.column_widths,
+            flags: old.flags,
+            unused: old.unused,
+            unused2: old.unused2,
+            extended_process_columns: [-1; EXTENDED_COLUMN_SLOTS],
+            extended_column_widths: [-1; EXTENDED_COLUMN_SLOTS],
+        }
     }
 
     fn set_flag(&mut self, mask: u32, value: bool) {
@@ -497,13 +647,81 @@ fn legacy_options_is_taskmgr_rs(options: &Options) -> bool {
         && is_valid_cpu_history_mode(options.cpu_history_mode)
         && is_valid_update_speed(options.update_speed)
         && options.flags & !ALL_VALID_FLAGS == 0
-        && process_columns_are_valid(&options.active_process_columns, &options.column_widths)
+        && options.process_columns_are_valid()
 }
 
-fn read_registry_binary<T: RegistryPod>(
-    key_path: &str,
-    value_name: &str,
-) -> Result<Option<T>, u32> {
+fn legacy_v2_options_are_taskmgr_rs(options: &OptionsV2) -> bool {
+    let migrated = Options::from_v2(*options);
+    options.cb_size == size_of::<OptionsV2>() as u32
+        && options.unused == SCHEMA_2_VERSION
+        && options.unused2 == 0
+        && migrated.current_page >= -1
+        && migrated.current_page < PageId::COUNT as i32
+        && is_valid_view_mode(migrated.view_mode)
+        && is_valid_cpu_history_mode(migrated.cpu_history_mode)
+        && is_valid_update_speed(migrated.update_speed)
+        && migrated.flags & !ALL_VALID_FLAGS == 0
+        && migrated.process_columns_are_valid()
+}
+
+fn decode_stored_options(bytes: &[u8]) -> Result<Options, u32> {
+    if bytes.len() < 16 {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let mut magic = [0u8; 8];
+    magic.copy_from_slice(&bytes[..8]);
+    if magic != OPTIONS_STORAGE_MAGIC {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let storage_version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if storage_version != OPTIONS_STORAGE_VERSION {
+        return Err(ERROR_REVISION_MISMATCH);
+    }
+    let payload_size = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let payload_len = usize::try_from(payload_size).map_err(|_| ERROR_INVALID_DATA)?;
+    if bytes.len() != 16 + payload_len {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let payload = &bytes[16..];
+    if payload_len == size_of::<OptionsV2>() {
+        Ok(Options::from_v2(read_pod::<OptionsV2>(payload)?))
+    } else if payload_len == size_of::<Options>() && bytes.len() == size_of::<StoredOptions>() {
+        read_pod::<StoredOptions>(bytes)?.into_options()
+    } else {
+        Err(ERROR_INVALID_DATA)
+    }
+}
+
+fn decode_legacy_taskmgr_rs_options(bytes: &[u8]) -> Option<Options> {
+    if bytes.len() == size_of::<Options>() {
+        let options = read_pod::<Options>(bytes).ok()?;
+        legacy_options_is_taskmgr_rs(&options).then_some(options)
+    } else if bytes.len() == size_of::<OptionsV2>() {
+        let old = read_pod::<OptionsV2>(bytes).ok()?;
+        legacy_v2_options_are_taskmgr_rs(&old).then_some(Options::from_v2(old))
+    } else {
+        None
+    }
+}
+
+fn read_pod<T: RegistryPod>(bytes: &[u8]) -> Result<T, u32> {
+    if bytes.len() != size_of::<T>() {
+        return Err(ERROR_INVALID_DATA);
+    }
+    // SAFETY: RegistryPod permits every bit pattern. `bytes` has the exact size of `T`, and the
+    // copy lands in aligned owned storage before any field is read.
+    unsafe {
+        let mut value = zeroed::<T>();
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (&mut value as *mut T).cast::<u8>(),
+            bytes.len(),
+        );
+        Ok(value)
+    }
+}
+
+fn read_registry_bytes(key_path: &str, value_name: &str) -> Result<Option<Vec<u8>>, u32> {
     unsafe {
         let key_path = to_wide_null(key_path);
         let value_name = to_wide_null(value_name);
@@ -539,21 +757,19 @@ fn read_registry_binary<T: RegistryPod>(
             RegCloseKey(key);
             return Err(size_status);
         }
-        if value_type != REG_BINARY || value_size != size_of::<T>() as u32 {
+        if value_type != REG_BINARY || value_size == 0 || value_size > 1_048_576 {
             RegCloseKey(key);
             return Err(ERROR_INVALID_DATA);
         }
 
-        // SAFETY: RegistryPod requires every bit pattern to be valid. The exact-size check above
-        // and the second query's unchanged byte count guarantee that Windows initializes all bytes.
-        let mut value = zeroed::<T>();
+        let mut value = vec![0u8; value_size as usize];
         let mut actual_size = value_size;
         let read_status = RegQueryValueExW(
             key,
             value_name.as_ptr(),
             null_mut(),
             &mut value_type,
-            (&mut value as *mut T).cast::<u8>(),
+            value.as_mut_ptr(),
             &mut actual_size,
         );
         let close_status = RegCloseKey(key);
@@ -563,9 +779,10 @@ fn read_registry_binary<T: RegistryPod>(
         if close_status != ERROR_SUCCESS {
             return Err(close_status);
         }
-        if value_type != REG_BINARY || actual_size != size_of::<T>() as u32 {
+        if value_type != REG_BINARY || actual_size != value_size {
             return Err(ERROR_INVALID_DATA);
         }
+        value.truncate(actual_size as usize);
         Ok(Some(value))
     }
 }
@@ -775,16 +992,49 @@ fn screen_reader_enabled() -> bool {
 }
 
 #[cfg(test)]
+fn schema2_stored_bytes(schema: i32, page: i32) -> Vec<u8> {
+    let current = Options::default();
+    let old = OptionsV2 {
+        cb_size: size_of::<OptionsV2>() as u32,
+        timer_interval: current.timer_interval,
+        view_mode: current.view_mode,
+        cpu_history_mode: current.cpu_history_mode,
+        update_speed: current.update_speed,
+        window_rect: current.window_rect,
+        current_page: page,
+        active_process_columns: current.active_process_columns,
+        column_widths: current.column_widths,
+        flags: current.flags,
+        unused: schema,
+        unused2: 0,
+    };
+    let mut bytes = Vec::with_capacity(16 + size_of::<OptionsV2>());
+    bytes.extend_from_slice(&OPTIONS_STORAGE_MAGIC);
+    bytes.extend_from_slice(&OPTIONS_STORAGE_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(size_of::<OptionsV2>() as u32).to_le_bytes());
+    // SAFETY: OptionsV2 is RegistryPod. This copies the initialized value and does not retain the pointer.
+    let raw = unsafe {
+        std::slice::from_raw_parts(
+            (&old as *const OptionsV2).cast::<u8>(),
+            size_of::<OptionsV2>(),
+        )
+    };
+    bytes.extend_from_slice(raw);
+    bytes
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         ColumnId, ERROR_INVALID_DATA, ERROR_REVISION_MISMATCH, LEGACY_OPTIONS_VALUE,
         LEGACY_TASKMAN_KEY, NUM_COLUMN, OPTIONS_KEY, OPTIONS_SCHEMA_VERSION, OPTIONS_STORAGE_MAGIC,
         OPTIONS_STORAGE_VERSION, OPTIONS_VALUE, Options, SCHEMA_0_NETWORK_PAGE,
         SCHEMA_0_USERS_PAGE, SCHEMA_1_GPU_PAGE, SCHEMA_1_NETWORK_PAGE, SCHEMA_1_USERS_PAGE,
-        StoredOptions, UpdateSpeed, legacy_options_is_taskmgr_rs, normalize_process_columns,
-        process_columns_are_valid, update_speed_timer_interval, window_rect_dimensions_are_valid,
-        window_rect_is_valid,
+        StoredOptions, UpdateSpeed, decode_stored_options, legacy_options_is_taskmgr_rs,
+        normalize_process_columns, process_columns_are_valid, schema2_stored_bytes,
+        update_speed_timer_interval, window_rect_dimensions_are_valid, window_rect_is_valid,
     };
+    use std::mem::size_of;
     use windows_sys::Win32::Foundation::RECT;
 
     #[test]
@@ -881,10 +1131,99 @@ mod tests {
             options.timer_interval,
             update_speed_timer_interval(UpdateSpeed::Normal as i32).unwrap()
         );
-        assert!(process_columns_are_valid(
-            &options.active_process_columns,
-            &options.column_widths
-        ));
+        assert!(options.process_columns_are_valid());
+        assert!(
+            options
+                .extended_process_columns
+                .iter()
+                .all(|column| *column == -1)
+        );
+    }
+
+    #[test]
+    fn schema2_options_grow_into_schema3_without_reordering_saved_columns() {
+        let mut options = decode_stored_options(&schema2_stored_bytes(2, 2)).unwrap();
+        assert_eq!(options.migrate_schema(), Ok(true));
+        assert_eq!(options.unused, OPTIONS_SCHEMA_VERSION);
+        assert_eq!(options.cb_size, size_of::<Options>() as u32);
+        assert_eq!(options.current_page, 2);
+        assert_eq!(
+            options.active_process_columns[0],
+            ColumnId::ImageName as i32
+        );
+        assert_eq!(options.active_process_columns[1], ColumnId::Username as i32);
+        assert_eq!(options.active_process_columns[4], ColumnId::MemUsage as i32);
+        assert!(
+            options
+                .extended_process_columns
+                .iter()
+                .all(|column| *column == -1)
+        );
+        assert!(
+            options
+                .extended_column_widths
+                .iter()
+                .all(|width| *width == -1)
+        );
+        assert!(options.process_columns_are_valid());
+
+        let mut network =
+            decode_stored_options(&schema2_stored_bytes(0, SCHEMA_0_NETWORK_PAGE)).unwrap();
+        assert_eq!(network.migrate_schema(), Ok(true));
+        assert_eq!(network.current_page, 5);
+        assert_eq!(network.unused, OPTIONS_SCHEMA_VERSION);
+        assert_eq!(
+            network.active_process_columns[0],
+            ColumnId::ImageName as i32
+        );
+    }
+
+    #[test]
+    fn stored_options_reject_a_payload_size_from_neither_schema() {
+        let mut bytes = schema2_stored_bytes(2, 0);
+        bytes.push(0);
+        let payload_size = (bytes.len() - 16) as u32;
+        bytes[12..16].copy_from_slice(&payload_size.to_le_bytes());
+        assert_eq!(
+            decode_stored_options(&bytes).err(),
+            Some(ERROR_INVALID_DATA)
+        );
+    }
+
+    #[test]
+    fn added_process_columns_keep_primary_duplicate_and_sentinel_rules() {
+        let mut columns = [-1; NUM_COLUMN + 1];
+        let mut widths = [-1; NUM_COLUMN + 1];
+        columns[0] = ColumnId::ImageName as i32;
+        columns[1] = ColumnId::CommandLine as i32;
+        widths[1] = 180;
+        columns[2] = ColumnId::IoReadBytes as i32;
+        columns[3] = ColumnId::GdiObjects as i32;
+        columns[4] = ColumnId::UserObjects as i32;
+        assert!(process_columns_are_valid(&columns, &widths));
+
+        columns[5] = ColumnId::CommandLine as i32;
+        assert!(!process_columns_are_valid(&columns, &widths));
+
+        columns[5] = NUM_COLUMN as i32;
+        assert!(!process_columns_are_valid(&columns, &widths));
+
+        columns[5] = -1;
+        widths[5] = 8;
+        assert!(!process_columns_are_valid(&columns, &widths));
+
+        widths[5] = -1;
+        widths[2] = 0;
+        normalize_process_columns(&mut columns, &mut widths);
+        assert_eq!(columns[0], ColumnId::ImageName as i32);
+        assert_eq!(columns[1], ColumnId::CommandLine as i32);
+        assert_eq!(columns[2], ColumnId::IoReadBytes as i32);
+        assert_eq!(columns[3], ColumnId::GdiObjects as i32);
+        assert_eq!(columns[4], ColumnId::UserObjects as i32);
+        assert_eq!(columns[5], -1);
+        assert_eq!(widths[1], 180);
+        assert_eq!(widths[2], -1);
+        assert!(process_columns_are_valid(&columns, &widths));
     }
 
     #[test]

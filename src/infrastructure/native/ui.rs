@@ -25,7 +25,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::Controls::{
     HDN_BEGINDRAG, HDN_ENDDRAG, LVIR_BOUNDS, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT,
-    LVM_GETITEMRECT, LVM_GETTOPINDEX, LVS_EX_HEADERDRAGDROP, NMHEADERW,
+    LVM_GETITEMRECT, LVM_GETTOPINDEX, LVS_EX_HEADERDRAGDROP, NMHDR, NMHEADERW,
 };
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass,
@@ -490,18 +490,7 @@ unsafe extern "system" fn list_view_wnd_proc(
                 }
             }
         }
-        WM_NOTIFY if lparam != 0 => {
-            let header = unsafe { &*(lparam as *const NMHEADERW) };
-            if header.hdr.code == HDN_BEGINDRAG && header.iItem == 0 {
-                return 1;
-            }
-            if header.hdr.code == HDN_ENDDRAG
-                && !header.pitem.is_null()
-                && unsafe { (*header.pitem).iOrder } == 0
-            {
-                return 1;
-            }
-        }
+        WM_NOTIFY if unsafe { header_drag_moves_primary_column(lparam) } => return 1,
         WM_NCDESTROY => {
             unsafe {
                 RemoveWindowSubclass(hwnd, Some(list_view_wnd_proc), LIST_VIEW_SUBCLASS_ID);
@@ -515,6 +504,29 @@ unsafe extern "system" fn list_view_wnd_proc(
 
     // 安全性: unhandled messages continue through the system-managed subclass chain.
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+/// Checks only the header-drag payloads that carry column-order information.
+///
+/// # Safety
+///
+/// `lparam` is either null or a live `WM_NOTIFY` payload. Its `NMHDR::code` must match the
+/// notification-specific structure supplied by the originating Win32 control.
+unsafe fn header_drag_moves_primary_column(lparam: LPARAM) -> bool {
+    let Some(header) = (unsafe { (lparam as *const NMHDR).as_ref() }) else {
+        return false;
+    };
+    if !matches!(header.code, HDN_BEGINDRAG | HDN_ENDDRAG) {
+        return false;
+    }
+    // Safety: only these two notification codes promise an NMHEADERW payload. Other
+    // notifications (for example NM_RELEASEDCAPTURE) can consist of an NMHDR alone.
+    let drag = unsafe { &*(lparam as *const NMHEADERW) };
+    match header.code {
+        HDN_BEGINDRAG => drag.iItem == 0,
+        HDN_ENDDRAG => !drag.pitem.is_null() && unsafe { (*drag.pitem).iOrder == 0 },
+        _ => false,
+    }
 }
 
 pub fn window_rect_relative_to_page(hwnd: HWND, page_hwnd: HWND) -> RECT {
@@ -596,7 +608,21 @@ pub unsafe fn widestr_ptr_to_string(ptr: *const u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_text_to_utf16_buffer;
+    use super::{copy_text_to_utf16_buffer, header_drag_moves_primary_column};
+
+    #[test]
+    fn non_drag_notifications_need_only_the_common_header() {
+        use windows_sys::Win32::UI::Controls::{NM_RELEASEDCAPTURE, NMHDR};
+
+        let header = NMHDR {
+            code: NM_RELEASEDCAPTURE,
+            ..Default::default()
+        };
+        // Safety: NM_RELEASEDCAPTURE's complete payload is precisely this NMHDR; there is
+        // deliberately no trailing NMHEADERW storage for the parser to borrow or inspect.
+        assert!(!unsafe { header_drag_moves_primary_column((&raw const header) as isize) });
+        assert!(!unsafe { header_drag_moves_primary_column(0) });
+    }
 
     #[test]
     fn architecture_suffixes_preserve_unknown_and_native_names() {

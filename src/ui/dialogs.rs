@@ -45,6 +45,8 @@ const SBS_VERT_STYLE: u32 = SBS_VERT as u32;
 const CBS_DROPDOWNLIST_STYLE: u32 = CBS_DROPDOWNLIST as u32;
 const SS_RIGHT_STYLE: u32 = 0x0000_0002;
 const SS_ENDELLIPSIS_STYLE: u32 = 0x0000_4000;
+const SS_NOPREFIX_STYLE: u32 = 0x0000_0080;
+const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
 const DIALOG_FONT_NAME: &str = "MS Shell Dlg";
 const DIALOG_FONT_SIZE: u16 = 8;
 const CPU_LABELS: [&str; 64] = [
@@ -342,6 +344,10 @@ fn build_perf_dialog() -> DialogSpec<'static> {
         frame_control("CPU Usage", IDC_CPUUSAGEFRAME, 8, 5, 60, 60),
         frame_control("MEM Usage", IDC_MEMBARFRAME, 8, 67, 60, 60),
         frame_control("Memory Usage History", IDC_MEMFRAME, 78, 67, 60, 60),
+        frame_control("Disk", IDC_DISKBARFRAME, 8, 100, 60, 40),
+        ownerdraw_button(IDC_DISKMETER, true, 14, 110, 48, 28),
+        frame_control("Disk Activity", IDC_DISKFRAME, 78, 100, 60, 40),
+        ownerdraw_button(IDC_DISKGRAPH, true, 82, 110, 48, 28),
         frame_control("Physical Memory (K)", IDC_STATIC1, 130, 129, 130, 39),
         frame_control("Commit Charge (K)", IDC_STATIC5, 8, 173, 113, 39),
         frame_control("Kernel Memory (K)", IDC_STATIC10, 130, 173, 130, 39),
@@ -685,6 +691,16 @@ fn build_process_dialog() -> DialogSpec<'static> {
         font_name: DIALOG_FONT_NAME,
         font_size: DIALOG_FONT_SIZE,
         controls: vec![
+            static_text(
+                "Filter:",
+                IDC_PROCESS_FILTER_LABEL,
+                SS_CENTERIMAGE_STYLE,
+                9,
+                8,
+                52,
+                10,
+            ),
+            edit_text(IDC_PROCESS_FILTER, ES_AUTOHSCROLL_STYLE, 64, 7, 321, 12),
             ControlSpec {
                 class_name: "SysListView32",
                 text: "List2",
@@ -698,9 +714,9 @@ fn build_process_dialog() -> DialogSpec<'static> {
                     | LVS_OWNERDATA,
                 ex_style: 0,
                 x: 9,
-                y: 9,
+                y: 22,
                 cx: 376,
-                cy: 131,
+                cy: 118,
             },
             button("&End Process", IDC_TERMINATE, 0, 320, 144, 66, 14),
         ],
@@ -755,15 +771,15 @@ fn build_task_dialog() -> DialogSpec<'static> {
 
 fn build_select_columns_dialog() -> DialogSpec<'static> {
     let controls = vec![
-        button("OK", 1, BS_DEFPUSHBUTTON_STYLE, 83, 122, 50, 14),
-        button("Cancel", 2, 0, 137, 122, 50, 14),
+        button("OK", 1, BS_DEFPUSHBUTTON_STYLE, 208, 122, 50, 14),
+        button("Cancel", 2, 0, 262, 122, 50, 14),
         static_text(
             "Select the columns that will appear on the Process page of the Task Manager.",
             IDC_SELECTPROCCOLS_DESC,
             0,
             7,
             4,
-            177,
+            304,
             19,
         ),
         ControlSpec {
@@ -942,13 +958,90 @@ fn build_select_columns_dialog() -> DialogSpec<'static> {
             cx: 87,
             cy: 10,
         },
+        ControlSpec {
+            class_name: "Button",
+            text: "Command Line",
+            id: IDC_COMMANDLINE as u16,
+            style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX_STYLE,
+            ex_style: 0,
+            x: 199,
+            y: 26,
+            cx: 112,
+            cy: 10,
+        },
+        ControlSpec {
+            class_name: "Button",
+            text: "I/O Read Bytes",
+            id: IDC_IOREADBYTES as u16,
+            style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX_STYLE,
+            ex_style: 0,
+            x: 199,
+            y: 37,
+            cx: 112,
+            cy: 10,
+        },
+        ControlSpec {
+            class_name: "Button",
+            text: "I/O Write Bytes",
+            id: IDC_IOWRITEBYTES as u16,
+            style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX_STYLE,
+            ex_style: 0,
+            x: 199,
+            y: 48,
+            cx: 112,
+            cy: 10,
+        },
+        ControlSpec {
+            class_name: "Button",
+            text: "I/O Reads",
+            id: IDC_IOREADCOUNT as u16,
+            style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX_STYLE,
+            ex_style: 0,
+            x: 199,
+            y: 59,
+            cx: 112,
+            cy: 10,
+        },
+        ControlSpec {
+            class_name: "Button",
+            text: "I/O Writes",
+            id: IDC_IOWRITECOUNT as u16,
+            style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX_STYLE,
+            ex_style: 0,
+            x: 199,
+            y: 70,
+            cx: 112,
+            cy: 10,
+        },
+        ControlSpec {
+            class_name: "Button",
+            text: "GDI Objects",
+            id: IDC_GDIOBJECTS as u16,
+            style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX_STYLE,
+            ex_style: 0,
+            x: 199,
+            y: 81,
+            cx: 112,
+            cy: 10,
+        },
+        ControlSpec {
+            class_name: "Button",
+            text: "USER Objects",
+            id: IDC_USEROBJECTS as u16,
+            style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX_STYLE,
+            ex_style: 0,
+            x: 199,
+            y: 92,
+            cx: 112,
+            cy: 10,
+        },
     ];
     DialogSpec {
         style: DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU,
         ex_style: 0,
         x: 20,
         y: 20,
-        cx: 191,
+        cx: 318,
         cy: 141,
         title: "Select Columns",
         font_name: DIALOG_FONT_NAME,
@@ -1054,8 +1147,18 @@ fn build_services_dialog() -> DialogSpec<'static> {
                 cx: 376,
                 cy: 131,
             },
-            button("&Start", IDM_SERVICE_START as i32, 0, 214, 144, 50, 14),
-            button("&Stop", IDM_SERVICE_STOP as i32, 0, 268, 144, 50, 14),
+            button("&Start", IDM_SERVICE_START as i32, 0, 98, 144, 50, 14),
+            button("&Stop", IDM_SERVICE_STOP as i32, 0, 152, 144, 50, 14),
+            button("&Pause", IDM_SERVICE_PAUSE as i32, 0, 206, 144, 50, 14),
+            button(
+                "&Continue",
+                IDM_SERVICE_CONTINUE as i32,
+                0,
+                260,
+                144,
+                58,
+                14,
+            ),
             button(
                 "&Go To Process",
                 IDM_SERVICE_GOTOPROCESS as i32,
@@ -1063,6 +1166,60 @@ fn build_services_dialog() -> DialogSpec<'static> {
                 322,
                 144,
                 64,
+                14,
+            ),
+        ],
+    }
+}
+
+fn build_startup_dialog() -> DialogSpec<'static> {
+    DialogSpec {
+        style: DS_3DLOOK | DS_CONTROL | WS_CHILD,
+        ex_style: 0,
+        x: 0,
+        y: 0,
+        cx: 393,
+        cy: 197,
+        title: "",
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
+        controls: vec![
+            ControlSpec {
+                class_name: "SysListView32",
+                text: "List5",
+                id: IDC_STARTUPLIST as u16,
+                style: WS_CHILD
+                    | WS_VISIBLE
+                    | WS_BORDER
+                    | WS_TABSTOP
+                    | LVS_REPORT
+                    | LVS_SINGLESEL
+                    | LVS_OWNERDATA,
+                ex_style: 0,
+                x: 9,
+                y: 9,
+                cx: 376,
+                cy: 131,
+            },
+            ControlSpec {
+                class_name: "Static",
+                text: "",
+                id: IDC_STARTUP_NOTICE as u16,
+                style: WS_CHILD | SS_NOPREFIX_STYLE | SS_ENDELLIPSIS_STYLE,
+                ex_style: 0,
+                x: 9,
+                y: 128,
+                cx: 250,
+                cy: 8,
+            },
+            button("&Enable", IDM_STARTUP_ENABLE as i32, 0, 268, 144, 50, 14),
+            button(
+                "&Disable",
+                IDM_STARTUP_DISABLE as i32,
+                BS_DEFPUSHBUTTON_STYLE,
+                322,
+                144,
+                50,
                 14,
             ),
         ],
@@ -1337,6 +1494,7 @@ fn dialog_spec(dialog_id: u16) -> Option<DialogSpec<'static>> {
         IDD_AFFINITY => build_affinity_dialog(),
         IDD_USERSPAGE => build_users_dialog(),
         IDD_SERVICESPAGE => build_services_dialog(),
+        IDD_STARTUPPAGE => build_startup_dialog(),
         IDD_MESSAGE => build_message_dialog(),
         IDD_DIAGNOSTICS => build_diagnostics_dialog(),
         IDD_NEWTASK => build_new_task_dialog(),
@@ -1416,10 +1574,10 @@ mod tests {
     use super::{DialogTemplateBuilder, dialog_spec};
     use crate::ui::resource_ids::{
         IDC_AFFINITY_GROUP_SELECTOR, IDC_NEWTASK_ADMIN, IDC_NEWTASK_BROWSE, IDC_NEWTASK_COMMAND,
-        IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_TASKLIST, IDD_AFFINITY, IDD_CPUPAGE,
-        IDD_DIAGNOSTICS, IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_NEWTASK,
-        IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_SERVICESPAGE, IDD_TASKPAGE,
-        IDD_USERSPAGE,
+        IDC_NICTOTALS, IDC_PROCESS_FILTER, IDC_PROCESS_FILTER_LABEL, IDC_PROCLIST, IDC_SERVICELIST,
+        IDC_STARTUPLIST, IDC_TASKLIST, IDD_AFFINITY, IDD_CPUPAGE, IDD_DIAGNOSTICS, IDD_GPUPAGE,
+        IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_NEWTASK, IDD_PERFPAGE, IDD_PROCPAGE,
+        IDD_SELECTPROCCOLS, IDD_SERVICESPAGE, IDD_STARTUPPAGE, IDD_TASKPAGE, IDD_USERSPAGE,
     };
     use windows_sys::Win32::UI::Controls::LVS_OWNERDATA;
 
@@ -1437,6 +1595,7 @@ mod tests {
             IDD_AFFINITY,
             IDD_USERSPAGE,
             IDD_SERVICESPAGE,
+            IDD_STARTUPPAGE,
             IDD_MESSAGE,
             IDD_DIAGNOSTICS,
             IDD_NEWTASK,
@@ -1451,12 +1610,36 @@ mod tests {
     }
 
     #[test]
+    fn process_page_places_the_name_filter_above_the_list() {
+        let spec = dialog_spec(IDD_PROCPAGE).unwrap();
+        let filter = spec
+            .controls
+            .iter()
+            .find(|control| control.id == IDC_PROCESS_FILTER as u16)
+            .unwrap();
+        let list = spec
+            .controls
+            .iter()
+            .find(|control| control.id == IDC_PROCLIST as u16)
+            .unwrap();
+        assert_eq!(filter.class_name, "Edit");
+        assert!(
+            spec.controls
+                .iter()
+                .any(|control| control.id == IDC_PROCESS_FILTER_LABEL as u16)
+        );
+        assert!(filter.y < list.y);
+        assert_eq!(list.style & LVS_OWNERDATA, LVS_OWNERDATA);
+    }
+
+    #[test]
     fn owner_data_lists_are_the_process_and_service_pages() {
         let cases = [
             (IDD_PROCPAGE, IDC_PROCLIST, true),
             (IDD_TASKPAGE, IDC_TASKLIST, false),
             (IDD_NETPAGE, IDC_NICTOTALS, false),
             (IDD_SERVICESPAGE, IDC_SERVICELIST, true),
+            (IDD_STARTUPPAGE, IDC_STARTUPLIST, true),
         ];
 
         for (dialog_id, control_id, expected) in cases {

@@ -11,10 +11,12 @@
 //! Owns process enumeration, account/session enrichment, and successful-snapshot delta baselines.
 //! Failed collections leave CPU and per-process baselines untouched.
 //!
-//! CPU, creation time, and memory counters come from one `SystemProcessInformation` query on
-//! the worker thread. That query covers the Idle process and processes that refuse `OpenProcess`.
-//! A limited, creation-time-checked open is used only for architecture and the primary token,
-//! and only for a verified identity that is not already cached or access-denied.
+//! CPU, creation time, memory, and I/O counters come from one `SystemProcessInformation` query
+//! on the worker thread. That query covers the Idle process and processes that refuse `OpenProcess`.
+//! A limited, creation-time-checked open is used only for architecture, the primary token, and,
+//! when those columns are visible, the command line and GDI/USER counts. A process that exits
+//! during one of those queries keeps its snapshot row; the missing value stays unknown and
+//! `row_error` is set. Unknown counters are not stored as zero.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -25,7 +27,7 @@ use std::slice;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA,
     ERROR_INVALID_PARAMETER, ERROR_NONE_MAPPED, GetLastError, HANDLE, LocalFree,
-    RtlNtStatusToDosError,
+    RtlNtStatusToDosError, SetLastError,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
@@ -36,9 +38,10 @@ use windows_sys::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW, WTSEnumerateProcessesW,
 };
 use windows_sys::Win32::System::Threading::{
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
-    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION, REALTIME_PRIORITY_CLASS,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GR_GDIOBJECTS, GR_USEROBJECTS,
+    GetGuiResources, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+    OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    REALTIME_PRIORITY_CLASS,
 };
 
 use super::model::{DirtyColumns, ProcEntry, ProcStaticMetadata};
@@ -146,6 +149,14 @@ pub(super) type ProcWorkerResult = Result<ProcWorkerSnapshot, u32>;
 
 pub(super) struct ProcWorkerRequest {
     pub(super) processor_count: usize,
+    pub(super) query_command_line: bool,
+    pub(super) query_gui_objects: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessDetailQuery {
+    command_line: bool,
+    gui_objects: bool,
 }
 
 #[derive(Default)]
@@ -160,8 +171,15 @@ impl ProcWorkerState {
         let system_time =
             current_system_time(request.processor_count, &mut self.cache.processor_info)?;
         let total_delta = system_time_delta(system_time, self.previous_system_time);
-        let collected =
-            collect_process_entries(&self.previous_samples, total_delta, &mut self.cache)?;
+        let collected = collect_process_entries(
+            &self.previous_samples,
+            total_delta,
+            &mut self.cache,
+            ProcessDetailQuery {
+                command_line: request.query_command_line,
+                gui_objects: request.query_gui_objects,
+            },
+        )?;
 
         // CPU and per-process deltas must share the same successful snapshot boundary. A failed
         // process walk leaves both baselines untouched so the next sample remains comparable.
@@ -510,6 +528,14 @@ unsafe extern "system" {
         system_information_length: u32,
         return_length: *mut u32,
     ) -> i32;
+
+    fn NtQueryInformationProcess(
+        process_handle: HANDLE,
+        process_information_class: i32,
+        process_information: *mut c_void,
+        process_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
 }
 
 #[repr(C)]
@@ -597,6 +623,10 @@ struct ParsedProcess {
     commit_bytes: usize,
     paged_pool_bytes: usize,
     nonpaged_pool_bytes: usize,
+    io_read_bytes: Option<u64>,
+    io_write_bytes: Option<u64>,
+    io_read_count: Option<u64>,
+    io_write_count: Option<u64>,
 }
 
 fn query_system_process_information(buffer: &mut Vec<u8>) -> Result<usize, u32> {
@@ -740,7 +770,20 @@ fn parsed_process(
         commit_bytes: header.pagefile_usage,
         paged_pool_bytes: header.quota_paged_pool_usage,
         nonpaged_pool_bytes: header.quota_non_paged_pool_usage,
+        io_read_bytes: counted_u64(header.read_transfer_count, row_error),
+        io_write_bytes: counted_u64(header.write_transfer_count, row_error),
+        io_read_count: counted_u64(header.read_operation_count, row_error),
+        io_write_count: counted_u64(header.write_operation_count, row_error),
     })
+}
+
+fn counted_u64(value: i64, row_error: &mut Option<u32>) -> Option<u64> {
+    if value < 0 {
+        row_error.get_or_insert(ERROR_INVALID_DATA);
+        None
+    } else {
+        Some(value as u64)
+    }
 }
 
 fn cpu_time_from_counters(kernel: i64, user: i64, row_error: &mut Option<u32>) -> Option<u64> {
@@ -865,11 +908,25 @@ fn build_process_entries(
             priority_class: priority_class_from_base_priority(row.base_priority),
             handle_count: row.handle_count,
             thread_count: row.thread_count,
+            command_line: None,
+            io_read_bytes: row.io_read_bytes,
+            io_write_bytes: row.io_write_bytes,
+            io_read_count: row.io_read_count,
+            io_write_count: row.io_write_count,
+            gdi_objects: None,
+            user_objects: None,
             display_text: std::array::from_fn(|_| String::new()),
             pass_count: 0,
             dirty_columns: DirtyColumns::default(),
         };
         if !identity_usable || row.cpu_time_100ns.is_none() {
+            row_error.get_or_insert(ERROR_INVALID_DATA);
+        }
+        if row.io_read_bytes.is_none()
+            || row.io_write_bytes.is_none()
+            || row.io_read_count.is_none()
+            || row.io_write_count.is_none()
+        {
             row_error.get_or_insert(ERROR_INVALID_DATA);
         }
         if identity_usable && let Some(previous) = previous_samples.get(&identity) {
@@ -920,6 +977,7 @@ fn collect_process_entries(
     previous_samples: &HashMap<ProcIdentity, PreviousProcSample>,
     total_delta: Option<u64>,
     cache: &mut ProcWorkerCache,
+    details: ProcessDetailQuery,
 ) -> Result<CollectedProcessEntries, u32> {
     let returned = query_system_process_information(&mut cache.process_info)?;
     let (rows, mut row_error) = parse_system_process_information(&cache.process_info[..returned])?;
@@ -1064,8 +1122,222 @@ fn collect_process_entries(
         }
     }
 
+    query_process_details(&mut collected.entries, details, &mut row_error);
     collected.row_error = row_error;
     Ok(collected)
+}
+
+fn query_process_details(
+    entries: &mut [ProcEntry],
+    query: ProcessDetailQuery,
+    row_error: &mut Option<u32>,
+) {
+    if !query.command_line && !query.gui_objects {
+        return;
+    }
+    for entry in entries.iter_mut() {
+        if entry.pid == 0 || !entry.identity.is_verified() {
+            continue;
+        }
+        // GDI/USER counts need PROCESS_QUERY_INFORMATION. Command line is available with
+        // PROCESS_QUERY_LIMITED_INFORMATION, so an access-denied full query still tries that.
+        let mut command_line_done = false;
+        if query.gui_objects {
+            match open_process_for_identity(
+                entry.identity,
+                PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            ) {
+                Ok(handle) => {
+                    if query.command_line {
+                        apply_command_line(entry, handle.as_raw(), row_error);
+                        command_line_done = true;
+                    }
+                    apply_gui_objects(entry, handle.as_raw(), row_error);
+                }
+                Err(error) => remember_row_error(row_error, error),
+            }
+        }
+        if query.command_line && !command_line_done {
+            match open_process_for_identity(entry.identity, PROCESS_QUERY_LIMITED_INFORMATION) {
+                Ok(handle) => apply_command_line(entry, handle.as_raw(), row_error),
+                Err(error) => remember_row_error(row_error, error),
+            }
+        }
+    }
+}
+
+fn apply_command_line(entry: &mut ProcEntry, handle: HANDLE, row_error: &mut Option<u32>) {
+    match query_command_line(handle) {
+        Ok(command_line) => entry.command_line = Some(command_line),
+        Err(error) => {
+            entry.command_line = None;
+            remember_row_error(row_error, error);
+        }
+    }
+}
+
+fn apply_gui_objects(entry: &mut ProcEntry, handle: HANDLE, row_error: &mut Option<u32>) {
+    match query_gui_objects(handle) {
+        Ok((gdi_objects, user_objects)) => {
+            entry.gdi_objects = Some(gdi_objects);
+            entry.user_objects = Some(user_objects);
+        }
+        Err(error) => {
+            entry.gdi_objects = None;
+            entry.user_objects = None;
+            remember_row_error(row_error, error);
+        }
+    }
+}
+
+fn remember_row_error(row_error: &mut Option<u32>, error: u32) {
+    row_error.get_or_insert(if error == 0 { ERROR_GEN_FAILURE } else { error });
+}
+
+const PROCESS_COMMAND_LINE_INFORMATION: i32 = 60;
+const COMMAND_LINE_INITIAL_BYTES: usize = 512;
+/// `UNICODE_STRING::Length` counts bytes in a `u16`. A UTF-16 command line is even, so
+/// 32,767 code units is the longest value that field can describe.
+const MAX_COMMAND_LINE_UNITS: usize = 32_767;
+/// Room for the `UnicodeString` header plus the longest legal command line. The header
+/// size depends on pointer width, so it is not a fixed 64 KiB.
+const COMMAND_LINE_MAX_BYTES: usize =
+    size_of::<UnicodeString>() + MAX_COMMAND_LINE_UNITS * size_of::<u16>();
+const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
+
+fn query_command_line(handle: HANDLE) -> Result<String, u32> {
+    let mut buffer = vec![0u8; COMMAND_LINE_INITIAL_BYTES];
+    loop {
+        let Ok(length) = u32::try_from(buffer.len()) else {
+            return Err(ERROR_INVALID_DATA);
+        };
+        let mut returned = 0u32;
+        // SAFETY: `handle` is a creation-time-checked process handle owned by the caller. The
+        // worker owns `buffer` for this call and does not share it. The kernel writes at most
+        // `length` bytes and reports the used size in `returned`.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                PROCESS_COMMAND_LINE_INFORMATION,
+                buffer.as_mut_ptr().cast(),
+                length,
+                &mut returned,
+            )
+        };
+        if status >= 0 {
+            let returned = returned as usize;
+            if returned == 0 || returned > buffer.len() {
+                return Err(ERROR_INVALID_DATA);
+            }
+            return parse_process_command_line(&buffer[..returned]);
+        }
+        if status != STATUS_INFO_LENGTH_MISMATCH
+            && status != STATUS_BUFFER_TOO_SMALL
+            && status != STATUS_BUFFER_OVERFLOW
+        {
+            return Err(ntstatus_to_win32(status));
+        }
+        let Some(next) = next_command_line_capacity(buffer.len(), returned as usize) else {
+            return Err(ntstatus_to_win32(status));
+        };
+        buffer.resize(next, 0);
+    }
+}
+
+fn parse_process_command_line(buffer: &[u8]) -> Result<String, u32> {
+    if buffer.len() < size_of::<UnicodeString>() {
+        return Err(ERROR_INVALID_DATA);
+    }
+    // SAFETY: `buffer` holds at least one `UnicodeString`. `read_unaligned` copies the header
+    // without requiring the struct alignment. The buffer is not mutated during the copy.
+    let header = unsafe { buffer.as_ptr().cast::<UnicodeString>().read_unaligned() };
+    if header.length == 0 {
+        return Ok(String::new());
+    }
+    if !header.length.is_multiple_of(2) {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let bytes = usize::from(header.length);
+    if bytes > MAX_COMMAND_LINE_UNITS * size_of::<u16>() {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let units = command_line_units(buffer, header.buffer, bytes)?;
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    Ok(String::from_utf16_lossy(&units[..end]))
+}
+
+fn next_command_line_capacity(current: usize, returned: usize) -> Option<usize> {
+    let next = if returned > current {
+        returned
+    } else {
+        // Doubling can jump past the header-inclusive cap. Try that cap once before failing,
+        // so a legal 32,767-unit command line still fits.
+        current.saturating_mul(2).min(COMMAND_LINE_MAX_BYTES)
+    };
+    if next > current && next <= COMMAND_LINE_MAX_BYTES {
+        Some(next)
+    } else {
+        None
+    }
+}
+
+fn command_line_units(buffer: &[u8], raw_buffer: *const u16, bytes: usize) -> Result<&[u16], u32> {
+    let buffer_start = buffer.as_ptr() as usize;
+    let Some(buffer_end) = buffer_start.checked_add(buffer.len()) else {
+        return Err(ERROR_INVALID_DATA);
+    };
+    let pointer = raw_buffer as usize;
+    let absolute = pointer >= buffer_start
+        && pointer
+            .checked_add(bytes)
+            .is_some_and(|end| end <= buffer_end)
+        && pointer.is_multiple_of(align_of::<u16>());
+    let start = if absolute {
+        pointer
+    } else if pointer != 0
+        && pointer.is_multiple_of(align_of::<u16>())
+        && pointer
+            .checked_add(bytes)
+            .is_some_and(|end| end <= buffer.len())
+    {
+        buffer_start + pointer
+    } else {
+        return Err(ERROR_INVALID_DATA);
+    };
+    // SAFETY: `start` is aligned for `u16` and `start..start + bytes` lies inside `buffer`,
+    // which outlives this slice. The kernel, or the test builder, placed the UTF-16 units there.
+    let units = unsafe { slice::from_raw_parts(start as *const u16, bytes / 2) };
+    Ok(units)
+}
+
+fn classify_gui_count(count: u32, last_error: u32) -> Result<u32, u32> {
+    if count == 0 && last_error != 0 {
+        Err(last_error)
+    } else {
+        Ok(count)
+    }
+}
+
+fn query_gui_objects(handle: HANDLE) -> Result<(u32, u32), u32> {
+    Ok((
+        query_gui_count(handle, GR_GDIOBJECTS)?,
+        query_gui_count(handle, GR_USEROBJECTS)?,
+    ))
+}
+
+fn query_gui_count(handle: HANDLE, flag: u32) -> Result<u32, u32> {
+    // SAFETY: `handle` is a creation-time-checked process handle owned by the caller.
+    // GetGuiResources documents GetLastError when it returns zero, so the last-error slot is
+    // cleared first and read only for that zero result. A zero count with no error is a real zero.
+    unsafe {
+        SetLastError(0);
+        let count = GetGuiResources(handle, flag);
+        let error = if count == 0 { GetLastError() } else { 0 };
+        classify_gui_count(count, error)
+    }
 }
 
 fn enrich_process_entries(
@@ -1169,19 +1441,25 @@ mod tests {
     use std::collections::HashMap;
     use std::mem::size_of;
 
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER,
+    };
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetCurrentProcessId, HIGH_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
     };
 
     use super::{
-        AccountNameCache, ParsedProcess, SystemProcessInformation, UnicodeString,
-        build_process_entries, parse_system_process_information, query_process_account_name,
-        query_system_process_information, wts_live_identity_allows_merge,
+        AccountNameCache, COMMAND_LINE_INITIAL_BYTES, COMMAND_LINE_MAX_BYTES,
+        MAX_COMMAND_LINE_UNITS, ParsedProcess, ProcessDetailQuery, SystemProcessInformation,
+        UnicodeString, build_process_entries, classify_gui_count, next_command_line_capacity,
+        parse_process_command_line, parse_system_process_information, query_process_account_name,
+        query_process_details, query_system_process_information, wts_live_identity_allows_merge,
     };
+    use crate::config::options::ColumnId;
     use crate::infrastructure::native::OwnedHandle;
     use crate::system::process_identity::{ProcIdentity, query_process_identity_for_pid};
+    use crate::ui::localization::{TextKey, text};
 
     #[test]
     fn current_process_primary_token_resolves_to_a_non_empty_account_label() {
@@ -1376,6 +1654,7 @@ mod tests {
                 paged_pool: 1_024,
                 nonpaged_pool: 3_072,
                 parent_pid: 0,
+                ..BufferSpec::default()
             },
             BufferSpec {
                 pid: 55,
@@ -1414,6 +1693,196 @@ mod tests {
         assert_eq!(built.entries[1].session_id, Some(2));
         assert_eq!(built.entries[1].identity, ProcIdentity::new(44, 123_456));
         assert!(built.entries[2].identity.is_verified());
+    }
+
+    #[test]
+    fn negative_io_counter_stays_unknown_and_keeps_the_sibling_row() {
+        let buffer = system_process_buffer(&[
+            BufferSpec {
+                pid: 10,
+                creation_time: 1,
+                name: Some("bad.exe".to_string()),
+                read_bytes: -1,
+                write_bytes: 4,
+                read_count: 2,
+                write_count: 3,
+                ..BufferSpec::default()
+            },
+            BufferSpec {
+                pid: 11,
+                creation_time: 2,
+                name: Some("ok.exe".to_string()),
+                read_bytes: 8,
+                write_bytes: 9,
+                read_count: 1,
+                write_count: 1,
+                ..BufferSpec::default()
+            },
+        ]);
+        let (rows, row_error) =
+            parse_system_process_information(&buffer).expect("synthetic buffer should parse");
+        assert!(row_error.is_some());
+        assert!(rows[0].io_read_bytes.is_none());
+        assert_eq!(rows[0].io_write_bytes, Some(4));
+        assert_eq!(rows[0].io_read_count, Some(2));
+        assert_eq!(rows[1].io_read_bytes, Some(8));
+        assert_ne!(rows[0].io_read_bytes, Some(0));
+
+        let built = build_process_entries(&rows, &HashMap::new(), None);
+        assert_eq!(built.entries.len(), 2);
+        assert!(built.row_error.is_some());
+        assert!(built.entries[0].io_read_bytes.is_none());
+        assert_eq!(built.entries[0].io_write_bytes, Some(4));
+        assert_eq!(built.entries[1].io_read_bytes, Some(8));
+        assert_eq!(built.entries[1].image_name, "ok.exe");
+    }
+
+    #[test]
+    fn command_line_bytes_outside_the_returned_buffer_are_not_an_empty_success() {
+        assert_eq!(
+            parse_process_command_line(&[]).err(),
+            Some(ERROR_INVALID_DATA)
+        );
+        assert_eq!(
+            parse_process_command_line(&command_line_buffer(0x1000, "nope")).err(),
+            Some(ERROR_INVALID_DATA)
+        );
+        assert_eq!(
+            parse_process_command_line(&command_line_buffer_inside("taskmgr.exe")).unwrap(),
+            "taskmgr.exe"
+        );
+        assert_eq!(
+            parse_process_command_line(&command_line_buffer_inside("")).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn command_line_accepts_the_unicode_string_length_limit() {
+        assert_eq!(
+            COMMAND_LINE_MAX_BYTES,
+            size_of::<UnicodeString>() + MAX_COMMAND_LINE_UNITS * 2
+        );
+        const {
+            assert!(COMMAND_LINE_MAX_BYTES > 64 * 1024);
+        }
+
+        let full = next_command_line_capacity(64 * 1024, 0).expect("cap is reachable");
+        assert_eq!(full, COMMAND_LINE_MAX_BYTES);
+        assert!(next_command_line_capacity(COMMAND_LINE_MAX_BYTES, 0).is_none());
+        assert!(
+            next_command_line_capacity(COMMAND_LINE_INITIAL_BYTES, COMMAND_LINE_MAX_BYTES + 1)
+                .is_none()
+        );
+
+        let mut built = build_process_entries(
+            &[sample_row(40, 10, Some(10), "long.exe", 8)],
+            &HashMap::new(),
+            None,
+        );
+        let unknown = text(TextKey::NotAvailable);
+        for units in [16_385_usize, MAX_COMMAND_LINE_UNITS] {
+            let invocation = "A".repeat(units);
+            let parsed =
+                parse_process_command_line(&command_line_buffer_inside(&invocation)).unwrap();
+            assert_eq!(parsed.chars().count(), units);
+            built.entries[0].command_line = Some(parsed);
+            built.entries[0].rebuild_display_columns(&[ColumnId::CommandLine]);
+            let shown = &built.entries[0].display_text[ColumnId::CommandLine as usize];
+            assert_eq!(shown.chars().count(), units);
+            assert_ne!(shown, unknown);
+        }
+    }
+
+    #[test]
+    fn gui_object_zero_is_success_only_when_the_call_reports_no_error() {
+        assert_eq!(classify_gui_count(0, 0), Ok(0));
+        assert_eq!(classify_gui_count(0, 5), Err(5));
+        assert_eq!(classify_gui_count(4, 5), Ok(4));
+    }
+
+    #[test]
+    fn departed_process_keeps_sibling_rows_and_records_row_error() {
+        // SAFETY: GetCurrentProcessId has no preconditions.
+        let self_pid = unsafe { GetCurrentProcessId() };
+        let self_identity = query_process_identity_for_pid(self_pid).expect("current identity");
+        let mut collected = build_process_entries(
+            &[
+                sample_row(u32::MAX, 1, Some(10), "gone.exe", 8),
+                sample_row(
+                    self_identity.pid,
+                    self_identity.creation_time_100ns,
+                    Some(10),
+                    "self.exe",
+                    8,
+                ),
+            ],
+            &HashMap::new(),
+            None,
+        );
+        let mut row_error = None;
+        query_process_details(
+            &mut collected.entries,
+            ProcessDetailQuery {
+                command_line: true,
+                gui_objects: true,
+            },
+            &mut row_error,
+        );
+        assert_eq!(collected.entries.len(), 2);
+        assert!(row_error.is_some());
+        assert!(collected.entries[0].command_line.is_none());
+        assert!(collected.entries[0].gdi_objects.is_none());
+        assert!(collected.entries[0].user_objects.is_none());
+        assert_eq!(collected.entries[0].io_read_bytes, Some(0));
+        assert!(
+            collected.entries[1]
+                .command_line
+                .as_ref()
+                .is_some_and(|line| !line.is_empty())
+        );
+        assert!(collected.entries[1].gdi_objects.is_some());
+        assert!(collected.entries[1].user_objects.is_some());
+        assert_eq!(collected.entries[1].identity, self_identity);
+    }
+
+    fn command_line_buffer_inside(text: &str) -> Vec<u8> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut buffer = vec![0u8; size_of::<UnicodeString>() + units.len() * 2];
+        let string_offset = size_of::<UnicodeString>();
+        for (index, unit) in units.iter().enumerate() {
+            let offset = string_offset + index * 2;
+            buffer[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let header = UnicodeString {
+            length: u16::try_from(units.len() * 2).unwrap(),
+            maximum_length: u16::try_from(units.len() * 2).unwrap(),
+            buffer: unsafe { buffer.as_ptr().add(string_offset).cast() },
+        };
+        // SAFETY: the header occupies the reserved prefix of `buffer` and does not alias a live
+        // reference to that range.
+        unsafe {
+            buffer
+                .as_mut_ptr()
+                .cast::<UnicodeString>()
+                .write_unaligned(header);
+        }
+        buffer
+    }
+
+    fn command_line_buffer(pointer: usize, text: &str) -> Vec<u8> {
+        let mut buffer = command_line_buffer_inside(text);
+        // SAFETY: the prefix of `buffer` is a UnicodeString written above. This only replaces the
+        // pointer field with an address that is outside the allocation.
+        unsafe {
+            let mut header = buffer.as_ptr().cast::<UnicodeString>().read_unaligned();
+            header.buffer = pointer as *const u16;
+            buffer
+                .as_mut_ptr()
+                .cast::<UnicodeString>()
+                .write_unaligned(header);
+        }
+        buffer
     }
 
     #[test]
@@ -1497,6 +1966,10 @@ mod tests {
             commit_bytes: 0,
             paged_pool_bytes: 0,
             nonpaged_pool_bytes: 0,
+            io_read_bytes: Some(0),
+            io_write_bytes: Some(0),
+            io_read_count: Some(0),
+            io_write_count: Some(0),
         }
     }
 
@@ -1526,6 +1999,10 @@ mod tests {
         paged_pool: usize,
         nonpaged_pool: usize,
         parent_pid: u32,
+        read_bytes: i64,
+        write_bytes: i64,
+        read_count: i64,
+        write_count: i64,
     }
 
     impl Default for BufferSpec {
@@ -1546,6 +2023,10 @@ mod tests {
                 paged_pool: 0,
                 nonpaged_pool: 0,
                 parent_pid: 0,
+                read_bytes: 0,
+                write_bytes: 0,
+                read_count: 0,
+                write_count: 0,
             }
         }
     }
@@ -1596,6 +2077,10 @@ mod tests {
                 quota_paged_pool_usage: spec.paged_pool,
                 quota_non_paged_pool_usage: spec.nonpaged_pool,
                 pagefile_usage: spec.commit,
+                read_operation_count: spec.read_count,
+                write_operation_count: spec.write_count,
+                read_transfer_count: spec.read_bytes,
+                write_transfer_count: spec.write_bytes,
                 ..SystemProcessInformation::default()
             };
             // SAFETY: `entry_offset` addresses `header_size` bytes reserved above, and this write

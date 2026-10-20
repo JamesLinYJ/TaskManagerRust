@@ -41,7 +41,9 @@ use windows_sys::Win32::Foundation::{
     ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND, ERROR_SUCCESS, FILETIME,
     FreeLibrary, GetLastError, HMODULE, INVALID_HANDLE_VALUE, SYSTEMTIME,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Time::FileTimeToSystemTime;
 
@@ -441,23 +443,31 @@ unsafe fn query_device_string_property(
     else {
         return Ok(None);
     };
-    if property_type != expected_type || buffer.len() % size_of::<u16>() != 0 {
+    if property_type != expected_type {
         return Err(GpuSampleError::InvalidData { context });
     }
-    let units = unsafe {
-        std::slice::from_raw_parts(
-            buffer.as_ptr().cast::<u16>(),
-            buffer.len() / size_of::<u16>(),
-        )
-    };
+    decode_device_string(&buffer, context)
+}
+
+fn decode_device_string(
+    bytes: &[u8],
+    context: &'static str,
+) -> Result<Option<String>, GpuSampleError> {
+    // SetupAPI returns a byte buffer. Decode UTF-16LE without assuming its allocation (or a
+    // subslice) has u16 alignment, and continue requiring a complete, terminated string.
+    let (units, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(GpuSampleError::InvalidData { context });
+    }
     let length = units
         .iter()
-        .position(|unit| *unit == 0)
+        .position(|unit| *unit == [0, 0])
         .ok_or(GpuSampleError::InvalidData { context })?;
     if length == 0 {
         return Ok(None);
     }
-    String::from_utf16(&units[..length])
+    char::decode_utf16(units[..length].iter().copied().map(u16::from_le_bytes))
+        .collect::<Result<String, _>>()
         .map(Some)
         .map_err(|_| GpuSampleError::InvalidData { context })
 }
@@ -643,9 +653,12 @@ struct DynamicLibrary(HMODULE);
 impl DynamicLibrary {
     fn load(name: &str) -> Result<Self, GpuSampleError> {
         let name = to_wide_null(name);
-        let module = unsafe { LoadLibraryW(name.as_ptr()) };
+        // D3D12 is an operating-system runtime. Restrict resolution to the system directory
+        // instead of accepting a namesake DLL beside this elevated application or in its CWD.
+        let module =
+            unsafe { LoadLibraryExW(name.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() {
-            Err(last_win32_error("LoadLibraryW for D3D12"))
+            Err(last_win32_error("LoadLibraryExW for system D3D12"))
         } else {
             Ok(Self(module))
         }
@@ -680,5 +693,144 @@ fn last_win32_error(context: &'static str) -> GpuSampleError {
         } else {
             code
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_string_decodes_unaligned_utf16_and_surrogate_pairs() {
+        #[repr(align(2))]
+        struct AlignedBytes([u8; 9]);
+        let storage = AlignedBytes([0xff, b'A', 0, 0x3d, 0xd8, 0x00, 0xde, 0, 0]);
+        let bytes = &storage.0[1..];
+        assert_eq!(bytes.as_ptr() as usize % 2, 1);
+        assert_eq!(
+            decode_device_string(bytes, "test").unwrap(),
+            Some("A😀".into())
+        );
+    }
+
+    #[test]
+    fn device_string_rejects_truncation_missing_terminator_and_invalid_utf16() {
+        for bytes in [b"A".as_slice(), &[b'A', 0][..], &[0x00, 0xd8, 0, 0][..]] {
+            assert!(decode_device_string(bytes, "test").is_err());
+        }
+        assert_eq!(decode_device_string(&[0, 0], "test").unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod dll_search_tests {
+    use super::*;
+    use std::{env, fs, path::PathBuf, process::Command};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, LoadLibraryW};
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    const CHILD_CASE: &str = "TASKMGR_DLL_SEARCH_TEST_CASE";
+    const TEST_NAME: &str =
+        "pages::gpu::metadata::dll_search_tests::system_runtime_ignores_untrusted_directories";
+
+    fn system_directory() -> PathBuf {
+        let mut buffer = vec![0u16; 32768];
+        let count = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        assert!(count > 0 && (count as usize) < buffer.len());
+        PathBuf::from(String::from_utf16(&buffer[..count as usize]).unwrap())
+    }
+
+    fn module_path(module: HMODULE) -> PathBuf {
+        let mut buffer = vec![0u16; 32768];
+        let count = unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) };
+        assert!(count > 0 && (count as usize) < buffer.len());
+        PathBuf::from(String::from_utf16(&buffer[..count as usize]).unwrap())
+    }
+
+    #[test]
+    fn system_runtime_ignores_untrusted_directories() {
+        if let Ok(case) = env::var(CHILD_CASE) {
+            let library = if case == "unrestricted-control" {
+                // The fixture is the OS version.dll copied under another name. It contains no
+                // malicious code. This control proves the old search could select the fixture.
+                let name = to_wide_null("d3d12.dll");
+                let module = unsafe { LoadLibraryW(name.as_ptr()) };
+                assert!(!module.is_null(), "fixture must be loadable");
+                DynamicLibrary(module)
+            } else {
+                DynamicLibrary::load("d3d12.dll").expect("system D3D12 should load")
+            };
+            let observed = fs::canonicalize(module_path(library.0)).unwrap();
+            if case == "unrestricted-control" {
+                let fixture =
+                    fs::canonicalize(env::current_exe().unwrap().with_file_name("d3d12.dll"))
+                        .unwrap();
+                assert_eq!(observed, fixture);
+            } else {
+                let expected = fs::canonicalize(system_directory().join("d3d12.dll")).unwrap();
+                assert_eq!(observed, expected);
+                assert!(
+                    unsafe { GetProcAddress(library.0, c"D3D12CreateDevice".as_ptr().cast()) }
+                        .is_some()
+                );
+            }
+            return;
+        }
+
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).expect("only the owned fixture directory is removed");
+            }
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!(
+            "taskmgr-system-dll-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let fixture = Fixture(directory);
+        let source = system_directory().join("version.dll");
+        for case in ["unrestricted-control", "adjacent", "cwd", "path"] {
+            let case_directory = fixture.0.join(case);
+            fs::create_dir(&case_directory).unwrap();
+            let exe_directory = case_directory.join("app");
+            let other_directory = case_directory.join("other");
+            fs::create_dir(&exe_directory).unwrap();
+            fs::create_dir(&other_directory).unwrap();
+            let child_exe = exe_directory.join("fixture.exe");
+            fs::copy(env::current_exe().unwrap(), &child_exe).unwrap();
+            let plant_directory = if matches!(case, "unrestricted-control" | "adjacent") {
+                &exe_directory
+            } else {
+                &other_directory
+            };
+            fs::copy(&source, plant_directory.join("d3d12.dll")).unwrap();
+            let mut child = Command::new(child_exe);
+            child
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_CASE, case)
+                .current_dir(if case == "cwd" {
+                    &other_directory
+                } else {
+                    &exe_directory
+                });
+            if case == "path" {
+                let mut paths = vec![other_directory];
+                paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+                child.env("PATH", env::join_paths(paths).unwrap());
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 }

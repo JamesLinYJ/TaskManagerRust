@@ -43,6 +43,10 @@ pub struct PerfLayoutPlan {
     pub mem_bar_frame_rect: RECT,
     pub mem_frame_rect: RECT,
     pub mem_graph_rect: RECT,
+    pub disk_bar_frame_rect: RECT,
+    pub disk_frame_rect: RECT,
+    pub disk_meter_rect: RECT,
+    pub disk_graph_rect: RECT,
     pub cpu_pane_rects: Vec<RECT>,
     pub graph_surface_width: i32,
     pub graph_surface_height: i32,
@@ -64,7 +68,9 @@ pub fn compute_perf_layout(
     let cpu_history_height = if no_title {
         parent_rect.bottom - parent_rect.top - spacing.def_spacing * 2
     } else {
-        (y_top - spacing.def_spacing * 3) / 2
+        // Three equal history bands. Two gaps of `def_spacing * 2` leave one `def_spacing`
+        // between the disk band and the detail area.
+        y_top.saturating_sub(spacing.def_spacing.saturating_mul(5)) / 3
     }
     .max(0);
 
@@ -106,6 +112,49 @@ pub fn compute_perf_layout(
         bottom: mem_top + spacing.top_spacing + graph_height,
     };
 
+    let (disk_bar_frame_rect, disk_frame_rect, disk_meter_rect, disk_graph_rect) = if no_title {
+        let empty = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        (empty, empty, empty, empty)
+    } else {
+        let disk_top = mem_top + cpu_history_height + spacing.def_spacing * 2;
+        let disk_bar_frame_rect = RECT {
+            left: anchors.mem_bar_frame.left,
+            top: disk_top,
+            right: anchors.mem_bar_frame.right,
+            bottom: disk_top + cpu_history_height,
+        };
+        let disk_frame_rect = RECT {
+            left: anchors.mem_frame.left,
+            top: disk_top,
+            right: parent_rect.right - spacing.def_spacing * 2,
+            bottom: disk_top + cpu_history_height,
+        };
+        let disk_graph_left = disk_frame_rect.left + spacing.inner_spacing * 2;
+        let disk_graph_rect = RECT {
+            left: disk_graph_left,
+            top: disk_top + spacing.top_spacing,
+            right: (disk_frame_rect.right - spacing.inner_spacing * 2).max(disk_graph_left),
+            bottom: disk_top + spacing.top_spacing + graph_height,
+        };
+        let disk_meter_rect = RECT {
+            left: meter_rect.left,
+            top: disk_top + spacing.top_spacing,
+            right: meter_rect.right,
+            bottom: disk_top + spacing.top_spacing + graph_height,
+        };
+        (
+            disk_bar_frame_rect,
+            disk_frame_rect,
+            disk_meter_rect,
+            disk_graph_rect,
+        )
+    };
+
     let pane_area_left = anchors.cpu_history_frame.left + spacing.inner_spacing * 2;
     let pane_area_top = anchors.cpu_history_frame.top + spacing.top_spacing;
     let pane_area_width =
@@ -139,7 +188,8 @@ pub fn compute_perf_layout(
         .first()
         .map(|rect| rect_width(*rect))
         .unwrap_or(0)
-        .max(rect_width(mem_graph_rect));
+        .max(rect_width(mem_graph_rect))
+        .max(rect_width(disk_graph_rect));
 
     PerfLayoutPlan {
         detail_shift_y,
@@ -150,6 +200,10 @@ pub fn compute_perf_layout(
         mem_bar_frame_rect,
         mem_frame_rect,
         mem_graph_rect,
+        disk_bar_frame_rect,
+        disk_frame_rect,
+        disk_meter_rect,
+        disk_graph_rect,
         cpu_pane_rects,
         graph_surface_width,
         graph_surface_height: graph_height,
@@ -312,6 +366,10 @@ mod tests {
                 .len()
                 > 1
         );
+        assert!(layout.disk_frame_rect.top >= layout.mem_frame_rect.bottom);
+        assert!(
+            layout.disk_frame_rect.bottom <= sample_anchors().top_frame.top + layout.detail_shift_y
+        );
         for (index, pane) in layout.cpu_pane_rects.iter().enumerate() {
             assert!(pane.right > pane.left);
             assert!(pane.bottom > pane.top);
@@ -323,5 +381,31 @@ mod tests {
                 assert!(!overlaps);
             }
         }
+    }
+
+    #[test]
+    fn disk_band_stays_above_the_detail_area() {
+        let anchors = sample_anchors();
+        let layout = compute_perf_layout(rect(0, 0, 640, 480), anchors, sample_spacing(), 1, false);
+        assert!(layout.cpu_history_height > 0);
+        assert!(layout.mem_frame_rect.bottom <= layout.disk_frame_rect.top);
+        assert!(layout.disk_frame_rect.bottom <= anchors.top_frame.top + layout.detail_shift_y);
+        assert_eq!(layout.disk_graph_rect.left, layout.disk_frame_rect.left + 6);
+        assert!(layout.disk_meter_rect.bottom <= layout.disk_bar_frame_rect.bottom);
+    }
+
+    #[test]
+    fn no_title_keeps_the_cpu_band_and_omits_disk() {
+        let layout = compute_perf_layout(
+            rect(0, 0, 640, 480),
+            sample_anchors(),
+            sample_spacing(),
+            1,
+            true,
+        );
+        assert_eq!(layout.cpu_history_height, 468);
+        assert_eq!(layout.disk_frame_rect.top, 0);
+        assert_eq!(layout.disk_frame_rect.bottom, 0);
+        assert_eq!(layout.disk_graph_rect.right, 0);
     }
 }

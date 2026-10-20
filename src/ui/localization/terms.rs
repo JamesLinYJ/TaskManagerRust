@@ -26,6 +26,15 @@ pub fn user_session_column_title() -> &'static str {
     text(TextKey::Session)
 }
 
+pub fn startup_column_titles() -> [&'static str; 4] {
+    [
+        text(TextKey::StartupColumnName),
+        text(TextKey::StartupColumnPublisher),
+        text(TextKey::StartupColumnLocation),
+        text(TextKey::Status),
+    ]
+}
+
 pub fn service_column_titles() -> [&'static str; 5] {
     [
         text(TextKey::ServiceColumnName),
@@ -36,13 +45,15 @@ pub fn service_column_titles() -> [&'static str; 5] {
     ]
 }
 
-pub fn network_column_titles() -> [&'static str; 7] {
+pub fn network_column_titles() -> [&'static str; 8] {
     // 网络页列标题会被列表头和相关对话框共同复用。
+    // 前五项是列表列：适配器、利用率、链路速度、状态、IPv4。字节计数接在后面。
     [
         text(TextKey::Adapter),
         text(TextKey::NetworkUtilization),
         text(TextKey::LinkSpeed),
         text(TextKey::State),
+        text(TextKey::Ipv4Address),
         text(TextKey::BytesSent),
         text(TextKey::BytesReceived),
         text(TextKey::BytesTotal),

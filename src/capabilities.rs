@@ -45,7 +45,11 @@ enum CapabilityCommand {
 }
 
 pub(crate) fn run_from_environment() -> Option<i32> {
-    let destination = match parse_arguments(env::args_os()) {
+    run_with_arguments(env::args_os())
+}
+
+pub(crate) fn run_with_arguments(arguments: impl IntoIterator<Item = OsString>) -> Option<i32> {
+    let destination = match parse_arguments(arguments) {
         CapabilityCommand::NotRequested => return None,
         CapabilityCommand::Export(destination) => destination,
         CapabilityCommand::Invalid(reason) => {
@@ -91,7 +95,7 @@ pub(crate) fn run_from_environment() -> Option<i32> {
                 "hardware capability report export failed",
                 &[
                     Field::sensitive_text("destination", destination.to_string_lossy()),
-                    Field::text("error", error),
+                    Field::sensitive_text("error", error),
                 ],
             );
             let _ = diagnostics::flush();
@@ -226,15 +230,41 @@ fn active_processor_groups() -> Value {
             },
         });
     }
-    let groups = (0..count)
-        .map(|number| {
-            let processor_count = unsafe { GetActiveProcessorCount(number) };
-            json!({
-                "number": number,
-                "active_logical_processor_count": processor_count,
-            })
-        })
-        .collect::<Vec<_>>();
+    processor_groups_report(count, |number| {
+        // Safety: the group number is drawn from the count reported by Windows. A topology
+        // change can still invalidate it between queries, so zero must remain an error.
+        let processor_count = unsafe { GetActiveProcessorCount(number) };
+        if processor_count == 0 {
+            let error = unsafe { GetLastError() };
+            Err(if error == 0 { ERROR_GEN_FAILURE } else { error })
+        } else {
+            Ok(processor_count)
+        }
+    })
+}
+
+fn processor_groups_report(count: u16, mut query: impl FnMut(u16) -> Result<u32, u32>) -> Value {
+    let mut groups = Vec::with_capacity(usize::from(count));
+    for number in 0..count {
+        let processor_count = match query(number) {
+            Ok(processor_count) => processor_count,
+            Err(error) => {
+                return json!({
+                    "status": "error",
+                    "error": {
+                        "domain": "win32",
+                        "code": error,
+                        "context": "GetActiveProcessorCount",
+                        "group": number,
+                    },
+                });
+            }
+        };
+        groups.push(json!({
+            "number": number,
+            "active_logical_processor_count": processor_count,
+        }));
+    }
     json!({
         "status": "supported",
         "group_count": count,
@@ -268,9 +298,30 @@ fn cpu_set_error_capability(error: CpuSetError) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapabilityCommand, parse_arguments};
+    use super::{CapabilityCommand, parse_arguments, processor_groups_report};
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    #[test]
+    fn group_query_failure_does_not_claim_a_complete_supported_topology() {
+        let report = processor_groups_report(2, |group| {
+            if group == 0 {
+                Ok(64)
+            } else {
+                Err(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER)
+            }
+        });
+        assert_eq!(report["status"], "error");
+        assert_eq!(report["error"]["context"], "GetActiveProcessorCount");
+        assert_eq!(report["error"]["group"], 1);
+        assert_eq!(report["error"]["code"], 87);
+        assert!(report.get("active_logical_processor_count").is_none());
+
+        let recovered = processor_groups_report(2, |_| Ok(64));
+        assert_eq!(recovered["status"], "supported");
+        assert_eq!(recovered["group_count"], 2);
+        assert_eq!(recovered["active_logical_processor_count"], 128);
+    }
 
     fn parse(arguments: &[&str]) -> CapabilityCommand {
         parse_arguments(arguments.iter().map(OsString::from))

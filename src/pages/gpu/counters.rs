@@ -12,7 +12,7 @@
 //! Counter baselines and topology changes are committed without inventing zero samples.
 
 use std::collections::{HashMap, HashSet};
-use std::mem::size_of;
+use std::mem::{align_of, size_of};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
@@ -36,6 +36,8 @@ const ENGINE_COUNTER_PATH: &str = r"\GPU Engine(*)\Utilization Percentage";
 const DEDICATED_MEMORY_COUNTER_PATH: &str = r"\GPU Adapter Memory(*)\Dedicated Usage";
 const SHARED_MEMORY_COUNTER_PATH: &str = r"\GPU Adapter Memory(*)\Shared Usage";
 const MAX_PDH_ARRAY_BYTES: u32 = 64 * 1024 * 1024;
+// The value union needs 64-bit alignment on i686 as well as on 64-bit Windows.
+const _: () = assert!(align_of::<u64>() >= align_of::<PDH_FMT_COUNTERVALUE_ITEM_W>());
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct EngineReading {
@@ -244,9 +246,9 @@ struct PdhQuery {
     shared_counter: PDH_HCOUNTER,
     shared_error: Option<GpuSampleError>,
     primed: bool,
-    engine_storage: Vec<usize>,
-    dedicated_storage: Vec<usize>,
-    shared_storage: Vec<usize>,
+    engine_storage: Vec<u64>,
+    dedicated_storage: Vec<u64>,
+    shared_storage: Vec<u64>,
 }
 
 pub(super) struct GpuCounterCapability {
@@ -402,7 +404,7 @@ impl PdhQuery {
     fn read_memory_values(
         counter: PDH_HCOUNTER,
         source_error: Option<GpuSampleError>,
-        storage: &mut Vec<usize>,
+        storage: &mut Vec<u64>,
     ) -> CounterRead<MemoryReading> {
         if let Some(error) = source_error {
             return CounterRead::source_error(error);
@@ -458,7 +460,7 @@ struct CounterArrayRead {
 fn query_counter_array(
     counter: PDH_HCOUNTER,
     format: u32,
-    storage: &mut Vec<usize>,
+    storage: &mut Vec<u64>,
 ) -> Result<CounterArrayRead, GpuSampleError> {
     unsafe {
         let mut byte_count = 0u32;
@@ -488,7 +490,7 @@ fn query_counter_array(
             });
         }
 
-        let word_size = size_of::<usize>();
+        let word_size = size_of::<u64>();
         let words = (byte_count as usize).div_ceil(word_size);
         if storage.len() < words {
             storage.resize(words, 0);

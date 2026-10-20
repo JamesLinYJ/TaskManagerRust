@@ -29,6 +29,11 @@ fn append_separator(menu: &mut PopupMenu) -> MenuResult<()> {
     menu.append_separator()
 }
 
+fn append_view_always_on_top(menu: &mut PopupMenu) -> MenuResult<()> {
+    append_separator(menu)?;
+    append_item(menu, IDM_ALWAYSONTOP, TextKey::AlwaysOnTop)
+}
+
 fn build_update_speed_menu() -> MenuResult<PopupMenu> {
     let mut menu = PopupMenu::new()?;
     for (command_id, key) in [
@@ -115,6 +120,7 @@ fn build_perf_view_menu() -> MenuResult<PopupMenu> {
     }
     menu.append_submenu(text(TextKey::CpuHistory), cpu_history)?;
     append_item(&mut menu, IDM_KERNELTIMES, TextKey::ShowKernelTimes)?;
+    append_view_always_on_top(&mut menu)?;
     Ok(menu)
 }
 
@@ -130,14 +136,12 @@ fn build_common_help_menu() -> MenuResult<PopupMenu> {
 fn build_common_options_menu(include_confirmations: bool) -> MenuResult<PopupMenu> {
     if include_confirmations {
         build_options_menu(&[
-            (IDM_ALWAYSONTOP, TextKey::AlwaysOnTop),
             (IDM_MINIMIZEONUSE, TextKey::MinimizeOnUse),
             (IDM_CONFIRMATIONS, TextKey::Confirmations),
             (IDM_HIDEWHENMIN, TextKey::HideWhenMinimized),
         ])
     } else {
         build_options_menu(&[
-            (IDM_ALWAYSONTOP, TextKey::AlwaysOnTop),
             (IDM_MINIMIZEONUSE, TextKey::MinimizeOnUse),
             (IDM_HIDEWHENMIN, TextKey::HideWhenMinimized),
         ])
@@ -165,6 +169,7 @@ fn build_task_main_menu() -> MenuResult<MenuBar> {
     append_item(&mut view, IDM_LARGEICONS, TextKey::LargeIcons)?;
     append_item(&mut view, IDM_SMALLICONS, TextKey::SmallIcons)?;
     append_item(&mut view, IDM_DETAILS, TextKey::Details)?;
+    append_view_always_on_top(&mut view)?;
 
     let mut windows = PopupMenu::new()?;
     for (command_id, key) in [
@@ -199,7 +204,9 @@ fn build_process_main_menu() -> MenuResult<MenuBar> {
     append_item(&mut view, IDM_PROC_EXPAND, TextKey::ExpandProcess)?;
     append_item(&mut view, IDM_PROC_COLLAPSE, TextKey::CollapseProcess)?;
     append_separator(&mut view)?;
+    append_item(&mut view, IDM_PROC_FILTER, TextKey::ProcessNameFilterMenu)?;
     append_item(&mut view, IDM_PROCCOLS, TextKey::SelectColumnsMenu)?;
+    append_view_always_on_top(&mut view)?;
     append_common_main_menus(
         &mut bar,
         build_file_menu()?,
@@ -229,6 +236,7 @@ fn build_cpu_main_menu() -> MenuResult<MenuBar> {
     view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
     append_separator(&mut view)?;
     append_item(&mut view, IDM_KERNELTIMES, TextKey::ShowKernelTimes)?;
+    append_view_always_on_top(&mut view)?;
     append_common_main_menus(
         &mut bar,
         build_file_menu()?,
@@ -244,6 +252,7 @@ fn build_network_main_menu() -> MenuResult<MenuBar> {
     let mut view = PopupMenu::new()?;
     append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
     view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
+    append_view_always_on_top(&mut view)?;
     append_common_main_menus(
         &mut bar,
         build_file_menu()?,
@@ -259,6 +268,7 @@ fn build_gpu_main_menu() -> MenuResult<MenuBar> {
     let mut view = PopupMenu::new()?;
     append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
     view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
+    append_view_always_on_top(&mut view)?;
     append_common_main_menus(
         &mut bar,
         build_file_menu()?,
@@ -274,6 +284,7 @@ fn build_services_main_menu() -> MenuResult<MenuBar> {
     let mut view = PopupMenu::new()?;
     append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
     view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
+    append_view_always_on_top(&mut view)?;
     append_common_main_menus(
         &mut bar,
         build_file_menu()?,
@@ -285,10 +296,36 @@ fn build_services_main_menu() -> MenuResult<MenuBar> {
     Ok(bar)
 }
 
+fn build_startup_main_menu() -> MenuResult<MenuBar> {
+    let mut bar = MenuBar::new()?;
+    let mut view = PopupMenu::new()?;
+    append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
+    view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
+    append_view_always_on_top(&mut view)?;
+    append_common_main_menus(
+        &mut bar,
+        build_file_menu()?,
+        build_common_options_menu(false)?,
+        view,
+    )?;
+    bar.append_submenu(text(TextKey::StartupMenu), build_startup_command_menu()?)?;
+    bar.append_submenu(text(TextKey::Help), build_common_help_menu()?)?;
+    Ok(bar)
+}
+
+fn build_startup_command_menu() -> MenuResult<PopupMenu> {
+    let mut menu = PopupMenu::new()?;
+    append_item(&mut menu, IDM_STARTUP_ENABLE, TextKey::StartupEnable)?;
+    append_item(&mut menu, IDM_STARTUP_DISABLE, TextKey::StartupDisable)?;
+    Ok(menu)
+}
+
 fn build_service_command_menu() -> MenuResult<PopupMenu> {
     let mut menu = PopupMenu::new()?;
     append_item(&mut menu, IDM_SERVICE_START, TextKey::ServiceStart)?;
     append_item(&mut menu, IDM_SERVICE_STOP, TextKey::ServiceStop)?;
+    append_item(&mut menu, IDM_SERVICE_PAUSE, TextKey::ServicePause)?;
+    append_item(&mut menu, IDM_SERVICE_CONTINUE, TextKey::ServiceContinue)?;
     append_separator(&mut menu)?;
     append_item(&mut menu, IDM_SERVICE_GOTOPROCESS, TextKey::GoToProcess)?;
     Ok(menu)
@@ -297,7 +334,6 @@ fn build_service_command_menu() -> MenuResult<PopupMenu> {
 fn build_users_main_menu() -> MenuResult<MenuBar> {
     let mut bar = MenuBar::new()?;
     let options = build_options_menu(&[
-        (IDM_ALWAYSONTOP, TextKey::AlwaysOnTop),
         (IDM_MINIMIZEONUSE, TextKey::MinimizeOnUse),
         (IDM_HIDEWHENMIN, TextKey::HideWhenMinimized),
         (IDM_SHOWDOMAINNAMES, TextKey::ShowFullAccountName),
@@ -305,6 +341,7 @@ fn build_users_main_menu() -> MenuResult<MenuBar> {
     let mut view = PopupMenu::new()?;
     append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
     view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
+    append_view_always_on_top(&mut view)?;
     append_common_main_menus(&mut bar, build_file_menu()?, options, view)?;
     bar.append_submenu(text(TextKey::Help), build_common_help_menu()?)?;
     Ok(bar)
@@ -321,6 +358,10 @@ fn build_tray_popup() -> MenuResult<PopupMenu> {
 
 fn build_service_context_popup() -> MenuResult<PopupMenu> {
     build_service_command_menu()
+}
+
+fn build_startup_context_popup() -> MenuResult<PopupMenu> {
+    build_startup_command_menu()
 }
 
 fn build_user_context_popup() -> MenuResult<PopupMenu> {
@@ -342,6 +383,7 @@ pub fn build_main_menu(resource_id: u16, processor_count: usize) -> MenuResult<M
         IDR_MAINMENU_NET => build_network_main_menu()?,
         IDR_MAINMENU_USER => build_users_main_menu()?,
         IDR_MAINMENU_SERVICE => build_services_main_menu()?,
+        IDR_MAINMENU_STARTUP => build_startup_main_menu()?,
         _ => return Err(ERROR_RESOURCE_DATA_NOT_FOUND),
     };
     sanitize_task_manager_menu(menu.as_raw(), processor_count);
@@ -360,6 +402,7 @@ pub(crate) const fn supports_main_menu(resource_id: u16) -> bool {
             | IDR_MAINMENU_NET
             | IDR_MAINMENU_USER
             | IDR_MAINMENU_SERVICE
+            | IDR_MAINMENU_STARTUP
     )
 }
 
@@ -369,6 +412,7 @@ pub fn build_popup_menu(resource_id: u16) -> MenuResult<PopupMenu> {
         IDR_TASKVIEW => build_task_view_popup(),
         IDR_USER_CONTEXT => build_user_context_popup(),
         IDR_SERVICE_CONTEXT => build_service_context_popup(),
+        IDR_STARTUP_CONTEXT => build_startup_context_popup(),
         IDR_TRAYMENU => build_tray_popup(),
         _ => Err(ERROR_RESOURCE_DATA_NOT_FOUND),
     }
@@ -419,6 +463,51 @@ mod tests {
                 info.fState & windows_sys::Win32::UI::WindowsAndMessaging::MFS_GRAYED,
                 0
             );
+        }
+    }
+
+    #[test]
+    fn view_menu_toggles_always_on_top_command() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CheckMenuItem, GetMenuState, MF_BYCOMMAND, MF_CHECKED, MF_UNCHECKED,
+        };
+        for resource_id in [
+            IDR_MAINMENU_TASK,
+            IDR_MAINMENU_PROC,
+            IDR_MAINMENU_PERF,
+            IDR_MAINMENU_CPU,
+            IDR_MAINMENU_GPU,
+            IDR_MAINMENU_NET,
+            IDR_MAINMENU_USER,
+            IDR_MAINMENU_SERVICE,
+            IDR_MAINMENU_STARTUP,
+        ] {
+            let menu = build_main_menu(resource_id, 2).expect("main menu should build");
+            unsafe {
+                let view =
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetSubMenu(menu.as_raw(), 2);
+                assert!(!view.is_null());
+                let count = GetMenuItemCount(view);
+                let mut found = false;
+                for index in 0..count {
+                    if GetMenuItemID(view, index) == u32::from(IDM_ALWAYSONTOP) {
+                        found = true;
+                    }
+                }
+                assert!(
+                    found,
+                    "view menu {resource_id} should contain always on top"
+                );
+                // The main-window command searches by ID from the menu bar. A duplicate in
+                // Options would intercept it and leave the View checkmark unchanged.
+                for state in [MF_CHECKED, MF_UNCHECKED] {
+                    CheckMenuItem(menu.as_raw(), IDM_ALWAYSONTOP as u32, MF_BYCOMMAND | state);
+                    assert_eq!(
+                        GetMenuState(view, IDM_ALWAYSONTOP as u32, MF_BYCOMMAND) & MF_CHECKED,
+                        state,
+                    );
+                }
+            }
         }
     }
 

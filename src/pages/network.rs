@@ -17,7 +17,7 @@ use std::ptr::null_mut;
 use std::slice;
 use std::time::Instant;
 
-use windows_sys::Win32::Foundation::{HWND, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, HWND, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BLACK_BRUSH, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DC_PEN, DT_CALCRECT,
     DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DeleteDC, DeleteObject, DrawTextW, FillRect,
@@ -26,10 +26,12 @@ use windows_sys::Win32::Graphics::Gdi::{
     TRANSPARENT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, MIB_IF_ROW2,
-    MIB_IF_TABLE2,
+    FreeMibTable, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+    GetAdaptersAddresses, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL,
+    IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKET_ADDRESS};
 use windows_sys::Win32::UI::Controls::{
     LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW,
     LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETECOLUMN, LVM_DELETEITEM, LVM_GETITEMCOUNT,
@@ -83,6 +85,8 @@ struct RawAdapterEntry {
     receive_link_speed_bps: u64,
     bytes_sent: u64,
     bytes_received: u64,
+    // None means the address query failed; a successful empty set is Some("-").
+    ipv4: Option<String>,
 }
 
 struct OwnedIfTable {
@@ -120,7 +124,12 @@ impl Drop for OwnedIfTable {
     }
 }
 
-type NetworkWorkerResult = Result<Vec<RawAdapterEntry>, u32>;
+struct AdapterSample {
+    adapters: Vec<RawAdapterEntry>,
+    ipv4_error: Option<u32>,
+}
+
+type NetworkWorkerResult = Result<AdapterSample, u32>;
 
 struct NetworkWorkerCompletion {
     sampled_at: Instant,
@@ -201,6 +210,7 @@ struct NetworkAdapterEntry {
     bytes_sent: String,
     bytes_received: String,
     bytes_total: String,
+    ipv4: String,
     current_sent: u64,
     current_received: u64,
     sent_history: HistoryBuffer,
@@ -218,6 +228,7 @@ struct PreviousAdapterState {
     bytes_sent: String,
     bytes_received: String,
     bytes_total: String,
+    ipv4: String,
     current_sent: u64,
     current_received: u64,
 }
@@ -249,6 +260,7 @@ pub struct NetworkPageState {
     cached_graph_height: i32,
     worker: Option<SingleFlightWorker<(), NetworkWorkerCompletion>>,
     last_refresh_error: Option<u32>,
+    last_ipv4_error: Option<u32>,
 }
 
 impl NetworkPageState {
@@ -761,9 +773,10 @@ impl NetworkPageState {
         for completion in drained.completions {
             crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
                 match completion.value.result {
-                    Ok(adapters) => {
+                    Ok(sample) => {
                         self.last_refresh_error = None;
-                        self.apply_adapter_snapshot(adapters, completion.value.sampled_at);
+                        self.note_ipv4_error(sample.ipv4_error);
+                        self.apply_adapter_snapshot(sample.adapters, completion.value.sampled_at);
                     }
                     Err(error) => self.set_refresh_error(error),
                 }
@@ -779,6 +792,15 @@ impl NetworkPageState {
             record_win32_error("network refresh", error);
         }
         self.last_refresh_error = Some(error);
+    }
+
+    fn note_ipv4_error(&mut self, error: Option<u32>) {
+        if self.last_ipv4_error != error {
+            if let Some(error) = error {
+                record_win32_error("network ipv4", error);
+            }
+            self.last_ipv4_error = error;
+        }
     }
 
     pub fn handle_worker_completion(&mut self) {
@@ -820,6 +842,7 @@ impl NetworkPageState {
                         bytes_sent,
                         bytes_received,
                         bytes_total,
+                        ipv4,
                         current_sent,
                         current_received,
                         sent_history,
@@ -840,6 +863,7 @@ impl NetworkPageState {
                             bytes_sent,
                             bytes_received,
                             bytes_total,
+                            ipv4,
                             current_sent,
                             current_received,
                         }),
@@ -905,6 +929,10 @@ impl NetworkPageState {
                 bytes_total: bytes_total
                     .map(format_counter)
                     .unwrap_or_else(|| "-".to_string()),
+                ipv4: raw_adapter
+                    .ipv4
+                    .or_else(|| previous_state.as_ref().map(|state| state.ipv4.clone()))
+                    .unwrap_or_else(|| adapter_state("Unknown").to_string()),
                 current_sent: raw_adapter.bytes_sent,
                 current_received: raw_adapter.bytes_received,
                 sent_history,
@@ -919,7 +947,8 @@ impl NetworkPageState {
                     || previous_state.utilization != adapter.utilization
                     || previous_state.bytes_sent != adapter.bytes_sent
                     || previous_state.bytes_received != adapter.bytes_received
-                    || previous_state.bytes_total != adapter.bytes_total;
+                    || previous_state.bytes_total != adapter.bytes_total
+                    || previous_state.ipv4 != adapter.ipv4;
             }
             adapters.push(adapter);
         }
@@ -940,7 +969,7 @@ impl NetworkPageState {
         self.update_graphs();
     }
 
-    fn collect_adapters() -> Result<Vec<RawAdapterEntry>, u32> {
+    fn collect_adapters() -> Result<AdapterSample, u32> {
         let mut raw_table = null_mut::<MIB_IF_TABLE2>();
         let status = unsafe { GetIfTable2(&mut raw_table) };
         if status != 0 {
@@ -950,6 +979,10 @@ impl NetworkPageState {
         // `raw_table`; this is the sole owner and will release it with `FreeMibTable`.
         let table = unsafe { OwnedIfTable::from_raw(raw_table) }
             .ok_or(windows_sys::Win32::Foundation::ERROR_INVALID_DATA)?;
+
+        let ipv4_query = query_unicast_ipv4_by_identity();
+        let ipv4_error = ipv4_query.as_ref().err().copied();
+        let ipv4_map = ipv4_query.ok();
 
         let mut adapters = Vec::with_capacity(table.rows().len());
         for row in table.rows() {
@@ -978,9 +1011,21 @@ impl NetworkPageState {
                 receive_link_speed_bps: row.ReceiveLinkSpeed,
                 bytes_sent: row.OutOctets,
                 bytes_received: row.InOctets,
+                ipv4: ipv4_map.as_ref().map(|addresses| {
+                    addresses
+                        .get(&AdapterIdentity {
+                            luid: unsafe { row.InterfaceLuid.Value },
+                            interface_index: row.InterfaceIndex,
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| "-".to_string())
+                }),
             });
         }
-        Ok(adapters)
+        Ok(AdapterSample {
+            adapters,
+            ipv4_error,
+        })
     }
 
     fn configure_columns(&self) {
@@ -1005,6 +1050,7 @@ impl NetworkPageState {
                 (titles[1], 96, LVCFMT_RIGHT),
                 (titles[2], 90, LVCFMT_RIGHT),
                 (titles[3], 120, LVCFMT_LEFT),
+                (titles[4], 140, LVCFMT_LEFT),
             ];
 
             for (index, (title, width, fmt)) in columns.iter().enumerate() {
@@ -1352,22 +1398,139 @@ fn scrollbar_width() -> i32 {
     unsafe { GetSystemMetrics(SM_CXVSCROLL).max(17) }
 }
 
-fn push_history(history: &mut HistoryBuffer, value: u8) {
-    history.push(value);
+fn push_history(history: &mut HistoryBuffer, value: Option<u8>) {
+    // Missing capacity or a reset/priming interval is not a measured idle interval. Preserve
+    // that direction's last trusted history, just as the list preserves an unavailable value.
+    if let Some(value) = value {
+        history.push(value);
+    }
 }
 
-fn adapter_row_texts(adapter: &NetworkAdapterEntry) -> [&str; 4] {
+fn adapter_row_texts(adapter: &NetworkAdapterEntry) -> [&str; 5] {
     [
         &adapter.name,
         &adapter.utilization,
         &adapter.link_speed,
         &adapter.state,
+        &adapter.ipv4,
     ]
 }
 
 fn include_adapter(row: &MIB_IF_ROW2) -> bool {
     // 经典任务管理器不显示 loopback / tunnel，这里保持相同过滤策略。
     row.Type != IF_TYPE_SOFTWARE_LOOPBACK && row.Type != IF_TYPE_TUNNEL
+}
+
+const MAX_ADAPTER_ADDRESS_BYTES: u32 = 1024 * 1024;
+
+fn query_unicast_ipv4_by_identity() -> Result<HashMap<AdapterIdentity, String>, u32> {
+    // 跳过 anycast / multicast / DNS，只留下单播地址供 FirstUnicastAddress 遍历。
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = 16 * 1024u32;
+    for _attempt in 0..4 {
+        if size == 0 || size > MAX_ADAPTER_ADDRESS_BYTES {
+            return Err(ERROR_BUFFER_OVERFLOW);
+        }
+        let align = std::mem::align_of::<IP_ADAPTER_ADDRESSES_LH>();
+        let mut storage = vec![0u8; size as usize + align];
+        let base = storage.as_mut_ptr() as usize;
+        let aligned = (base + align - 1) & !(align - 1);
+        let head = aligned as *mut IP_ADAPTER_ADDRESSES_LH;
+        // SAFETY: `head` points at `align_of::<IP_ADAPTER_ADDRESSES_LH>()`-aligned storage that
+        // stays alive for this call. A null reserved pointer is the documented unused argument.
+        // On success the API writes a linked list into `storage`; the walk below copies owned
+        // strings out before `storage` drops.
+        let status = unsafe {
+            GetAdaptersAddresses(u32::from(AF_INET), flags, std::ptr::null(), head, &mut size)
+        };
+        if status == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        if status == ERROR_NO_DATA {
+            return Ok(HashMap::new());
+        }
+        if status != 0 {
+            return Err(status);
+        }
+        return Ok(ipv4_map_from_adapters(head));
+    }
+    Err(ERROR_BUFFER_OVERFLOW)
+}
+
+fn ipv4_map_from_adapters(
+    mut head: *const IP_ADAPTER_ADDRESSES_LH,
+) -> HashMap<AdapterIdentity, String> {
+    let mut addresses = HashMap::new();
+    let mut adapters_seen = 0u32;
+    while !head.is_null() && adapters_seen < 4096 {
+        adapters_seen += 1;
+        // SAFETY: `head` is a node written by the successful `GetAdaptersAddresses` call whose
+        // buffer is still alive. `Next` is either null or another node in that buffer.
+        let adapter = unsafe { &*head };
+        let text = ipv4_text_from_unicast(adapter.FirstUnicastAddress);
+        if text != "-" {
+            // SAFETY: `Anonymous1.Anonymous` is the Length/IfIndex view that
+            // `GetAdaptersAddresses` initializes for every returned adapter.
+            let key = AdapterIdentity {
+                luid: unsafe { adapter.Luid.Value },
+                interface_index: unsafe { adapter.Anonymous1.Anonymous.IfIndex },
+            };
+            addresses.insert(key, text);
+        }
+        head = adapter.Next;
+    }
+    addresses
+}
+
+fn ipv4_text_from_unicast(mut node: *const IP_ADAPTER_UNICAST_ADDRESS_LH) -> String {
+    let mut parts = Vec::new();
+    let mut seen = 0u32;
+    while !node.is_null() && seen < 64 {
+        seen += 1;
+        // SAFETY: `node` is a `FirstUnicastAddress` link from the live adapter buffer. `Next`
+        // stays inside that buffer or is null.
+        let current = unsafe { &*node };
+        if let Some(text) = ipv4_text_from_socket_address(&current.Address)
+            && !parts.contains(&text)
+        {
+            parts.push(text);
+        }
+        node = current.Next;
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn ipv4_text_from_socket_address(address: &SOCKET_ADDRESS) -> Option<String> {
+    let length = address.iSockaddrLength;
+    let sockaddr = address.lpSockaddr;
+    if sockaddr.is_null() || length < 8 {
+        return None;
+    }
+    // SAFETY: `lpSockaddr` and `iSockaddrLength` describe one sockaddr in the adapter buffer.
+    // Only `sa_family` is read here; address bytes are accepted later, and only for AF_INET.
+    let family = unsafe { (*sockaddr).sa_family };
+    let bytes = unsafe { slice::from_raw_parts(sockaddr.cast::<u8>(), length as usize) };
+    ipv4_octets_from_sockaddr(family, length, bytes).map(format_ipv4_octets)
+}
+
+fn ipv4_octets_from_sockaddr(family: u16, length: i32, bytes: &[u8]) -> Option<[u8; 4]> {
+    // SOCKADDR_IN is family:u16, port:u16, then four address octets in network order.
+    if family != AF_INET || length < 8 || bytes.len() < 8 {
+        return None;
+    }
+    let octets = [bytes[4], bytes[5], bytes[6], bytes[7]];
+    if octets == [0, 0, 0, 0] {
+        return None;
+    }
+    Some(octets)
+}
+
+fn format_ipv4_octets(octets: [u8; 4]) -> String {
+    format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
 }
 
 fn collapse_raw_adapters(adapters: Vec<RawAdapterEntry>) -> Vec<RawAdapterEntry> {
@@ -1464,17 +1627,14 @@ fn directional_utilization_ratios(
     (sent, received, total)
 }
 
-fn utilization_percent_for_history(ratio_percent: Option<f64>) -> u8 {
-    let Some(ratio_percent) = ratio_percent else {
-        return 0;
-    };
-
+fn utilization_percent_for_history(ratio_percent: Option<f64>) -> Option<u8> {
+    let ratio_percent = ratio_percent?;
     let rounded = ratio_percent.round().clamp(0.0, 100.0) as u8;
-    if rounded == 0 && ratio_percent > 0.0 {
+    Some(if rounded == 0 && ratio_percent > 0.0 {
         1
     } else {
         rounded
-    }
+    })
 }
 
 fn utilization_text(ratio_percent: Option<f64>) -> String {
@@ -1854,6 +2014,7 @@ mod tests {
             bytes_sent: "10".to_string(),
             bytes_received: "20".to_string(),
             bytes_total: "30".to_string(),
+            ipv4: "192.168.0.2".to_string(),
             current_sent: 10,
             current_received: 20,
             sent_history: HistoryBuffer::zeroed(3),
@@ -1877,9 +2038,112 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_network_intervals_do_not_append_idle_history() {
+        let mut history = HistoryBuffer::zeroed(3);
+        push_history(&mut history, utilization_percent_for_history(Some(50.0)));
+
+        // Counter resets, unknown link capacity, and a zero interval each mean unavailable.
+        let reset_ratio = adapter_counter_delta(1, 1, Some((100, 100)))
+            .and_then(|delta| utilization_ratio_percent(delta.0, 1_000, 1.0));
+        for ratio in [
+            reset_ratio,
+            utilization_ratio_percent(100, 0, 1.0),
+            utilization_ratio_percent(100, 1_000, 0.0),
+        ] {
+            push_history(&mut history, utilization_percent_for_history(ratio));
+        }
+        assert_eq!(history.iter().collect::<Vec<_>>(), vec![50, 0, 0]);
+
+        let idle_ratio = utilization_ratio_percent(0, 1_000, 1.0);
+        push_history(&mut history, utilization_percent_for_history(idle_ratio));
+        assert_eq!(history.iter().collect::<Vec<_>>(), vec![0, 50, 0]);
+    }
+
+    #[test]
     fn renamed_adapter_updates_the_primary_list_column() {
         let adapter = test_adapter("Renamed Ethernet");
-        assert_eq!(adapter_row_texts(&adapter)[0], "Renamed Ethernet");
+        let columns = adapter_row_texts(&adapter);
+        assert_eq!(columns[0], "Renamed Ethernet");
+        assert_eq!(columns[4], "192.168.0.2");
+    }
+
+    #[test]
+    fn failed_ipv4_query_preserves_only_the_same_adapters_last_address() {
+        let now = Instant::now();
+        let mut page = NetworkPageState {
+            adapters: vec![test_adapter("Ethernet")],
+            last_sample_time: Some(now),
+            ..Default::default()
+        };
+        let sample = |luid, ipv4| RawAdapterEntry {
+            interface_index: 7,
+            key: AdapterIdentity {
+                luid,
+                interface_index: 7,
+            },
+            name: "Ethernet".to_string(),
+            state: "Connected".to_string(),
+            transmit_link_speed_bps: 1_000_000_000,
+            receive_link_speed_bps: 1_000_000_000,
+            bytes_sent: 100,
+            bytes_received: 200,
+            ipv4,
+        };
+        page.apply_adapter_snapshot(vec![sample(42, None)], now);
+        assert_eq!(page.adapters[0].ipv4, "192.168.0.2");
+        assert_eq!(page.adapters[0].current_received, 200);
+
+        // A successful empty address set must clear the retained value.
+        page.apply_adapter_snapshot(vec![sample(42, Some("-".to_string()))], now);
+        assert_eq!(page.adapters[0].ipv4, "-");
+        page.apply_adapter_snapshot(vec![sample(42, Some("10.1.2.3".to_string()))], now);
+        assert_eq!(page.adapters[0].ipv4, "10.1.2.3");
+
+        // Reusing an interface index does not transfer an old adapter's address.
+        page.apply_adapter_snapshot(vec![sample(43, None)], now);
+        assert_eq!(page.adapters[0].ipv4, adapter_state("Unknown"));
+    }
+
+    fn ipv4_text_from_sockaddr_list(nodes: &[(u16, &[u8])]) -> String {
+        let mut parts = Vec::new();
+        for &(family, bytes) in nodes {
+            if let Some(octets) = ipv4_octets_from_sockaddr(family, bytes.len() as i32, bytes) {
+                let text = format_ipv4_octets(octets);
+                if !parts.contains(&text) {
+                    parts.push(text);
+                }
+            }
+        }
+        if parts.is_empty() {
+            "-".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    #[test]
+    fn unicast_address_text_keeps_only_af_inet() {
+        let ipv4 = [2, 0, 0, 0, 192, 168, 1, 10];
+        let other_ipv4 = [2, 0, 0, 0, 10, 1, 2, 3];
+        let ipv6 = [23, 0, 0, 0, 0x20, 0x01, 0x0d, 0xb8];
+        let unspecified = [2, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            ipv4_text_from_sockaddr_list(&[
+                (23, &ipv6),
+                (2, &unspecified),
+                (2, &ipv4),
+                (2, &ipv4),
+                (2, &other_ipv4),
+            ]),
+            "192.168.1.10, 10.1.2.3"
+        );
+        assert_eq!(ipv4_text_from_sockaddr_list(&[(23, &ipv6)]), "-");
+        assert_eq!(
+            ipv4_octets_from_sockaddr(2, 16, &ipv4),
+            Some([192, 168, 1, 10])
+        );
+        assert_eq!(ipv4_octets_from_sockaddr(23, 28, &ipv6), None);
+        assert_eq!(ipv4_octets_from_sockaddr(2, 4, &ipv4), None);
     }
 
     #[test]

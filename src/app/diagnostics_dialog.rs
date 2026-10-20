@@ -17,6 +17,7 @@
 use std::ffi::OsString;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStringExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr::null;
 use std::sync::{Arc, Mutex};
@@ -36,7 +37,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EndDialog, GetDlgItem, IDCANCEL, IDYES, MB_ICONERROR, MB_ICONEXCLAMATION, MB_OK, MB_YESNO,
-    MessageBoxW, PostMessageW, SW_SHOWNORMAL, SetDlgItemTextW, WM_COMMAND, WM_INITDIALOG,
+    MessageBoxW, SW_SHOWNORMAL, SetDlgItemTextW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INITDIALOG,
 };
 
 use crate::infrastructure::diagnostics::{self, Field, Level};
@@ -44,6 +45,7 @@ use crate::infrastructure::native::{
     format_resource_string, get_window_userdata, loword, record_win32_error, set_window_userdata,
     to_wide_null,
 };
+use crate::infrastructure::worker::WorkerStopSignal;
 use crate::ui::dialogs::dialog_box;
 use crate::ui::localization::{TextKey, localize_dialog, text};
 use crate::ui::resource_ids::*;
@@ -54,10 +56,43 @@ pub(super) enum DiagnosticDialogOutcome {
     RestartDetailed,
 }
 
+#[cfg(test)]
+type PrepareFixture =
+    Arc<dyn Fn() -> Result<diagnostics::PreparedDiagnosticBundle, String> + Send + Sync>;
+
 struct DiagnosticDialogContext {
     operation_id: u64,
-    export_result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
-    export_in_progress: bool,
+    export_result: Arc<Mutex<Option<ExportCompletion>>>,
+    export_phase: ExportPhase,
+    stop: WorkerStopSignal,
+    #[cfg(test)]
+    prepare_fixture: Option<PrepareFixture>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportPhase {
+    Idle,
+    Preparing,
+    Writing,
+}
+
+enum ExportCompletion {
+    Prepared(Result<diagnostics::PreparedDiagnosticBundle, String>),
+    Written(Result<PathBuf, String>),
+}
+
+enum ExportWork {
+    Prepare,
+    Write {
+        bundle: diagnostics::PreparedDiagnosticBundle,
+        destination: PathBuf,
+    },
+}
+
+impl Drop for DiagnosticDialogContext {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
 }
 
 pub(super) fn show(
@@ -68,7 +103,10 @@ pub(super) fn show(
     let mut context = DiagnosticDialogContext {
         operation_id,
         export_result: Arc::new(Mutex::new(None)),
-        export_in_progress: false,
+        export_phase: ExportPhase::Idle,
+        stop: WorkerStopSignal::default(),
+        #[cfg(test)]
+        prepare_fixture: None,
     };
     // DialogBox runs a nested message loop. Clear the ambient command correlation while it is
     // active so unrelated timers and worker completions are not attributed to this UI command.
@@ -108,12 +146,14 @@ unsafe extern "system" fn diagnostics_dialog_proc(
                 let operation_id = context(hwnd).operation_id;
                 match control_id {
                     IDCANCEL => {
-                        if context(hwnd).export_in_progress {
+                        if context(hwnd).export_phase == ExportPhase::Writing {
                             return 1;
                         }
+                        context(hwnd).stop.cancel();
                         EndDialog(hwnd, IDCANCEL as isize);
                         1
                     }
+                    _ if context(hwnd).export_phase != ExportPhase::Idle => 1,
                     IDC_DIAGNOSTIC_DETAILED => {
                         let enabled =
                             IsDlgButtonChecked(hwnd, IDC_DIAGNOSTIC_DETAILED) == BST_CHECKED;
@@ -163,6 +203,20 @@ unsafe extern "system" fn diagnostics_dialog_proc(
             PWM_DIAGNOSTIC_EXPORT_COMPLETE => {
                 complete_export(hwnd);
                 1
+            }
+            WM_CLOSE => {
+                if context(hwnd).export_phase != ExportPhase::Writing {
+                    context(hwnd).stop.cancel();
+                    EndDialog(hwnd, IDCANCEL as isize);
+                }
+                1
+            }
+            WM_DESTROY => {
+                let pointer = get_window_userdata(hwnd) as *mut DiagnosticDialogContext;
+                if !pointer.is_null() {
+                    (*pointer).stop.cancel();
+                }
+                0
             }
             _ => 0,
         }
@@ -280,55 +334,72 @@ fn open_log_folder(hwnd: HWND, operation_id: u64) {
 unsafe fn begin_export(hwnd: HWND, operation_id: u64) {
     // Safety: this function is called only while the modal dialog owns its stack context.
     let context = unsafe { context(hwnd) };
-    if context.export_in_progress {
+    if context.export_phase != ExportPhase::Idle {
         return;
     }
-    if diagnostics::export_requires_privacy_warning() && !confirm_sensitive_export(hwnd) {
-        return;
-    }
-    let destination = match choose_bundle_destination(hwnd) {
-        Ok(Some(path)) => path,
-        Ok(None) => return,
-        Err(error) => {
-            diagnostics::with_operation_id(operation_id, || {
-                record_win32_error("diagnostic save dialog", error);
-            });
-            show_error(
-                hwnd,
-                TextKey::DiagnosticExportFailedTitle,
-                &format!("{} ({error:#010X})", text(TextKey::Win32ErrorPrefix)),
-            );
-            return;
-        }
-    };
-
-    context.export_in_progress = true;
+    context.export_phase = ExportPhase::Preparing;
     set_export_controls_enabled(hwnd, false);
     set_dialog_text(
         hwnd,
         IDC_DIAGNOSTIC_EXPORT_STATUS,
         text(TextKey::DiagnosticExporting),
     );
-    let result = Arc::clone(&context.export_result);
+    spawn_export_work(hwnd, operation_id, ExportWork::Prepare);
+}
+
+fn spawn_export_work(hwnd: HWND, operation_id: u64, work: ExportWork) {
+    // SAFETY: called by the dialog owner, before return from the modal loop.
+    let (result, stop) = unsafe {
+        let context = context(hwnd);
+        (Arc::clone(&context.export_result), context.stop.clone())
+    };
     let window = hwnd as isize;
+    #[cfg(test)]
+    let prepare_fixture = unsafe { context(hwnd).prepare_fixture.clone() };
     let spawn = thread::Builder::new()
         .name("taskmgr-rs-diagnostic-export".to_string())
         .spawn(move || {
+            if stop.is_cancelled() {
+                return;
+            }
             diagnostics::with_operation_id(operation_id, || {
-                let export = diagnostics::export_bundle(&destination).map(|()| destination);
+                let preparing = matches!(&work, ExportWork::Prepare);
+                let export = catch_unwind(AssertUnwindSafe(|| match work {
+                    ExportWork::Prepare => {
+                        #[cfg(test)]
+                        if let Some(prepare) = prepare_fixture {
+                            return ExportCompletion::Prepared(prepare());
+                        }
+                        ExportCompletion::Prepared(diagnostics::prepare_export_bundle())
+                    }
+                    ExportWork::Write {
+                        bundle,
+                        destination,
+                    } => ExportCompletion::Written(
+                        bundle.export_to(&destination).map(|()| destination),
+                    ),
+                }))
+                .unwrap_or_else(|_| {
+                    let error = "diagnostic export worker panicked".to_string();
+                    if preparing {
+                        ExportCompletion::Prepared(Err(error))
+                    } else {
+                        ExportCompletion::Written(Err(error))
+                    }
+                });
+                if stop.is_cancelled() {
+                    return;
+                }
                 if let Ok(mut slot) = result.lock() {
                     *slot = Some(export);
                 }
-                // Safety: HWND is used only as an opaque message target; failure means the dialog
-                // closed while the independent export was completing.
-                unsafe {
-                    PostMessageW(window as HWND, PWM_DIAGNOSTIC_EXPORT_COMPLETE, 0, 0);
+                if let Some(error) = stop.notify(window as HWND, PWM_DIAGNOSTIC_EXPORT_COMPLETE) {
+                    record_win32_error("diagnostic export completion notification", error);
                 }
             });
         });
     if spawn.is_err() {
-        context.export_in_progress = false;
-        set_export_controls_enabled(hwnd, true);
+        finish_export(hwnd);
         diagnostics::with_operation_id(operation_id, || {
             record_win32_error("diagnostic export worker", ERROR_NOT_ENOUGH_MEMORY);
         });
@@ -342,16 +413,80 @@ unsafe fn begin_export(hwnd: HWND, operation_id: u64) {
 
 unsafe fn complete_export(hwnd: HWND) {
     // Safety: the completion message is handled only before the modal dialog returns.
-    let context = unsafe { context(hwnd) };
-    context.export_in_progress = false;
-    set_export_controls_enabled(hwnd, true);
-    let result = context
-        .export_result
-        .lock()
-        .ok()
-        .and_then(|mut result| result.take());
+    let (result, phase, operation_id, stop) = {
+        let context = unsafe { context(hwnd) };
+        let result = context
+            .export_result
+            .lock()
+            .ok()
+            .and_then(|mut result| result.take());
+        (
+            result,
+            context.export_phase,
+            context.operation_id,
+            context.stop.clone(),
+        )
+    };
+    // A stale notification cannot change a newer dialog's phase or unlock its controls.
+    let Some(result) = result else {
+        return;
+    };
+    if stop.is_cancelled() {
+        return;
+    }
     match result {
-        Some(Ok(path)) => {
+        ExportCompletion::Prepared(Ok(bundle)) => {
+            if phase != ExportPhase::Preparing {
+                return;
+            }
+            if bundle.requires_privacy_warning() && !confirm_sensitive_export(hwnd) {
+                if stop.is_cancelled() {
+                    return;
+                }
+                finish_export(hwnd);
+                set_dialog_text(hwnd, IDC_DIAGNOSTIC_EXPORT_STATUS, "");
+                return;
+            }
+            if stop.is_cancelled() {
+                return;
+            }
+            let destination = match choose_bundle_destination(hwnd) {
+                Ok(Some(path)) => path,
+                Ok(None) => {
+                    finish_export(hwnd);
+                    set_dialog_text(hwnd, IDC_DIAGNOSTIC_EXPORT_STATUS, "");
+                    return;
+                }
+                Err(error) => {
+                    finish_export(hwnd);
+                    diagnostics::with_operation_id(operation_id, || {
+                        record_win32_error("diagnostic save dialog", error)
+                    });
+                    show_error(
+                        hwnd,
+                        TextKey::DiagnosticExportFailedTitle,
+                        &format!("{} ({error:#010X})", text(TextKey::Win32ErrorPrefix)),
+                    );
+                    return;
+                }
+            };
+            if stop.is_cancelled() {
+                return;
+            }
+            unsafe {
+                context(hwnd).export_phase = ExportPhase::Writing;
+            }
+            spawn_export_work(
+                hwnd,
+                operation_id,
+                ExportWork::Write {
+                    bundle,
+                    destination,
+                },
+            );
+        }
+        ExportCompletion::Written(Ok(path)) => {
+            finish_export(hwnd);
             set_dialog_text(
                 hwnd,
                 IDC_DIAGNOSTIC_EXPORT_STATUS,
@@ -362,18 +497,20 @@ unsafe fn complete_export(hwnd: HWND) {
                 ),
             );
         }
-        Some(Err(error)) => {
+        ExportCompletion::Prepared(Err(error)) | ExportCompletion::Written(Err(error)) => {
+            finish_export(hwnd);
             set_dialog_text(hwnd, IDC_DIAGNOSTIC_EXPORT_STATUS, &error);
             show_error(hwnd, TextKey::DiagnosticExportFailedTitle, &error);
         }
-        None => {
-            show_error(
-                hwnd,
-                TextKey::DiagnosticExportFailedTitle,
-                text(TextKey::DiagnosticExportFailedTitle),
-            );
-        }
     }
+}
+
+fn finish_export(hwnd: HWND) {
+    // SAFETY: completion/spawn failures are handled on the live dialog thread.
+    unsafe {
+        context(hwnd).export_phase = ExportPhase::Idle;
+    }
+    set_export_controls_enabled(hwnd, true);
 }
 
 fn set_export_controls_enabled(hwnd: HWND, enabled: bool) {
@@ -383,6 +520,9 @@ fn set_export_controls_enabled(hwnd: HWND, enabled: bool) {
             IDC_DIAGNOSTIC_EXPORT,
             IDC_DIAGNOSTIC_RESTART,
             IDC_DIAGNOSTIC_OPEN_FOLDER,
+            IDC_DIAGNOSTIC_DETAILED,
+            IDC_DIAGNOSTIC_SENSITIVE,
+            IDC_DIAGNOSTIC_MINIDUMP,
         ] {
             EnableWindow(GetDlgItem(hwnd, id), i32::from(enabled));
         }
@@ -465,5 +605,75 @@ fn show_error(hwnd: HWND, title_key: TextKey, body: &str) {
     // Safety: strings and owner HWND remain valid for this synchronous prompt.
     unsafe {
         MessageBoxW(hwnd, body.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DestroyWindow, HWND_MESSAGE, IsWindow, SendMessageW,
+    };
+
+    #[test]
+    fn blocked_export_preflight_keeps_command_dispatch_and_cancellation_responsive() {
+        let (started_tx, started_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let (finished_tx, finished_rx) = bounded(1);
+        let mut state = DiagnosticDialogContext {
+            operation_id: 1,
+            export_result: Arc::new(Mutex::new(None)),
+            export_phase: ExportPhase::Idle,
+            stop: WorkerStopSignal::default(),
+            prepare_fixture: Some(Arc::new(move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+                finished_tx.send(()).unwrap();
+                Err("controlled preflight failure".to_string())
+            })),
+        };
+        // Use the application's generated template, which is not an embedded dialog resource.
+        // The context stays on this owner thread until its test window has been destroyed.
+        let hwnd = crate::ui::dialogs::create_dialog(
+            unsafe { GetModuleHandleW(null()) },
+            IDD_DIAGNOSTICS,
+            HWND_MESSAGE,
+            Some(diagnostics_dialog_proc),
+            &mut state as *mut _ as LPARAM,
+        )
+        .expect("create controlled diagnostics dialog");
+        struct Window(HWND);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                unsafe {
+                    if IsWindow(self.0) != 0 {
+                        DestroyWindow(self.0);
+                    }
+                }
+            }
+        }
+        let window = Window(hwnd);
+        let started = Instant::now();
+        unsafe {
+            SendMessageW(hwnd, WM_COMMAND, IDC_DIAGNOSTIC_EXPORT as usize, 0);
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "UI enumerated files synchronously"
+        );
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(state.export_phase == ExportPhase::Preparing);
+        let started = Instant::now();
+        unsafe {
+            SendMessageW(hwnd, WM_COMMAND, IDCANCEL as usize, 0);
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(state.stop.is_cancelled());
+        drop(window);
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
 }

@@ -111,6 +111,14 @@ const MENU_STATUS_HELP_KEYS: &[(&str, &str)] = &[
         "crate::ui::resource_ids::IDM_SERVICE_STOP",
     ),
     (
+        "IDM_SERVICE_PAUSE",
+        "crate::ui::resource_ids::IDM_SERVICE_PAUSE",
+    ),
+    (
+        "IDM_SERVICE_CONTINUE",
+        "crate::ui::resource_ids::IDM_SERVICE_CONTINUE",
+    ),
+    (
         "IDM_SERVICE_GOTOPROCESS",
         "crate::ui::resource_ids::IDM_SERVICE_GOTOPROCESS",
     ),
@@ -122,6 +130,23 @@ const MENU_STATUS_HELP_KEYS: &[(&str, &str)] = &[
     (
         "IDM_PROC_COLLAPSE",
         "crate::ui::resource_ids::IDM_PROC_COLLAPSE",
+    ),
+    ("IDM_PROC_DUMP", "crate::ui::resource_ids::IDM_PROC_DUMP"),
+    (
+        "IDM_PROC_SEARCHONLINE",
+        "crate::ui::resource_ids::IDM_PROC_SEARCHONLINE",
+    ),
+    (
+        "IDM_STARTUP_ENABLE",
+        "crate::ui::resource_ids::IDM_STARTUP_ENABLE",
+    ),
+    (
+        "IDM_STARTUP_DISABLE",
+        "crate::ui::resource_ids::IDM_STARTUP_DISABLE",
+    ),
+    (
+        "IDM_PROC_FILTER",
+        "crate::ui::resource_ids::IDM_PROC_FILTER",
     ),
 ];
 
