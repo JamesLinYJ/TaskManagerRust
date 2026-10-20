@@ -197,6 +197,7 @@ ProcessTree = "Prozess&baum"
 ExpandProcess = "&Erweitern"
 CollapseProcess = "&Zuklappen"
 OpenFileLocation = "Open File &Location"
+SearchOnline = "Online &suchen"
 Debug = "&Debuggen"
 SetPriority = "&Prioritaet festlegen"
 Realtime = "&Echtzeit"
@@ -289,6 +290,7 @@ NotResponding = "Keine Rueckmeldung"
 Running = "Wird ausgefuehrt"
 MessageCouldNotBeSent = "Die Nachricht konnte nicht gesendet werden."
 UnableToOpenFileLocation = "Unable to Open File Location"
+UnableToSearchOnline = "Onlinesuche nicht möglich"
 KillProcessTreePrompt = """This operation will attempt to terminate this process and any
 processes which were directly or indirectly started by it.
 
@@ -368,3 +370,4 @@ IDM_SERVICE_GOTOPROCESS = "Wählt den Prozess des Diensts auf der Seite Prozesse
 IDM_PROC_TREE = "Gruppiert Prozesse unter dem übergeordneten Prozess, der sie erstellt hat"
 IDM_PROC_EXPAND = "Zeigt die untergeordneten Prozesse der Auswahl"
 IDM_PROC_COLLAPSE = "Blendet die untergeordneten Prozesse der Auswahl aus"
+IDM_PROC_SEARCHONLINE = "Sucht im Web nach dem Abbildnamen des ausgewählten Prozesses"

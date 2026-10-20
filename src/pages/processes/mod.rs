@@ -11,6 +11,7 @@
 mod actions;
 mod model;
 mod sampler;
+mod search;
 mod tree;
 
 // 进程页实现。
@@ -31,7 +32,8 @@ use std::mem::zeroed;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_GEN_FAILURE, ERROR_INVALID_DATA, HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM,
+    ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER, ERROR_INVALID_WINDOW_HANDLE,
+    HINSTANCE, HWND, LPARAM, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     GetDC, GetTextExtentPoint32W, HGDIOBJ, ReleaseDC, SelectObject,
@@ -64,6 +66,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use self::actions::load_debugger_path;
 use self::model::{DirtyColumns, ProcEntry, column_text, compare_entries, update_process_entry};
 use self::sampler::{ProcWorkerRequest, ProcWorkerResult, ProcWorkerState};
+use self::search::{
+    ProcessSearchFailure, ProcessSearchRequest, search_online_menu_enabled, spawn_search_worker,
+};
 use self::tree::{
     TreeRow, expansion_ancestors, layout_process_rows, nearest_visible_identity,
     retain_live_identities, same_tree_presentation, tree_image_prefix,
@@ -214,6 +219,7 @@ struct ProcessStrings {
     cant_change_priority: String,
     cant_set_affinity: String,
     cant_open_file_location: String,
+    cant_search_online: String,
     priority_low: String,
     priority_below_normal: String,
     priority_normal: String,
@@ -247,6 +253,7 @@ enum ProcCommand {
     TerminateTree,
     Debug,
     OpenFileLocation,
+    SearchOnline,
     Affinity,
     SetPriority(ProcPriority),
     PickColumns,
@@ -294,6 +301,7 @@ impl ProcCommand {
             Self::TerminateTree => IDM_PROC_ENDTREE,
             Self::Debug => IDM_PROC_DEBUG,
             Self::OpenFileLocation => IDM_PROC_OPENFILELOCATION,
+            Self::SearchOnline => IDM_PROC_SEARCHONLINE,
             Self::Affinity => IDM_AFFINITY,
             Self::SetPriority(priority) => priority.command_id(),
             Self::PickColumns => IDM_PROCCOLS,
@@ -309,6 +317,7 @@ impl ProcCommand {
             IDM_PROC_ENDTREE => Some(Self::TerminateTree),
             id if id == IDC_DEBUG as u16 || id == IDM_PROC_DEBUG => Some(Self::Debug),
             IDM_PROC_OPENFILELOCATION => Some(Self::OpenFileLocation),
+            IDM_PROC_SEARCHONLINE => Some(Self::SearchOnline),
             IDM_AFFINITY => Some(Self::Affinity),
             IDM_PROC_LOW => Some(Self::SetPriority(ProcPriority::Low)),
             IDM_PROC_BELOWNORMAL => Some(Self::SetPriority(ProcPriority::BelowNormal)),
@@ -352,6 +361,8 @@ pub struct ProcessPageState {
     strings: ProcessStrings,
     pass_count: u64,
     worker: Option<SingleFlightWorker<ProcWorkerRequest, ProcWorkerResult>>,
+    search_worker:
+        Option<SingleFlightWorker<ProcessSearchRequest, Result<(), ProcessSearchFailure>>>,
     last_refresh_error: Option<u32>,
     last_row_error: Option<u32>,
 }
@@ -380,6 +391,7 @@ impl Default for ProcessPageState {
             strings: ProcessStrings::default(),
             pass_count: 0,
             worker: None,
+            search_worker: None,
             last_refresh_error: None,
             last_row_error: None,
         }
@@ -406,6 +418,7 @@ impl ProcessPageState {
 
     fn stop_worker_thread(&mut self) {
         self.worker = None;
+        self.search_worker = None;
     }
 
     pub fn new() -> Self {
@@ -602,6 +615,7 @@ impl ProcessPageState {
                     self.open_file_location(identity);
                 }
             }
+            ProcCommand::SearchOnline => self.search_selected_process(),
             ProcCommand::Affinity => {
                 if let Some(identity) = self.current_selected_identity() {
                     self.set_affinity(identity);
@@ -731,6 +745,15 @@ impl ProcessPageState {
                 ProcCommand::OpenFileLocation,
                 TextKey::OpenFileLocation,
                 if identity_verified {
+                    MenuItemState::ENABLED
+                } else {
+                    MenuItemState::disabled()
+                },
+            ),
+            (
+                ProcCommand::SearchOnline,
+                TextKey::SearchOnline,
+                if search_online_menu_enabled(entry.identity, &entry.image_name) {
                     MenuItemState::ENABLED
                 } else {
                     MenuItemState::disabled()
@@ -877,6 +900,7 @@ impl ProcessPageState {
         self.strings.cant_change_priority = text(TextKey::UnableToChangePriority).to_string();
         self.strings.cant_set_affinity = text(TextKey::UnableToSetAffinity).to_string();
         self.strings.cant_open_file_location = text(TextKey::UnableToOpenFileLocation).to_string();
+        self.strings.cant_search_online = text(TextKey::UnableToSearchOnline).to_string();
         self.strings.priority_low = text(TextKey::Low).to_string();
         self.strings.priority_below_normal = text(TextKey::BelowNormal).to_string();
         self.strings.priority_normal = text(TextKey::Normal).to_string();
@@ -1003,6 +1027,77 @@ impl ProcessPageState {
 
     pub fn handle_worker_completion(&mut self) {
         self.drain_worker_results();
+    }
+
+    pub fn handle_search_completion(&mut self) {
+        let drain = match self.search_worker.as_mut() {
+            Some(worker) => worker.drain(self.hwnd_page),
+            None => return,
+        };
+        for completion in drain.completions {
+            if let Err(failure) = completion.value {
+                self.show_search_failure(failure);
+            }
+        }
+        if let Some(error) = drain.error {
+            self.show_failure_message(&self.strings.cant_search_online, error);
+        }
+    }
+
+    fn search_selected_process(&mut self) {
+        let identity = self.current_selected_identity().or(self.selected_identity);
+        let Some(identity) = identity else {
+            self.show_failure_message(&self.strings.cant_search_online, ERROR_INVALID_PARAMETER);
+            return;
+        };
+        let image_name = self
+            .entries
+            .iter()
+            .find(|entry| entry.identity == identity)
+            .map(|entry| entry.image_name.clone())
+            .filter(|name| search_online_menu_enabled(identity, name));
+        let Some(image_name) = image_name else {
+            self.show_failure_message(&self.strings.cant_search_online, ERROR_INVALID_PARAMETER);
+            return;
+        };
+        if self.hwnd_page.is_null() {
+            self.show_failure_message(
+                &self.strings.cant_search_online,
+                ERROR_INVALID_WINDOW_HANDLE,
+            );
+            return;
+        }
+        if self.search_worker.is_none() {
+            match spawn_search_worker() {
+                Ok(worker) => self.search_worker = Some(worker),
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_search_online, error);
+                    return;
+                }
+            }
+        }
+        let request = ProcessSearchRequest {
+            identity,
+            image_name,
+        };
+        let submitted = self
+            .search_worker
+            .as_mut()
+            .map(|worker| worker.request(request, self.hwnd_page));
+        if let Some(Err(error)) = submitted {
+            self.show_failure_message(&self.strings.cant_search_online, error);
+        }
+    }
+
+    fn show_search_failure(&self, failure: ProcessSearchFailure) {
+        let error = match failure {
+            ProcessSearchFailure::Win32(error) => error,
+            ProcessSearchFailure::Shell(code) => match u32::try_from(code) {
+                Ok(error) if error != 0 => error,
+                _ => ERROR_GEN_FAILURE,
+            },
+        };
+        self.show_failure_message(&self.strings.cant_search_online, error);
     }
 
     // 按当前排序列和方向重排 entries；文本列直接比较预先缓存的小写字符串。

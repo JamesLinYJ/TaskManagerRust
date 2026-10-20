@@ -2255,6 +2255,7 @@ impl App {
                 | IDM_PROC_TERMINATE
                 | IDM_PROC_ENDTREE
                 | IDM_PROC_OPENFILELOCATION
+                | IDM_PROC_SEARCHONLINE
                 | IDM_PROC_REALTIME
                 | IDM_PROC_HIGH
                 | IDM_PROC_ABOVENORMAL
