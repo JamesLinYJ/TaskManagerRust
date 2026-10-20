@@ -12,11 +12,17 @@
 //! Physical-disk activity for the performance page.
 //!
 //! The system sampler worker owns one handle per `\\.\PhysicalDriveN` and reads
-//! `IOCTL_DISK_PERFORMANCE`. Refresh never opens a process. Cumulative byte and
-//! timing counters stay on the worker. A failed read leaves those baselines in
-//! place. The first sample, a counter reset, and a rate that does not fit in
-//! `u64` replace the baseline without publishing a point. A zero query interval
-//! publishes nothing and keeps the previous baseline.
+//! `IOCTL_DISK_PERFORMANCE`. Microsoft documents that each successful call
+//! increments a reference count that enables disk statistics. This collector
+//! counts those successes. It keeps one enable while the handle is open, and
+//! issues one `IOCTL_DISK_PERFORMANCE_OFF` for every other success before the
+//! next sample. Dropping the drive — the worker stopping, or the drive
+//! disappearing — issues the remaining offs before `CloseHandle`. A failed
+//! IOCTL does not add a reference. Refresh never opens a process. Cumulative
+//! byte and timing counters stay on the worker. A failed read leaves those
+//! baselines in place. The first sample, a counter reset, and a rate that does
+//! not fit in `u64` replace the baseline without publishing a point. A zero
+//! query interval publishes nothing and keeps the previous baseline.
 
 use std::mem::{offset_of, size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -34,6 +40,8 @@ use crate::infrastructure::native::{OwnedHandle, record_win32_error, to_wide_nul
 
 /// `IOCTL_DISK_PERFORMANCE` = `CTL_CODE(FILE_DEVICE_DISK, 0x0008, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const IOCTL_DISK_PERFORMANCE: u32 = 0x0007_0020;
+/// `IOCTL_DISK_PERFORMANCE_OFF` = `CTL_CODE(FILE_DEVICE_DISK, 0x0018, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+const IOCTL_DISK_PERFORMANCE_OFF: u32 = 0x0007_0060;
 const MAX_PHYSICAL_DRIVES: u32 = 32;
 const RESCAN_INTERVAL: u32 = 30;
 const HUNDRED_NS_PER_SECOND: u64 = 10_000_000;
@@ -123,6 +131,54 @@ struct OpenDrive {
     index: u32,
     handle: OwnedHandle,
     baseline: Option<DiskCounters>,
+    enables: PerformanceEnables,
+}
+
+/// Outstanding `IOCTL_DISK_PERFORMANCE` enables for one drive handle.
+///
+/// A successful performance IOCTL increments the driver's reference count even
+/// when the returned payload is later rejected. `release_until` sends one
+/// `IOCTL_DISK_PERFORMANCE_OFF` per counted enable above `keep`, and stops at
+/// the first disable failure so the remainder stays outstanding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PerformanceEnables {
+    outstanding: u32,
+}
+
+impl PerformanceEnables {
+    fn note_successful_ioctl(&mut self) {
+        self.outstanding = self.outstanding.saturating_add(1);
+    }
+
+    fn release_until(&mut self, keep: u32, mut issue_off: impl FnMut() -> bool) -> u32 {
+        let mut sent = 0u32;
+        while self.outstanding > keep {
+            if !issue_off() {
+                break;
+            }
+            self.outstanding -= 1;
+            sent = sent.saturating_add(1);
+        }
+        sent
+    }
+}
+
+impl Drop for OpenDrive {
+    fn drop(&mut self) {
+        let handle = self.handle.as_raw();
+        let mut logged = false;
+        self.enables
+            .release_until(0, || match disable_disk_performance_once(handle) {
+                Ok(()) => true,
+                Err(error) => {
+                    if !logged {
+                        record_win32_error("disk performance disable", error);
+                        logged = true;
+                    }
+                    false
+                }
+            });
+    }
 }
 
 impl DiskCollector {
@@ -141,18 +197,24 @@ impl DiskCollector {
             return DiskActivityUpdate::Failed;
         }
 
-        let mut readings = Vec::with_capacity(self.drives.len());
+        let reads: Vec<PerformanceRead> = self
+            .drives
+            .iter()
+            .map(|drive| read_disk_counters(drive.handle.as_raw()))
+            .collect();
+        for (index, read) in reads.iter().enumerate() {
+            if read.enabled {
+                self.retain_one_enable(index);
+            }
+        }
+
         let mut drop_drives = Vec::new();
         let mut errors = Vec::new();
-        for (index, drive) in self.drives.iter().enumerate() {
-            match read_disk_counters(drive.handle.as_raw()) {
-                Ok(counters) => readings.push(Ok(counters)),
-                Err(error) => {
-                    errors.push(error);
-                    if drive_is_gone(error) {
-                        drop_drives.push(index);
-                    }
-                    readings.push(Err(()));
+        for (index, read) in reads.iter().enumerate() {
+            if let Err(error) = read.counters {
+                errors.push(error);
+                if drive_is_gone(error) {
+                    drop_drives.push(index);
                 }
             }
         }
@@ -160,7 +222,7 @@ impl DiskCollector {
             self.note_error(error);
         }
 
-        if readings.iter().any(Result::is_err) {
+        if reads.iter().any(|read| read.counters.is_err()) {
             for index in drop_drives.into_iter().rev() {
                 self.drives.swap_remove(index);
             }
@@ -169,6 +231,10 @@ impl DiskCollector {
 
         let mut baselines: Vec<Option<DiskCounters>> =
             self.drives.iter().map(|drive| drive.baseline).collect();
+        let readings: Vec<Result<DiskCounters, ()>> = reads
+            .iter()
+            .map(|read| read.counters.map_err(|_| ()))
+            .collect();
         let update = commit_disk_readings(&mut baselines, &readings);
         for (drive, baseline) in self.drives.iter_mut().zip(baselines) {
             drive.baseline = baseline;
@@ -195,6 +261,7 @@ impl DiskCollector {
                     index,
                     handle,
                     baseline: None,
+                    enables: PerformanceEnables::default(),
                 }),
                 OpenAttempt::Absent => {}
                 OpenAttempt::Failed(error) => self.note_error(error),
@@ -209,6 +276,24 @@ impl DiskCollector {
         }
         record_win32_error("disk performance counters", error);
         self.last_error = Some(error);
+    }
+
+    fn retain_one_enable(&mut self, index: usize) {
+        let handle = self.drives[index].handle.as_raw();
+        let mut failure = None;
+        self.drives[index].enables.note_successful_ioctl();
+        self.drives[index].enables.release_until(1, || {
+            match disable_disk_performance_once(handle) {
+                Ok(()) => true,
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            }
+        });
+        if let Some(error) = failure {
+            self.note_error(error);
+        }
     }
 }
 
@@ -246,7 +331,14 @@ fn open_physical_drive(index: u32) -> OpenAttempt {
     }
 }
 
-fn read_disk_counters(handle: HANDLE) -> Result<DiskCounters, u32> {
+struct PerformanceRead {
+    /// The driver incremented its enable reference. This stays set when the
+    /// payload is rejected, because the IOCTL itself succeeded.
+    enabled: bool,
+    counters: Result<DiskCounters, u32>,
+}
+
+fn read_disk_counters(handle: HANDLE) -> PerformanceRead {
     let mut raw = unsafe { zeroed::<DiskPerformanceRaw>() };
     let mut returned = 0u32;
     // Safety: `handle` is a live physical-drive handle owned by the collector. `raw` is writable
@@ -264,12 +356,47 @@ fn read_disk_counters(handle: HANDLE) -> Result<DiskCounters, u32> {
         )
     };
     if ok == 0 {
-        return Err(last_error_or_gen_failure());
+        return PerformanceRead {
+            enabled: false,
+            counters: Err(last_error_or_gen_failure()),
+        };
     }
     if returned < MIN_DISK_PERFORMANCE_BYTES {
-        return Err(ERROR_INVALID_DATA);
+        return PerformanceRead {
+            enabled: true,
+            counters: Err(ERROR_INVALID_DATA),
+        };
     }
-    counters_from_raw(&raw).ok_or(ERROR_INVALID_DATA)
+    PerformanceRead {
+        enabled: true,
+        counters: counters_from_raw(&raw).ok_or(ERROR_INVALID_DATA),
+    }
+}
+
+fn disable_disk_performance_once(handle: HANDLE) -> Result<(), u32> {
+    if handle.is_null() {
+        return Err(ERROR_INVALID_HANDLE);
+    }
+    let mut returned = 0u32;
+    // Safety: `handle` is still owned by `OpenDrive`. This synchronous IOCTL has no buffers.
+    // The worker calls it at passive level, before `CloseHandle`.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_PERFORMANCE_OFF,
+            null(),
+            0,
+            null_mut(),
+            0,
+            &mut returned,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(last_error_or_gen_failure())
+    } else {
+        Ok(())
+    }
 }
 
 fn counters_from_raw(raw: &DiskPerformanceRaw) -> Option<DiskCounters> {
@@ -694,6 +821,76 @@ mod tests {
             DiskActivityUpdate::NoRate
         );
         assert_eq!(baselines, [Some(skewed)]);
+    }
+
+    #[test]
+    fn successful_samples_keep_one_enable_and_shutdown_releases_it() {
+        let mut enables = PerformanceEnables::default();
+        let mut offs = 0u32;
+        for _ in 0..4 {
+            enables.note_successful_ioctl();
+            offs += enables.release_until(1, || true);
+        }
+        assert_eq!(enables.outstanding, 1);
+        assert_eq!(offs, 3);
+        assert_eq!(enables.release_until(0, || true), 1);
+        assert_eq!(enables.outstanding, 0);
+        assert_eq!(enables.release_until(0, || true), 0);
+    }
+
+    #[test]
+    fn a_failed_ioctl_does_not_need_a_disable() {
+        let mut enables = PerformanceEnables::default();
+        assert_eq!(
+            enables.release_until(0, || panic!("no enable to release")),
+            0
+        );
+    }
+
+    #[test]
+    fn a_rejected_payload_still_counts_as_an_enable() {
+        let mut enables = PerformanceEnables::default();
+        let read = PerformanceRead {
+            enabled: true,
+            counters: Err(ERROR_INVALID_DATA),
+        };
+        if read.enabled {
+            enables.note_successful_ioctl();
+        }
+        assert!(read.counters.is_err());
+        assert_eq!(enables.release_until(0, || true), 1);
+    }
+
+    #[test]
+    fn a_failed_disable_leaves_the_reference_outstanding() {
+        let mut enables = PerformanceEnables::default();
+        enables.note_successful_ioctl();
+        enables.note_successful_ioctl();
+        assert_eq!(enables.release_until(1, || false), 0);
+        assert_eq!(enables.outstanding, 2);
+        let mut attempts = 0u32;
+        let sent = enables.release_until(0, || {
+            attempts += 1;
+            false
+        });
+        assert_eq!(sent, 0);
+        assert_eq!(attempts, 1);
+        assert_eq!(enables.outstanding, 2);
+    }
+
+    #[test]
+    fn removing_one_drive_balances_only_that_drive() {
+        let mut kept = PerformanceEnables::default();
+        let mut gone = PerformanceEnables::default();
+        kept.note_successful_ioctl();
+        gone.note_successful_ioctl();
+        gone.note_successful_ioctl();
+        assert_eq!(gone.release_until(1, || true), 1);
+        assert_eq!(gone.outstanding, 1);
+        assert_eq!(gone.release_until(0, || true), 1);
+        assert_eq!(gone.outstanding, 0);
+        assert_eq!(kept.outstanding, 1);
+        assert_eq!(kept.release_until(0, || true), 1);
     }
 
     #[test]

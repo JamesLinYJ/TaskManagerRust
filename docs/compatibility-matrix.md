@@ -124,7 +124,10 @@ until the cause is understood.
 ## Disk activity history
 
 The Performance page samples physical disks with `DeviceIoControl(IOCTL_DISK_PERFORMANCE)` on
-`\\.\PhysicalDriveN`. The system sampler worker keeps those handles open. It does not open
-processes. Unit tests cover the first sample, a counter reset, a zero query interval, a rate that
-does not fit in `u64`, and a failed read that leaves the baseline unchanged. Hands-on Windows UI
-for the disk graph is **pending**. A Linux cross typecheck is not a device test.
+`\\.\PhysicalDriveN`. Each successful call increments the driver's enable reference. The sampler
+keeps one enable while the handle is open and issues `IOCTL_DISK_PERFORMANCE_OFF` for every other
+success, then for the last enable when that drive is dropped (worker shutdown or the drive
+disappearing). The system sampler worker keeps those handles open. It does not open processes.
+Unit tests cover the first sample, a counter reset, a zero query interval, a rate that does not
+fit in `u64`, a failed read that leaves the baseline unchanged, and enable/disable balance.
+Hands-on Windows UI for the disk graph is **pending**. A Linux cross typecheck is not a device test.
