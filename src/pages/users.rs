@@ -12,7 +12,8 @@ use std::collections::HashMap;
 
 // 用户页实现。
 // 这里负责枚举终端服务会话、刷新用户列表，并处理发送消息、断开连接、
-// 注销等会话级操作。
+// 注销等会话级操作。枚举、身份复核和 WTS 调用都在持久 worker 上执行。
+// UI 线程只分发命令、布局、绘制，并在 worker 返回后显示已有的错误对话框。
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 use std::slice;
@@ -51,7 +52,7 @@ use crate::infrastructure::native::{
     record_win32_error_with_fields, set_window_userdata, subclass_list_view, to_wide_null,
     widestr_ptr_to_string, window_rect_relative_to_page,
 };
-use crate::infrastructure::worker::{SingleFlightWorker, keep_pending};
+use crate::infrastructure::worker::SingleFlightWorker;
 use crate::ui::dialogs::dialog_box;
 use crate::ui::localization::{
     TextKey, localize_dialog, session_state, text, user_column_titles, user_session_column_title,
@@ -131,7 +132,7 @@ pub struct UserPageState {
     sessions: Vec<UserSessionEntry>,
     sort_column: usize,
     sort_ascending: bool,
-    worker: Option<SingleFlightWorker<(), UserWorkerResult>>,
+    worker: Option<SingleFlightWorker<UserWorkerRequest, UserWorkerCompletion>>,
     last_refresh_error: Option<u32>,
     last_row_errors: Vec<UserSessionRowError>,
 }
@@ -190,8 +191,8 @@ impl UserPageState {
         self.worker = Some(SingleFlightWorker::spawn(
             "taskmgr-rs-user-sampler",
             PWM_USER_WORKER_COMPLETE,
-            keep_pending,
-            |()| collect_user_sessions(),
+            merge_user_requests,
+            perform_user_request,
         )?);
         Ok(())
     }
@@ -397,13 +398,16 @@ impl UserPageState {
     }
 
     fn schedule_collection(&mut self) {
-        let Some(worker) = self.worker.as_mut() else {
-            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
-            return;
-        };
-        if let Err(error) = worker.request((), self.hwnd) {
+        if let Err(error) = self.submit_request(UserWorkerRequest::Refresh) {
             self.set_refresh_error(error);
         }
+    }
+
+    fn submit_request(&mut self, request: UserWorkerRequest) -> Result<(), u32> {
+        let Some(worker) = self.worker.as_mut() else {
+            return Err(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+        };
+        worker.request(request, self.hwnd).map(|_| ())
     }
 
     fn drain_worker_results(&mut self) {
@@ -413,11 +417,31 @@ impl UserPageState {
         };
         for completion in drained.completions {
             crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
-                self.apply_user_worker_result(completion.value);
+                self.apply_user_worker_completion(completion.value);
             });
         }
         if let Some(error) = drained.error {
             self.set_refresh_error(error);
+        }
+    }
+
+    fn apply_user_worker_completion(&mut self, completion: UserWorkerCompletion) {
+        match completion {
+            UserWorkerCompletion::Snapshot(result) => self.apply_user_worker_result(result),
+            UserWorkerCompletion::Actions(reports) => {
+                let mut refresh = false;
+                for report in reports {
+                    if let Some(error) = report.error {
+                        self.show_action_error(report.kind, error);
+                        refresh = true;
+                    } else if report.kind != UserSessionKind::SendMessage {
+                        refresh = true;
+                    }
+                }
+                if refresh && let Err(error) = self.submit_request(UserWorkerRequest::Refresh) {
+                    self.set_refresh_error(error);
+                }
+            }
         }
     }
 
@@ -841,133 +865,97 @@ impl UserPageState {
     }
 
     fn send_message(&mut self) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            // 发送消息会先弹出输入对话框，再逐个会话调用 WTSSendMessageW。
-            let selected = self.selected_session_identities();
-            if selected.is_empty() {
-                return;
-            }
-
-            let mut result = MessageDialogResult::default();
-            match dialog_box(
-                self.hinstance as _,
-                IDD_MESSAGE,
-                self.hwnd,
-                Some(message_dialog_proc),
-                &mut result as *mut _ as LPARAM,
-            ) {
-                Ok(dialog_result) if dialog_result == IDOK as isize => {}
-                Ok(_) => return,
-                Err(error) => {
-                    self.show_command_failure_with_error(
-                        text(TextKey::MessageCouldNotBeSent),
-                        error,
-                    );
-                    return;
-                }
-            }
-
-            if let Err(error) = validate_session_identities(&selected) {
+        // 对话框收集标题和正文。身份复核与 WTSSendMessageW 留在 worker。
+        let Some(selected) = self.verified_selection(UserSessionKind::SendMessage) else {
+            return;
+        };
+        let mut result = MessageDialogResult::default();
+        match dialog_box(
+            self.hinstance as _,
+            IDD_MESSAGE,
+            self.hwnd,
+            Some(message_dialog_proc),
+            &mut result as *mut _ as LPARAM,
+        ) {
+            Ok(dialog_result) if dialog_result == IDOK as isize => {}
+            Ok(_) => return,
+            Err(error) => {
                 self.show_command_failure_with_error(text(TextKey::MessageCouldNotBeSent), error);
-                self.refresh();
                 return;
-            }
-
-            let title = to_wide_null(&result.title);
-            let body = to_wide_null(&result.body);
-            for identity in selected {
-                if let Err(error) = validate_session_identity(&identity) {
-                    self.show_command_failure_with_error(
-                        text(TextKey::MessageCouldNotBeSent),
-                        error,
-                    );
-                    break;
-                }
-                let mut response = 0i32;
-                if WTSSendMessageW(
-                    WTS_CURRENT_SERVER_HANDLE,
-                    identity.session_id,
-                    title.as_ptr(),
-                    (result.title.encode_utf16().count() * 2) as u32,
-                    body.as_ptr(),
-                    (result.body.encode_utf16().count() * 2) as u32,
-                    MB_OK | MB_TOPMOST | MB_ICONINFORMATION,
-                    0,
-                    &mut response,
-                    0,
-                ) == 0
-                {
-                    self.show_command_failure(text(TextKey::MessageCouldNotBeSent));
-                    break;
-                }
             }
         }
+        self.submit_session_command(UserSessionCommand {
+            kind: UserSessionKind::SendMessage,
+            sessions: selected,
+            title: result.title,
+            body: result.body,
+        });
     }
 
     fn change_session_state(&mut self, command_id: u16) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            // 断开/注销属于高影响操作，先确认，再逐个会话执行，失败时立即报错并停止。
-            let selected = self.selected_session_identities();
-            if selected.is_empty() {
-                return;
-            }
-
-            let prompt = if command_id == IDM_LOGOFF {
-                text(TextKey::ConfirmLogoffSelectedUsers)
-            } else {
-                text(TextKey::ConfirmDisconnectSelectedUsers)
-            };
+        // 确认框留在 UI 线程。断开和注销的 WTS 调用留在 worker。
+        let kind = if command_id == IDM_LOGOFF {
+            UserSessionKind::Logoff
+        } else {
+            UserSessionKind::Disconnect
+        };
+        let Some(selected) = self.verified_selection(kind) else {
+            return;
+        };
+        let prompt = if kind == UserSessionKind::Logoff {
+            text(TextKey::ConfirmLogoffSelectedUsers)
+        } else {
+            text(TextKey::ConfirmDisconnectSelectedUsers)
+        };
+        // 安全性: both strings are NUL-terminated and live for the modal confirmation.
+        let confirmed = unsafe {
             let prompt_wide = to_wide_null(prompt);
             let caption_wide = to_wide_null(text(TextKey::AppTitle));
-            if MessageBoxW(
+            MessageBoxW(
                 self.hwnd,
                 prompt_wide.as_ptr(),
                 caption_wide.as_ptr(),
                 MB_YESNO | MB_DEFBUTTON2 | MB_ICONEXCLAMATION,
-            ) != IDYES
-            {
-                return;
-            }
+            ) == IDYES
+        };
+        if !confirmed {
+            return;
+        }
+        self.submit_session_command(UserSessionCommand {
+            kind,
+            sessions: selected,
+            title: String::new(),
+            body: String::new(),
+        });
+    }
 
-            let failure_message = if command_id == IDM_LOGOFF {
-                text(TextKey::SelectedUserCouldNotBeLoggedOff)
-            } else {
-                text(TextKey::SelectedUserCouldNotBeDisconnected)
-            };
-            if let Err(error) = validate_session_identities(&selected) {
-                self.show_command_failure_with_error(failure_message, error);
-                self.refresh();
-                return;
-            }
-
-            for identity in selected {
-                if let Err(error) = validate_session_identity(&identity) {
-                    self.show_command_failure_with_error(failure_message, error);
-                    break;
-                }
-                let succeeded = if command_id == IDM_LOGOFF {
-                    WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, identity.session_id, 0) != 0
-                } else {
-                    WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, identity.session_id, 0) != 0
-                };
-                if !succeeded {
-                    self.show_command_failure(failure_message);
-                    break;
-                }
-            }
-
-            self.refresh();
+    fn verified_selection(&self, kind: UserSessionKind) -> Option<Vec<UserSessionIdentity>> {
+        let selected = self.selected_session_identities();
+        if selected.is_empty() {
+            return None;
+        }
+        if selected.iter().all(UserSessionIdentity::is_verified) {
+            Some(selected)
+        } else {
+            self.show_action_error(kind, ERROR_INVALID_PARAMETER);
+            None
         }
     }
 
-    fn show_command_failure(&self, message: &str) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            // 统一附带最后一个 Win32 错误码，方便排查权限或会话状态问题。
-            self.show_command_failure_with_error(message, GetLastError());
+    fn submit_session_command(&mut self, command: UserSessionCommand) {
+        let kind = command.kind;
+        if let Err(error) = self.submit_request(UserWorkerRequest::Actions(vec![command])) {
+            self.show_action_error(kind, error);
         }
+    }
+
+    fn show_action_error(&self, kind: UserSessionKind, error: u32) {
+        let message = match kind {
+            UserSessionKind::Disconnect => text(TextKey::SelectedUserCouldNotBeDisconnected),
+            UserSessionKind::Logoff => text(TextKey::SelectedUserCouldNotBeLoggedOff),
+            UserSessionKind::SendMessage => text(TextKey::MessageCouldNotBeSent),
+        };
+        self.show_command_failure_with_error(message, error);
     }
 
     fn show_command_failure_with_error(&self, message: &str, error: u32) {
@@ -993,6 +981,68 @@ impl UserPageState {
     fn list_hwnd(&self) -> HWND {
         // 安全性: this only queries a child HWND from this page dialog; null is allowed.
         unsafe { GetDlgItem(self.hwnd, IDC_USERLIST) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserSessionKind {
+    Disconnect,
+    Logoff,
+    SendMessage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UserSessionCommand {
+    kind: UserSessionKind,
+    sessions: Vec<UserSessionIdentity>,
+    title: String,
+    body: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UserWorkerRequest {
+    Refresh,
+    Actions(Vec<UserSessionCommand>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UserActionReport {
+    kind: UserSessionKind,
+    error: Option<u32>,
+}
+
+enum UserWorkerCompletion {
+    Snapshot(UserWorkerResult),
+    Actions(Vec<UserActionReport>),
+}
+
+/// Keeps a confirmed session action ahead of a coalesced refresh, and queues a later action
+/// behind one that has not started.
+fn merge_user_requests(pending: &mut UserWorkerRequest, incoming: UserWorkerRequest) {
+    match (&mut *pending, incoming) {
+        (UserWorkerRequest::Actions(queued), UserWorkerRequest::Actions(more)) => {
+            queued.extend(more);
+        }
+        (UserWorkerRequest::Actions(_), UserWorkerRequest::Refresh) => {}
+        (pending, incoming) => *pending = incoming,
+    }
+}
+
+fn perform_user_request(request: UserWorkerRequest) -> UserWorkerCompletion {
+    match request {
+        UserWorkerRequest::Refresh => UserWorkerCompletion::Snapshot(collect_user_sessions()),
+        UserWorkerRequest::Actions(commands) => UserWorkerCompletion::Actions(
+            commands
+                .into_iter()
+                .map(|command| {
+                    let kind = command.kind;
+                    UserActionReport {
+                        kind,
+                        error: execute_session_command(&command).err(),
+                    }
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -1157,15 +1207,107 @@ fn format_session_display_name(identity: &UserSessionIdentity, show_domain_names
     }
 }
 
-fn validate_session_identity(expected: &UserSessionIdentity) -> Result<(), u32> {
-    let info = query_session_info(expected.session_id)?;
-    let current = UserSessionIdentity {
-        session_id: expected.session_id,
-        logon_time_100ns: info.LogonTime,
-        user_name: query_session_string(expected.session_id, WTSUserName)?,
-        domain_name: query_session_string(expected.session_id, WTSDomainName)?,
+fn execute_session_command(command: &UserSessionCommand) -> Result<(), u32> {
+    if command.sessions.is_empty() {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    let message = if command.kind == UserSessionKind::SendMessage {
+        Some(prepare_session_message(&command.title, &command.body)?)
+    } else {
+        None
     };
-    validate_observed_session_identity(expected, &current)
+    for identity in &command.sessions {
+        // Re-query immediately before the destructive call. A reused session id, a missing
+        // logon time, or a different user or domain is a failure, not success.
+        let current = observed_session_identity(identity.session_id)?;
+        run_session_action_if_verified(identity, &current, || {
+            invoke_session_action(command.kind, identity.session_id, message.as_ref())
+        })?;
+    }
+    Ok(())
+}
+
+fn prepare_session_message(title: &str, body: &str) -> Result<PreparedSessionMessage, u32> {
+    Ok(PreparedSessionMessage {
+        title: to_wide_null(title),
+        body: to_wide_null(body),
+        title_bytes: wide_byte_length(title)?,
+        body_bytes: wide_byte_length(body)?,
+    })
+}
+
+struct PreparedSessionMessage {
+    title: Vec<u16>,
+    body: Vec<u16>,
+    title_bytes: u32,
+    body_bytes: u32,
+}
+
+fn wide_byte_length(value: &str) -> Result<u32, u32> {
+    let units = u32::try_from(value.encode_utf16().count()).map_err(|_| ERROR_INVALID_PARAMETER)?;
+    units.checked_mul(2).ok_or(ERROR_INVALID_PARAMETER)
+}
+
+fn observed_session_identity(session_id: u32) -> Result<UserSessionIdentity, u32> {
+    let info = query_session_info(session_id)?;
+    Ok(UserSessionIdentity {
+        session_id,
+        logon_time_100ns: info.LogonTime,
+        user_name: query_session_string(session_id, WTSUserName)?,
+        domain_name: query_session_string(session_id, WTSDomainName)?,
+    })
+}
+
+fn run_session_action_if_verified(
+    expected: &UserSessionIdentity,
+    current: &UserSessionIdentity,
+    invoke: impl FnOnce() -> Result<(), u32>,
+) -> Result<(), u32> {
+    validate_observed_session_identity(expected, current)?;
+    invoke()
+}
+
+fn invoke_session_action(
+    kind: UserSessionKind,
+    session_id: u32,
+    message: Option<&PreparedSessionMessage>,
+) -> Result<(), u32> {
+    // 安全性: WTS_CURRENT_SERVER_HANDLE is the documented local-server sentinel. Message buffers,
+    // when present, outlive this synchronous call and include a NUL terminator. GetLastError is
+    // read before any other Win32 call.
+    let succeeded = match kind {
+        UserSessionKind::Disconnect => unsafe {
+            WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0)
+        },
+        UserSessionKind::Logoff => unsafe {
+            WTSLogoffSession(WTS_CURRENT_SERVER_HANDLE, session_id, 0)
+        },
+        UserSessionKind::SendMessage => {
+            let Some(message) = message else {
+                return Err(ERROR_INVALID_PARAMETER);
+            };
+            let mut response = 0i32;
+            unsafe {
+                WTSSendMessageW(
+                    WTS_CURRENT_SERVER_HANDLE,
+                    session_id,
+                    message.title.as_ptr(),
+                    message.title_bytes,
+                    message.body.as_ptr(),
+                    message.body_bytes,
+                    MB_OK | MB_TOPMOST | MB_ICONINFORMATION,
+                    0,
+                    &mut response,
+                    0,
+                )
+            }
+        }
+    };
+    if succeeded != 0 {
+        Ok(())
+    } else {
+        Err(win32_error_or_gen_failure(unsafe { GetLastError() }))
+    }
 }
 
 fn validate_observed_session_identity(
@@ -1177,13 +1319,6 @@ fn validate_observed_session_identity(
     } else {
         Err(ERROR_INVALID_PARAMETER)
     }
-}
-
-fn validate_session_identities(expected: &[UserSessionIdentity]) -> Result<(), u32> {
-    for identity in expected {
-        validate_session_identity(identity)?;
-    }
-    Ok(())
 }
 
 fn win32_error_or_gen_failure(error: u32) -> u32 {
@@ -1444,6 +1579,98 @@ mod tests {
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.sessions[0].identity, expected);
         assert_eq!(state.last_refresh_error, Some(1722));
+    }
+
+    #[test]
+    fn user_or_domain_change_is_not_the_same_identity() {
+        let expected = identity(1, 100);
+        let mut renamed = expected.clone();
+        renamed.user_name = "Other".to_string();
+        assert_eq!(
+            validate_observed_session_identity(&expected, &renamed),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+
+        let mut other_domain = expected.clone();
+        other_domain.domain_name = "OTHER".to_string();
+        assert_eq!(
+            validate_observed_session_identity(&expected, &other_domain),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn mismatched_identity_does_not_run_the_session_action() {
+        let mut called = false;
+        let result = run_session_action_if_verified(&identity(1, 100), &identity(1, 200), || {
+            called = true;
+            Ok(())
+        });
+        assert_eq!(result, Err(ERROR_INVALID_PARAMETER));
+        assert!(!called);
+    }
+
+    #[test]
+    fn verified_identity_runs_the_session_action() {
+        let expected = identity(1, 100);
+        let mut called = false;
+        let result = run_session_action_if_verified(&expected, &expected, || {
+            called = true;
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
+        assert!(called);
+    }
+
+    #[test]
+    fn empty_session_action_is_not_success() {
+        let command = UserSessionCommand {
+            kind: UserSessionKind::Disconnect,
+            sessions: Vec::new(),
+            title: String::new(),
+            body: String::new(),
+        };
+        assert_eq!(
+            execute_session_command(&command),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn pending_session_action_survives_a_coalesced_refresh() {
+        let action = UserWorkerRequest::Actions(vec![session_command(UserSessionKind::Disconnect)]);
+        let mut pending = action.clone();
+        merge_user_requests(&mut pending, UserWorkerRequest::Refresh);
+        assert_eq!(pending, action);
+    }
+
+    #[test]
+    fn session_action_replaces_a_pending_refresh() {
+        let action = UserWorkerRequest::Actions(vec![session_command(UserSessionKind::Logoff)]);
+        let mut pending = UserWorkerRequest::Refresh;
+        merge_user_requests(&mut pending, action.clone());
+        assert_eq!(pending, action);
+    }
+
+    #[test]
+    fn a_second_session_action_stays_queued() {
+        let first = session_command(UserSessionKind::Disconnect);
+        let second = session_command(UserSessionKind::SendMessage);
+        let mut pending = UserWorkerRequest::Actions(vec![first.clone()]);
+        merge_user_requests(
+            &mut pending,
+            UserWorkerRequest::Actions(vec![second.clone()]),
+        );
+        assert_eq!(pending, UserWorkerRequest::Actions(vec![first, second]));
+    }
+
+    fn session_command(kind: UserSessionKind) -> UserSessionCommand {
+        UserSessionCommand {
+            kind,
+            sessions: vec![identity(1, 100)],
+            title: String::new(),
+            body: String::new(),
+        }
     }
 
     #[test]

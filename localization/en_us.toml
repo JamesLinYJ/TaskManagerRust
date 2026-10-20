@@ -327,6 +327,9 @@ ServiceStartFailed = "Unable to start the service."
 ServiceStopFailed = "Unable to stop the service."
 ServiceStateUnchanged = "The service did not enter the requested state."
 ServiceProcessPid = "PID"
+DisconnectStatusHelp = "Disconnects the selected user session"
+LogoffStatusHelp = "Logs off the selected user session"
+SendMessageStatusHelp = "Sends a message to the selected user session"
 
 [menu_status_help]
 IDM_RUN = "Runs a new program"
