@@ -309,8 +309,6 @@ impl PerformancePageState {
             self.rebuild_cpu_graph_labels();
             self.sync_cpu_graph_accessible_text(hwnd_page);
         }
-        self.cpu_usage = sample.cpu_usage;
-        self.kernel_usage = sample.kernel_usage;
         self.physical_mem_usage_kb = sample.physical_mem_usage_kb;
         self.physical_mem_limit_kb = sample.physical_mem_limit_kb;
         self.commit_total_kb = sample.commit_total_kb;
@@ -327,6 +325,10 @@ impl PerformancePageState {
         self.process_count = sample.process_count;
 
         if sample.cpu_delta_valid {
+            // A priming/reset interval carries placeholder zeros. Keep the meters in step with
+            // the history and the CPU page until a measured delta is available again.
+            self.cpu_usage = sample.cpu_usage;
+            self.kernel_usage = sample.kernel_usage;
             for (history, usage) in self
                 .cpu_history
                 .iter_mut()
@@ -1500,4 +1502,71 @@ fn push_unique_window(windows: &mut Vec<HWND>, hwnd: HWND) {
         return;
     }
     windows.push(hwnd);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::system::cpu_topology::query_processor_topology;
+    use crate::system::sampler::{CpuDiagnosticError, CpuDiagnosticSample};
+
+    #[test]
+    fn invalid_cpu_interval_preserves_meters_while_memory_updates() {
+        let mut page = PerformancePageState {
+            no_title: true,
+            ..Default::default()
+        };
+        // This read-only topology query also creates a correctly sized unknown topology on
+        // hosts with more than one processor. No page/window is created by this test.
+        let mut sample = SystemSample {
+            processor_count: 1,
+            processor_topology: Arc::new(query_processor_topology(1)),
+            cpu_delta_valid: true,
+            cpu_usage: 75,
+            kernel_usage: 25,
+            processor_cpu_usage: vec![75],
+            processor_kernel_usage: vec![25],
+            cpu_diagnostics: Ok(CpuDiagnosticSample::default()),
+            uptime_ms: 1_000,
+            physical_mem_usage_kb: 50,
+            physical_mem_limit_kb: 100,
+            commit_total_kb: 0,
+            commit_limit_kb: 0,
+            commit_peak_kb: 0,
+            total_physical_kb: 100,
+            avail_physical_kb: 50,
+            file_cache_kb: 0,
+            kernel_total_kb: 0,
+            kernel_paged_kb: 0,
+            kernel_nonpaged_kb: 0,
+            handle_count: 0,
+            thread_count: 0,
+            process_count: 0,
+        };
+        page.apply_system_sample(null_mut(), &sample, false)
+            .unwrap();
+        sample.cpu_delta_valid = false;
+        sample.cpu_usage = 0;
+        sample.kernel_usage = 0;
+        sample.processor_cpu_usage[0] = 0;
+        sample.processor_kernel_usage[0] = 0;
+        sample.cpu_diagnostics = Err(CpuDiagnosticError::CounterRegression);
+        sample.physical_mem_usage_kb = 60;
+        page.apply_system_sample(null_mut(), &sample, false)
+            .unwrap();
+
+        assert_eq!(page.cpu_usage, 75);
+        assert_eq!(page.kernel_usage, 25);
+        assert_eq!(page.averaged_cpu_history.value_at(0), Some(75));
+        assert_eq!(page.averaged_kernel_history.value_at(0), Some(25));
+        assert_eq!(page.physical_mem_usage_kb, 60);
+        assert_eq!(page.mem_history.value_at(0), Some(60));
+
+        // A real idle measurement must still replace the retained busy value.
+        sample.cpu_delta_valid = true;
+        page.apply_system_sample(null_mut(), &sample, false)
+            .unwrap();
+        assert_eq!(page.cpu_usage, 0);
+        assert_eq!(page.kernel_usage, 0);
+    }
 }

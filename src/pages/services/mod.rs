@@ -72,6 +72,7 @@ struct ServiceRow {
     status_text: String,
     status_sort: String,
     startup: ServiceStartupType,
+    accepts_stop: bool,
     startup_text: String,
     startup_sort: String,
     process: Option<ProcIdentity>,
@@ -89,6 +90,7 @@ pub struct ServicePageState {
     sort_ascending: bool,
     updating_list: bool,
     worker: Option<SingleFlightWorker<ServiceRequest, ServiceWorkerCompletion>>,
+    pending_control: Option<ServiceControlAction>,
     last_refresh_error: Option<u32>,
     last_row_errors: Vec<self::sampler::ServiceRowError>,
 }
@@ -105,6 +107,7 @@ impl Default for ServicePageState {
             sort_ascending: true,
             updating_list: false,
             worker: None,
+            pending_control: None,
             last_refresh_error: None,
             last_row_errors: Vec::new(),
         }
@@ -157,11 +160,17 @@ impl ServicePageState {
 
     pub fn destroy(&mut self) {
         self.worker = None;
+        self.pending_control = None;
         self.rows.clear();
     }
 
     pub fn command_state(&self) -> ServiceCommandState {
-        model::command_state(self.selected_input())
+        let mut state = model::command_state(self.selected_input());
+        if self.pending_control.is_some() {
+            state.start = false;
+            state.stop = false;
+        }
+        state
     }
 
     pub fn handle_command(&mut self, command_id: u16) -> bool {
@@ -342,7 +351,12 @@ impl ServicePageState {
 
     fn refresh(&mut self) {
         self.drain_worker();
-        self.submit(ServiceRequest::Refresh);
+        // A control owns the one coalesced slot until its completion. Do not queue another
+        // refresh behind it: an action panic must leave the worker idle so it can be reported
+        // as a failed action, rather than being mistaken for a failed background refresh.
+        if self.pending_control.is_none() {
+            self.submit(ServiceRequest::Refresh);
+        }
     }
 
     fn request_control(&mut self, action: ServiceControlAction) {
@@ -376,6 +390,9 @@ impl ServicePageState {
         };
         if let Err(error) = worker.request(request, self.hwnd) {
             self.report_submit_failure(error, action);
+        } else if let Some(action) = action {
+            self.pending_control = Some(action);
+            self.update_ui_state();
         }
     }
 
@@ -399,6 +416,15 @@ impl ServicePageState {
         }
         if let Some(error) = drained.error {
             self.set_refresh_error(error);
+            if self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_in_flight() && !worker.has_pending())
+                && let Some(action) = self.pending_control.take()
+            {
+                self.update_ui_state();
+                self.show_action_failure(action, ServiceActionFailure::Api(error));
+            }
         }
     }
 
@@ -409,6 +435,25 @@ impl ServicePageState {
                 Err(error) => self.set_refresh_error(error),
             },
             ServiceWorkerCompletion::Action(report) => {
+                self.pending_control = None;
+                if let Ok(status) = report.outcome
+                    && let Some(row) = self
+                        .rows
+                        .iter_mut()
+                        .find(|row| row.service_name.eq_ignore_ascii_case(&report.service_name))
+                {
+                    row.status = status;
+                    row.status_text = status_text(status).to_string();
+                    row.status_sort = row.status_text.to_lowercase();
+                    if !model::service_has_valid_process_id(status) {
+                        row.process = None;
+                        row.process_text.clear();
+                        row.process_sort.clear();
+                    }
+                    self.sort_rows();
+                    self.rebuild_list(refresh_scroll_policy());
+                }
+                self.update_ui_state();
                 if let Err(failure) = report.outcome {
                     self.show_action_failure(report.action, failure);
                 }
@@ -595,6 +640,7 @@ impl ServicePageState {
         Some(ServiceCommandInput {
             status: row.status,
             startup: row.startup,
+            accepts_stop: row.accepts_stop,
             process: row.process,
         })
     }
@@ -696,6 +742,7 @@ fn service_row(record: self::sampler::ServiceRecord, pid_label: &str) -> Service
         status_sort: status_text.to_lowercase(),
         status_text,
         startup: record.startup,
+        accepts_stop: record.accepts_stop,
         startup_sort: startup_text.to_lowercase(),
         startup_text,
         process_sort: process_text.to_lowercase(),
@@ -754,5 +801,145 @@ fn redraw_visible(list: HWND, count: usize) {
     let end = top.saturating_add(visible).saturating_add(1).min(count);
     if top < end {
         unsafe { SendMessageW(list, LVM_REDRAWITEMS, top, (end - 1) as LPARAM) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_confirmed_stop_clears_the_old_owner_even_if_the_refresh_cannot_start() {
+        let mut page = ServicePageState {
+            rows: vec![service_row(
+                self::sampler::ServiceRecord {
+                    service_name: "test-service".to_string(),
+                    description: String::new(),
+                    status: ServiceRunState::Running,
+                    startup: ServiceStartupType::Manual,
+                    accepts_stop: true,
+                    process: Some(model::OwningProcess {
+                        identity: ProcIdentity::new(44, 100),
+                        image_name: Some("service.exe".to_string()),
+                    }),
+                },
+                "PID",
+            )],
+            selected_service: Some("test-service".to_string()),
+            pending_control: Some(ServiceControlAction::Stop),
+            // No worker is installed: the follow-up refresh must fail without changing rows.
+            ..ServicePageState::default()
+        };
+        page.apply_completion(ServiceWorkerCompletion::Action(
+            self::sampler::ServiceActionReport {
+                service_name: "test-service".to_string(),
+                action: ServiceControlAction::Stop,
+                outcome: Ok(ServiceRunState::Stopped),
+            },
+        ));
+        assert_eq!(page.rows[0].status, ServiceRunState::Stopped);
+        assert_eq!(page.rows[0].process, None);
+        assert!(page.rows[0].process_text.is_empty());
+        assert!(page.rows[0].process_sort.is_empty());
+        assert!(!page.command_state().go_to_process);
+        assert_eq!(page.last_refresh_error, Some(ERROR_BROKEN_PIPE));
+    }
+
+    #[test]
+    fn a_queued_service_control_cannot_be_overwritten_by_another_selection() {
+        let (started_sender, started_receiver) = crossbeam_channel::bounded(1);
+        let (resume_sender, resume_receiver) = crossbeam_channel::bounded(1);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let worker_observed = Arc::clone(&observed);
+        // All service work is synthetic. No SCM handle is opened and no service is changed.
+        let worker = SingleFlightWorker::spawn(
+            "taskmgr-service-control-queue-test",
+            0,
+            merge_service_requests,
+            move |request: ServiceRequest| {
+                let first = {
+                    let mut observed = worker_observed.lock().unwrap();
+                    let first = observed.is_empty();
+                    observed.push(request.clone());
+                    first
+                };
+                if first {
+                    started_sender.send(()).unwrap();
+                    resume_receiver
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                match request {
+                    ServiceRequest::Refresh => {
+                        ServiceWorkerCompletion::Snapshot(Ok(ServiceCollection {
+                            services: Vec::new(),
+                            row_errors: Vec::new(),
+                        }))
+                    }
+                    ServiceRequest::Control {
+                        service_name,
+                        action,
+                    } => ServiceWorkerCompletion::Action(self::sampler::ServiceActionReport {
+                        service_name,
+                        action,
+                        outcome: Ok(ServiceRunState::StartPending),
+                    }),
+                }
+            },
+        )
+        .unwrap();
+        let mut page = ServicePageState {
+            worker: Some(worker),
+            rows: vec![service_row(
+                self::sampler::ServiceRecord {
+                    service_name: "first".to_string(),
+                    description: String::new(),
+                    status: ServiceRunState::Stopped,
+                    startup: ServiceStartupType::Manual,
+                    accepts_stop: false,
+                    process: None,
+                },
+                "PID",
+            )],
+            selected_service: Some("first".to_string()),
+            ..ServicePageState::default()
+        };
+        page.submit(ServiceRequest::Refresh);
+        started_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        page.request_control(ServiceControlAction::Start);
+        assert_eq!(page.pending_control, Some(ServiceControlAction::Start));
+
+        page.rows[0].service_name = "second".to_string();
+        page.selected_service = Some("second".to_string());
+        assert!(!page.command_state().start);
+        assert!(!page.command_state().stop);
+        page.request_control(ServiceControlAction::Start);
+        resume_sender.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while page.pending_control.is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "control completion was not delivered"
+            );
+            page.drain_worker();
+            std::thread::yield_now();
+        }
+        let observed = observed.lock().unwrap();
+        let controls = observed
+            .iter()
+            .filter(|request| matches!(request, ServiceRequest::Control { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            controls,
+            vec![&ServiceRequest::Control {
+                service_name: "first".to_string(),
+                action: ServiceControlAction::Start,
+            }]
+        );
     }
 }

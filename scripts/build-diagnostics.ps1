@@ -44,7 +44,10 @@ Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
 
 Push-Location $repoRoot
 try {
-    & $cargoCommand build --profile diagnostics --target $Target
+    & $cargoCommand build --profile diagnostics --target $Target --locked
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo diagnostic build failed with exit code $LASTEXITCODE"
+    }
     if (-not (Test-Path $pdb)) {
         throw "The linker did not produce the expected PDB: $pdb"
     }

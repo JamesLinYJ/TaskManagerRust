@@ -48,7 +48,9 @@ pub struct RuntimeStatsController {
 
 impl RuntimeStatsController {
     pub fn apply_sample(&mut self, sample: &SystemSample) {
-        self.cpu_usage = sample.cpu_usage;
+        if sample.cpu_delta_valid {
+            self.cpu_usage = sample.cpu_usage;
+        }
         self.mem_usage_kb = sample.physical_mem_usage_kb;
         self.mem_limit_kb = sample.physical_mem_limit_kb;
         self.process_count = sample.process_count;
@@ -259,5 +261,63 @@ impl WindowModeController {
 
     pub fn mark_restored(&mut self) {
         self.temporarily_hidden = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeStatsController;
+    use crate::system::sampler::{CpuDiagnosticError, CpuDiagnosticSample, SystemSample};
+
+    fn sample(cpu_delta_valid: bool, cpu_usage: u8) -> SystemSample {
+        SystemSample {
+            processor_count: 2,
+            processor_topology: Default::default(),
+            cpu_delta_valid,
+            cpu_usage,
+            kernel_usage: 0,
+            processor_cpu_usage: vec![cpu_usage; 2],
+            processor_kernel_usage: vec![0; 2],
+            cpu_diagnostics: if cpu_delta_valid {
+                Ok(CpuDiagnosticSample::default())
+            } else {
+                Err(CpuDiagnosticError::BaselineUnavailable)
+            },
+            uptime_ms: 0,
+            physical_mem_usage_kb: 2048,
+            physical_mem_limit_kb: 4096,
+            commit_total_kb: 0,
+            commit_limit_kb: 0,
+            commit_peak_kb: 0,
+            total_physical_kb: 4096,
+            avail_physical_kb: 2048,
+            file_cache_kb: 0,
+            kernel_total_kb: 0,
+            kernel_paged_kb: 0,
+            kernel_nonpaged_kb: 0,
+            handle_count: 0,
+            thread_count: 0,
+            process_count: 17,
+        }
+    }
+
+    #[test]
+    fn unavailable_cpu_delta_retains_last_usage_and_commits_independent_stats() {
+        let mut stats = RuntimeStatsController::default();
+        stats.apply_sample(&sample(true, 73));
+        let mut unavailable = sample(false, 0);
+        unavailable.physical_mem_usage_kb = 3072;
+        unavailable.process_count = 18;
+        stats.apply_sample(&unavailable);
+
+        assert_eq!(stats.cpu_usage, 73);
+        assert_eq!(stats.mem_usage_kb, 3072);
+        assert_eq!(stats.mem_limit_kb, 4096);
+        assert_eq!(stats.process_count, 18);
+        assert_eq!(stats.processor_count, 2);
+
+        // A later valid idle interval really is zero and must replace the retained value.
+        stats.apply_sample(&sample(true, 0));
+        assert_eq!(stats.cpu_usage, 0);
     }
 }

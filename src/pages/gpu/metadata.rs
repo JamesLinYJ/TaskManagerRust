@@ -41,7 +41,9 @@ use windows_sys::Win32::Foundation::{
     ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND, ERROR_SUCCESS, FILETIME,
     FreeLibrary, GetLastError, HMODULE, INVALID_HANDLE_VALUE, SYSTEMTIME,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Time::FileTimeToSystemTime;
 
@@ -441,23 +443,31 @@ unsafe fn query_device_string_property(
     else {
         return Ok(None);
     };
-    if property_type != expected_type || buffer.len() % size_of::<u16>() != 0 {
+    if property_type != expected_type {
         return Err(GpuSampleError::InvalidData { context });
     }
-    let units = unsafe {
-        std::slice::from_raw_parts(
-            buffer.as_ptr().cast::<u16>(),
-            buffer.len() / size_of::<u16>(),
-        )
-    };
+    decode_device_string(&buffer, context)
+}
+
+fn decode_device_string(
+    bytes: &[u8],
+    context: &'static str,
+) -> Result<Option<String>, GpuSampleError> {
+    // SetupAPI returns a byte buffer. Decode UTF-16LE without assuming its allocation (or a
+    // subslice) has u16 alignment, and continue requiring a complete, terminated string.
+    let (units, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(GpuSampleError::InvalidData { context });
+    }
     let length = units
         .iter()
-        .position(|unit| *unit == 0)
+        .position(|unit| *unit == [0, 0])
         .ok_or(GpuSampleError::InvalidData { context })?;
     if length == 0 {
         return Ok(None);
     }
-    String::from_utf16(&units[..length])
+    char::decode_utf16(units[..length].iter().copied().map(u16::from_le_bytes))
+        .collect::<Result<String, _>>()
         .map(Some)
         .map_err(|_| GpuSampleError::InvalidData { context })
 }
@@ -643,9 +653,12 @@ struct DynamicLibrary(HMODULE);
 impl DynamicLibrary {
     fn load(name: &str) -> Result<Self, GpuSampleError> {
         let name = to_wide_null(name);
-        let module = unsafe { LoadLibraryW(name.as_ptr()) };
+        // D3D12 is an operating-system runtime. Restrict resolution to the system directory
+        // instead of accepting a namesake DLL beside this elevated application or in its CWD.
+        let module =
+            unsafe { LoadLibraryExW(name.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() {
-            Err(last_win32_error("LoadLibraryW for D3D12"))
+            Err(last_win32_error("LoadLibraryExW for system D3D12"))
         } else {
             Ok(Self(module))
         }
@@ -680,5 +693,31 @@ fn last_win32_error(context: &'static str) -> GpuSampleError {
         } else {
             code
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_string_decodes_unaligned_utf16_and_surrogate_pairs() {
+        #[repr(align(2))]
+        struct AlignedBytes([u8; 9]);
+        let storage = AlignedBytes([0xff, b'A', 0, 0x3d, 0xd8, 0x00, 0xde, 0, 0]);
+        let bytes = &storage.0[1..];
+        assert_eq!(bytes.as_ptr() as usize % 2, 1);
+        assert_eq!(
+            decode_device_string(bytes, "test").unwrap(),
+            Some("A😀".into())
+        );
+    }
+
+    #[test]
+    fn device_string_rejects_truncation_missing_terminator_and_invalid_utf16() {
+        for bytes in [b"A".as_slice(), &[b'A', 0][..], &[0x00, 0xd8, 0, 0][..]] {
+            assert!(decode_device_string(bytes, "test").is_err());
+        }
+        assert_eq!(decode_device_string(&[0, 0], "test").unwrap(), None);
     }
 }

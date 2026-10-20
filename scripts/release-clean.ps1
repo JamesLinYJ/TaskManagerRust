@@ -10,6 +10,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $previousRustFlags = $env:RUSTFLAGS
+$previousEncodedFlags = $env:CARGO_ENCODED_RUSTFLAGS
+$separator = [char]0x1f
 
 function Add-RemapPrefix {
     param(
@@ -33,6 +35,22 @@ function Add-RemapPrefix {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $rustflags = New-Object 'System.Collections.Generic.List[string]'
 
+if ($null -ne $previousEncodedFlags) {
+    foreach ($flag in $previousEncodedFlags.Split($separator)) {
+        if ($flag.Length -gt 0) {
+            $rustflags.Add($flag)
+        }
+    }
+} elseif (-not [string]::IsNullOrWhiteSpace($previousRustFlags)) {
+    # Match Cargo's whitespace-separated RUSTFLAGS semantics. The encoded variable takes
+    # precedence when present, and keeps each new path-remapping argument intact.
+    foreach ($flag in ($previousRustFlags -split '\s+')) {
+        if ($flag.Length -gt 0) {
+            $rustflags.Add($flag)
+        }
+    }
+}
+
 Add-RemapPrefix $rustflags $repoRoot "."
 Add-RemapPrefix $rustflags $env:USERPROFILE "C:\\Users\\builder"
 Add-RemapPrefix $rustflags $env:CARGO_HOME "C:\\.cargo"
@@ -55,15 +73,12 @@ if (Test-Path $rustSrc) {
     Add-RemapPrefix $rustflags $rustSrc "/rustc/src"
 }
 
-$existing = $env:RUSTFLAGS
-if ($existing) {
-    $rustflags.Insert(0, $existing)
-}
 if ($UseNightlyBuildStd) {
     $rustflags.Add("-Zunstable-options")
     $rustflags.Add("-Cpanic=immediate-abort")
 }
-$env:RUSTFLAGS = ($rustflags -join " ").Trim()
+$env:CARGO_ENCODED_RUSTFLAGS = $rustflags -join $separator
+Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
 
 Push-Location $repoRoot
 try {
@@ -86,6 +101,11 @@ try {
     }
 } finally {
     Pop-Location
+    if ($null -eq $previousEncodedFlags) {
+        Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
+    } else {
+        $env:CARGO_ENCODED_RUSTFLAGS = $previousEncodedFlags
+    }
     if ($null -eq $previousRustFlags) {
         Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
     } else {

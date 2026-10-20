@@ -109,6 +109,9 @@ jobs:
       - name: Run all tests
         run: cargo test --all-targets --locked
 
+      - name: Test build script failure handling
+        run: ./tests/build_scripts.ps1
+
       - name: Build release executable
         run: cargo build --release --locked
 

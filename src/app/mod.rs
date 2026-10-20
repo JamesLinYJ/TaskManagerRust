@@ -52,7 +52,7 @@ use windows_sys::Win32::UI::Controls::{
     TCN_SELCHANGE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DELETE, VK_RETURN,
 };
 use windows_sys::Win32::UI::Shell::{NIM_ADD, NIM_DELETE, ShellAboutW, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -71,10 +71,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TrackPopupMenuEx,
     TranslateAcceleratorW, TranslateMessage, WINDOWPLACEMENT, WM_CLOSE, WM_COMMAND, WM_CREATE,
     WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITDIALOG, WM_INITMENU,
-    WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN,
-    WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETICON, WM_SETREDRAW, WM_SIZE,
-    WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_DLGFRAME, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TILEDWINDOW, WS_VISIBLE,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_MENUSELECT, WM_MOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
+    WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NOTIFY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETICON,
+    WM_SETREDRAW, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_DLGFRAME, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_TILEDWINDOW, WS_VISIBLE,
 };
 
 use self::controllers::{
@@ -554,24 +555,32 @@ impl App {
                     break 1;
                 }
 
-                let page_hwnd = active_page_id(self.options.current_page)
+                let page_id = active_page_id(self.options.current_page);
+                let page_hwnd = page_id
                     .map(|page_id| self.pages[page_id.index()].hwnd())
                     .unwrap_or(null_mut());
 
-                let mut handled = !self.accelerator_table.is_null()
-                    && TranslateAcceleratorW(
-                        self.main_hwnd,
-                        self.accelerator_table,
-                        &raw const message,
-                    ) != 0;
-
-                if !handled && !page_hwnd.is_null() && !self.accelerator_table.is_null() {
-                    handled = TranslateAcceleratorW(
-                        page_hwnd,
-                        self.accelerator_table,
-                        &raw const message,
-                    ) != 0;
-                }
+                // Delete and Enter belong to the Applications list. Translating the complete
+                // table against the main dialog first consumes them even though that dialog
+                // does not handle their commands. Other controls must receive their own keys.
+                let task_list = if page_id == Some(PageId::Applications) && !page_hwnd.is_null() {
+                    GetDlgItem(page_hwnd, IDC_TASKLIST)
+                } else {
+                    null_mut()
+                };
+                let target = match accelerator_scope(
+                    message.message,
+                    message.wParam,
+                    !task_list.is_null() && message.hwnd == task_list,
+                ) {
+                    AcceleratorScope::Main => self.main_hwnd,
+                    AcceleratorScope::ApplicationsList => page_hwnd,
+                    AcceleratorScope::Control => null_mut(),
+                };
+                let handled = !target.is_null()
+                    && !self.accelerator_table.is_null()
+                    && TranslateAcceleratorW(target, self.accelerator_table, &raw const message)
+                        != 0;
 
                 if !handled && IsDialogMessageW(self.main_hwnd, &raw const message) == 0 {
                     TranslateMessage(&raw const message);
@@ -2534,6 +2543,31 @@ fn active_page_id(current_page: i32) -> Option<PageId> {
     PageId::from_persisted(current_page)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceleratorScope {
+    Main,
+    ApplicationsList,
+    Control,
+}
+
+fn accelerator_scope(
+    message: u32,
+    key: WPARAM,
+    applications_list_has_focus: bool,
+) -> AcceleratorScope {
+    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN)
+        && (key == usize::from(VK_DELETE) || key == usize::from(VK_RETURN))
+    {
+        if applications_list_has_focus {
+            AcceleratorScope::ApplicationsList
+        } else {
+            AcceleratorScope::Control
+        }
+    } else {
+        AcceleratorScope::Main
+    }
+}
+
 fn is_active_page(current_page: i32, page_id: PageId) -> bool {
     active_page_id(current_page) == Some(page_id)
 }
@@ -2758,9 +2792,43 @@ unsafe extern "system" fn main_window_proc(
 mod tests {
     use super::page_registry::PageId;
     use super::{
-        ShellExecuteFailure, active_page_id, active_page_uses_normal_minimum, clamped_window_size,
-        help_documentation_url, is_active_page, page_uses_normal_minimum, shell_execute_failure,
+        AcceleratorScope, ShellExecuteFailure, accelerator_scope, active_page_id,
+        active_page_uses_normal_minimum, clamped_window_size, help_documentation_url,
+        is_active_page, page_uses_normal_minimum, shell_execute_failure,
     };
+
+    #[test]
+    fn task_action_keys_reach_the_applications_list_only() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_RETURN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+
+        for key in [VK_DELETE, VK_RETURN] {
+            assert_eq!(
+                accelerator_scope(WM_KEYDOWN, usize::from(key), true),
+                AcceleratorScope::ApplicationsList,
+            );
+            // An edit, button, tab, or another page must retain its normal key processing.
+            assert_eq!(
+                accelerator_scope(WM_KEYDOWN, usize::from(key), false),
+                AcceleratorScope::Control,
+            );
+        }
+    }
+
+    #[test]
+    fn global_shortcuts_keep_main_dialog_routing_with_list_or_edit_focus() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F5, VK_TAB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+
+        for key in [VK_F5, VK_TAB, VK_ESCAPE, u16::from(b'F')] {
+            for list_has_focus in [true, false] {
+                assert_eq!(
+                    accelerator_scope(WM_KEYDOWN, usize::from(key), list_has_focus),
+                    AcceleratorScope::Main,
+                );
+            }
+        }
+    }
 
     #[test]
     fn help_uses_fixed_https_project_documentation() {

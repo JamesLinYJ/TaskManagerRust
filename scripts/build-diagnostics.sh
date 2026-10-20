@@ -34,7 +34,7 @@ hash_file="$profile_dir/taskmgr.exe.sha256"
 cargo_command="${CARGO:-cargo}"
 
 cd "$repo_root"
-"$cargo_command" build --profile diagnostics --target "$target"
+"$cargo_command" build --profile diagnostics --target "$target" --locked
 "$objcopy" --only-keep-debug "$executable" "$symbols"
 "$objcopy" --strip-debug "$executable"
 (
