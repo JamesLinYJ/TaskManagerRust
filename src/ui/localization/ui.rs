@@ -168,6 +168,14 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
             set_dialog_item_text(hwnd, IDC_MESSAGE_TITLE_LABEL, TextKey::MessageTitleLabel);
             set_dialog_item_text(hwnd, IDC_MESSAGE_BODY_LABEL, TextKey::MessageLabel);
         }
+        IDD_NEWTASK => {
+            set_window_text(hwnd, TextKey::NewTaskTitle);
+            set_dialog_item_text(hwnd, IDC_NEWTASK_PROMPT, TextKey::RunPrompt);
+            set_dialog_item_text(hwnd, IDC_NEWTASK_BROWSE, TextKey::NewTaskBrowse);
+            set_dialog_item_text(hwnd, IDC_NEWTASK_ADMIN, TextKey::NewTaskAdmin);
+            set_dialog_item_text(hwnd, IDOK, TextKey::Ok);
+            set_dialog_item_text(hwnd, IDCANCEL, TextKey::Cancel);
+        }
         IDD_DIAGNOSTICS => {
             set_window_text(hwnd, TextKey::DiagnosticLogsTitle);
             set_dialog_item_text(

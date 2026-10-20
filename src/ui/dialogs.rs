@@ -18,9 +18,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::UI::Controls::{LVS_OWNERDATA, LVS_REPORT, LVS_SINGLESEL};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_OWNERDRAW, CBS_DROPDOWNLIST,
-    CreateDialogIndirectParamW, DialogBoxIndirectParamW, ES_AUTOVSCROLL, ES_MULTILINE, SBS_VERT,
-    WS_BORDER, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME,
-    WS_VISIBLE, WS_VSCROLL,
+    CreateDialogIndirectParamW, DialogBoxIndirectParamW, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
+    ES_MULTILINE, SBS_VERT, WS_BORDER, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_POPUP, WS_SYSMENU,
+    WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::ui::resource_ids::*;
@@ -29,6 +29,7 @@ type DialogProc = Option<unsafe extern "system" fn(HWND, u32, usize, isize) -> i
 
 const DS_SETFONT: u32 = 0x40;
 const DS_MODALFRAME: u32 = 0x80;
+const DS_CENTER: u32 = 0x0800;
 const DS_3DLOOK: u32 = 0x0004;
 const DS_CONTROL: u32 = 0x0400;
 const WS_EX_NOPARENTNOTIFY: u32 = 0x0000_0004;
@@ -38,6 +39,7 @@ const BS_AUTOCHECKBOX_STYLE: u32 = BS_AUTOCHECKBOX as u32;
 const BS_GROUPBOX_STYLE: u32 = BS_GROUPBOX as u32;
 const BS_DEFPUSHBUTTON_STYLE: u32 = BS_DEFPUSHBUTTON as u32;
 const ES_MULTILINE_STYLE: u32 = ES_MULTILINE as u32;
+const ES_AUTOHSCROLL_STYLE: u32 = ES_AUTOHSCROLL as u32;
 const ES_AUTOVSCROLL_STYLE: u32 = ES_AUTOVSCROLL as u32;
 const SBS_VERT_STYLE: u32 = SBS_VERT as u32;
 const CBS_DROPDOWNLIST_STYLE: u32 = CBS_DROPDOWNLIST as u32;
@@ -1141,6 +1143,60 @@ fn build_message_dialog() -> DialogSpec<'static> {
     }
 }
 
+fn build_new_task_dialog() -> DialogSpec<'static> {
+    DialogSpec {
+        style: DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        ex_style: 0,
+        x: 20,
+        y: 20,
+        cx: 320,
+        cy: 128,
+        title: "Create New Task",
+        font_name: DIALOG_FONT_NAME,
+        font_size: DIALOG_FONT_SIZE,
+        controls: vec![
+            static_text(
+                "Type the name of a program, folder, document, or Internet resource, and Windows will open it for you.",
+                IDC_NEWTASK_PROMPT,
+                0,
+                8,
+                8,
+                304,
+                36,
+            ),
+            edit_text(IDC_NEWTASK_COMMAND, ES_AUTOHSCROLL_STYLE, 8, 48, 230, 14),
+            button(
+                "&Browse...",
+                IDC_NEWTASK_BROWSE,
+                WS_TABSTOP,
+                244,
+                48,
+                68,
+                14,
+            ),
+            button(
+                "Create this task with administrative privileges",
+                IDC_NEWTASK_ADMIN,
+                BS_AUTOCHECKBOX_STYLE | WS_TABSTOP,
+                8,
+                70,
+                304,
+                12,
+            ),
+            button(
+                "OK",
+                1,
+                BS_DEFPUSHBUTTON_STYLE | WS_TABSTOP,
+                192,
+                102,
+                56,
+                14,
+            ),
+            button("Cancel", 2, WS_TABSTOP, 254, 102, 56, 14),
+        ],
+    }
+}
+
 fn build_diagnostics_dialog() -> DialogSpec<'static> {
     DialogSpec {
         style: DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU,
@@ -1283,6 +1339,7 @@ fn dialog_spec(dialog_id: u16) -> Option<DialogSpec<'static>> {
         IDD_SERVICESPAGE => build_services_dialog(),
         IDD_MESSAGE => build_message_dialog(),
         IDD_DIAGNOSTICS => build_diagnostics_dialog(),
+        IDD_NEWTASK => build_new_task_dialog(),
         _ => return None,
     })
 }
@@ -1358,10 +1415,11 @@ pub fn dialog_box(
 mod tests {
     use super::{DialogTemplateBuilder, dialog_spec};
     use crate::ui::resource_ids::{
-        IDC_AFFINITY_GROUP_SELECTOR, IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_TASKLIST,
-        IDD_AFFINITY, IDD_CPUPAGE, IDD_DIAGNOSTICS, IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE,
-        IDD_NETPAGE, IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_SERVICESPAGE,
-        IDD_TASKPAGE, IDD_USERSPAGE,
+        IDC_AFFINITY_GROUP_SELECTOR, IDC_NEWTASK_ADMIN, IDC_NEWTASK_BROWSE, IDC_NEWTASK_COMMAND,
+        IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_TASKLIST, IDD_AFFINITY, IDD_CPUPAGE,
+        IDD_DIAGNOSTICS, IDD_GPUPAGE, IDD_MAINWND, IDD_MESSAGE, IDD_NETPAGE, IDD_NEWTASK,
+        IDD_PERFPAGE, IDD_PROCPAGE, IDD_SELECTPROCCOLS, IDD_SERVICESPAGE, IDD_TASKPAGE,
+        IDD_USERSPAGE,
     };
     use windows_sys::Win32::UI::Controls::LVS_OWNERDATA;
 
@@ -1381,6 +1439,7 @@ mod tests {
             IDD_SERVICESPAGE,
             IDD_MESSAGE,
             IDD_DIAGNOSTICS,
+            IDD_NEWTASK,
         ] {
             let template = DialogTemplateBuilder::new().build(dialog_spec(dialog_id).unwrap());
             assert!(!template.is_empty());
@@ -1409,6 +1468,30 @@ mod tests {
                 .unwrap();
             assert_eq!((control.style & LVS_OWNERDATA) != 0, expected);
         }
+    }
+
+    #[test]
+    fn new_task_dialog_collects_a_command_and_admin_checkbox() {
+        let spec = dialog_spec(IDD_NEWTASK).unwrap();
+        let admin = spec
+            .controls
+            .iter()
+            .find(|control| control.id == IDC_NEWTASK_ADMIN as u16)
+            .unwrap();
+        let command = spec
+            .controls
+            .iter()
+            .find(|control| control.id == IDC_NEWTASK_COMMAND as u16)
+            .unwrap();
+        assert_ne!(admin.style & super::BS_AUTOCHECKBOX_STYLE, 0);
+        assert_eq!(command.class_name, "Edit");
+        assert!(
+            spec.controls
+                .iter()
+                .any(|control| control.id == IDC_NEWTASK_BROWSE as u16)
+        );
+        assert!(spec.controls.iter().any(|control| control.id == 1));
+        assert!(spec.controls.iter().any(|control| control.id == 2));
     }
 
     #[test]

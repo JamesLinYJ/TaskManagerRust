@@ -14,6 +14,7 @@
 
 pub(crate) mod controllers;
 mod diagnostics_dialog;
+mod new_task;
 pub(crate) mod page_host;
 pub(crate) mod page_registry;
 mod single_instance;
@@ -23,10 +24,7 @@ use std::mem::{size_of, zeroed};
 use std::ptr::{NonNull, null, null_mut};
 use std::sync::OnceLock;
 
-use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-};
-use windows::Win32::UI::Shell::{IShellDispatch, Shell};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_TIMEOUT,
     GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, POINT, RECT, SetLastError, TRUE, WAIT_TIMEOUT,
@@ -1131,6 +1129,8 @@ impl App {
         }
 
         sanitize_task_manager_menu(menu, self.stats.processor_count);
+        // New Task stays enabled on every page unless the shell Run policy removed the item.
+        self.enable_menu_item(menu, IDM_RUN, true);
 
         // 安全性: all calls mutate only the menu handle retrieved from this main window.
         unsafe {
@@ -2053,14 +2053,6 @@ impl App {
         }
     }
 
-    fn show_run_dialog(&self) -> Result<(), i32> {
-        let _apartment = ComApartment::initialize()?;
-        let shell: IShellDispatch = unsafe { CoCreateInstance(&Shell, None, CLSCTX_ALL) }
-            .map_err(|error| error.code().0)?;
-        // IShellDispatch::FileRun is the documented Shell automation API for the system dialog.
-        unsafe { shell.FileRun() }.map_err(|error| error.code().0)
-    }
-
     fn show_hresult_failure(&self, title: &str, error: i32) {
         let title = to_wide_null(title);
         let body = to_wide_null(&format!("HRESULT: 0x{:08X}", error as u32));
@@ -2308,9 +2300,14 @@ impl App {
                     }
                 }
                 IDM_RUN => {
-                    if let Err(error) = self.show_run_dialog() {
-                        record_hresult_error("system Run dialog", error);
-                        self.show_hresult_failure(text(TextKey::RunTitle), error);
+                    if let Err(error) = new_task::show(self.hinstance, hwnd) {
+                        record_win32_error("new task dialog", error);
+                        let title = to_wide_null(text(TextKey::NewTaskTitle));
+                        let message = to_wide_null(&format!(
+                            "{} ({error:#010X})",
+                            text(TextKey::NewTaskFailed)
+                        ));
+                        MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONSTOP);
                     }
                 }
                 IDM_HELP => {
