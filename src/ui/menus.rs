@@ -407,6 +407,22 @@ mod tests {
     }
 
     #[test]
+    fn file_menu_new_task_is_enabled() {
+        let menu = build_file_menu().expect("file menu should build");
+        unsafe {
+            assert_eq!(GetMenuItemID(menu.as_raw(), 0), u32::from(IDM_RUN));
+            let mut info = zeroed::<MENUITEMINFOW>();
+            info.cbSize = size_of::<MENUITEMINFOW>() as u32;
+            info.fMask = windows_sys::Win32::UI::WindowsAndMessaging::MIIM_STATE;
+            assert_ne!(GetMenuItemInfoW(menu.as_raw(), 0, 1, &mut info), 0);
+            assert_eq!(
+                info.fState & windows_sys::Win32::UI::WindowsAndMessaging::MFS_GRAYED,
+                0
+            );
+        }
+    }
+
+    #[test]
     fn diagnostics_is_between_help_topics_and_the_about_separator() {
         let menu = build_common_help_menu().expect("help menu should build");
         unsafe {
