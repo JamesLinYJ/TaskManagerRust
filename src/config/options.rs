@@ -388,6 +388,8 @@ impl Options {
     }
 
     pub fn always_on_top(&self) -> bool {
+        // The stored flag remains in the registry layout. View → Always on Top is session-only
+        // and does not write it.
         self.flags & FLAG_ALWAYS_ON_TOP != 0
     }
 
