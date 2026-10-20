@@ -363,4 +363,13 @@ pub enum TextKey {
     DisconnectStatusHelp,
     LogoffStatusHelp,
     SendMessageStatusHelp,
+    DiskActivityHistory,
+    DiskUsage,
+    DiskRead,
+    DiskWrite,
+    DiskRateBytes,
+    DiskRateKilobytes,
+    DiskRateMegabytes,
+    DiskRateGigabytes,
+    DiskRateTerabytes,
 }

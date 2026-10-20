@@ -312,6 +312,7 @@ pub fn draw_history_series<H: HistoryAccess + ?Sized>(
             ChartColor::Green => rgb(0, 255, 0),
             ChartColor::Yellow => rgb(255, 255, 0),
             ChartColor::Red => rgb(255, 0, 0),
+            ChartColor::Cyan => rgb(0, 200, 255),
             ChartColor::Grid => rgb(0, 128, 64),
         };
 

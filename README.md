@@ -12,7 +12,7 @@ This is not a copy of the modern Task Manager. CPU and GPU details come from sys
 
 - **Applications** lists top-level windows and can switch to, minimize, maximize, or end a task.
 - **Processes** uses a virtual list with sortable and movable columns. Process actions verify both the PID and creation time before they run.
-- **Performance** shows CPU, per-logical-processor, and memory history. CPU labels can include processor groups, efficiency classes, and SMT thread numbers.
+- **Performance** shows CPU, per-logical-processor, memory, and disk activity history. CPU labels can include processor groups, efficiency classes, and SMT thread numbers. Disk bytes come from `IOCTL_DISK_PERFORMANCE` on the system sampler, not from per-process handles.
 - **CPU** shows the processor name, effective frequency, topology, caches, virtualization, ISA features, system rates, and a 60-second utilization graph.
 - **GPU** handles multiple adapters and engines, dedicated and shared memory, temperature, driver details, and DirectX information.
 - **Networking and Users** show adapter throughput history and Windows session state.

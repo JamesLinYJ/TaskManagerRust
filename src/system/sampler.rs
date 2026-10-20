@@ -8,7 +8,7 @@
 //   作者:       OpenAI Codex
 // --------------------------------------------------------------------------
 
-//! Coherent system-wide CPU and memory sampling on one persistent worker.
+//! Coherent system-wide CPU, memory, and disk sampling on one persistent worker.
 //!
 //! The collector owns cumulative CPU baselines. A candidate is committed only after both the
 //! processor and `PERFORMANCE_INFORMATION` queries succeed, so consumers never combine values
@@ -31,6 +31,7 @@ use crate::infrastructure::worker::{
 };
 use crate::system::cpu_sampler::{ProcessorPerformance, query_processor_performance};
 use crate::system::cpu_topology::{ProcessorTopology, query_processor_topology};
+use crate::system::disk::{DiskActivityUpdate, DiskCollector};
 use crate::ui::resource_ids::PWM_SYSTEM_WORKER_COMPLETE;
 
 const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001_u32 as i32;
@@ -84,6 +85,7 @@ pub(crate) struct SystemSample {
     pub(crate) handle_count: u32,
     pub(crate) thread_count: u32,
     pub(crate) process_count: u32,
+    pub(crate) disk: DiskActivityUpdate,
 }
 
 pub(crate) type SystemSampleResult = Result<SystemSample, SystemSampleError>;
@@ -160,6 +162,7 @@ struct SystemCollector {
     previous_cpu_times: Vec<CpuTimes>,
     previous_timestamp_ms: Option<u64>,
     processor_topology: Option<Arc<ProcessorTopology>>,
+    disk: DiskCollector,
 }
 
 impl SystemCollector {
@@ -170,6 +173,7 @@ impl SystemCollector {
             previous_cpu_times: Vec::with_capacity(expected_processor_count),
             previous_timestamp_ms: None,
             processor_topology: None,
+            disk: DiskCollector::new(),
         }
     }
 
@@ -273,6 +277,7 @@ impl SystemCollector {
             .cloned()
             .unwrap_or_else(|| Arc::new(query_processor_topology(current_cpu_times.len())));
         let timestamp_ms = unsafe { GetTickCount64() };
+        let disk = self.disk.sample();
         let elapsed_ms = self
             .previous_timestamp_ms
             .and_then(|previous| timestamp_ms.checked_sub(previous));
@@ -311,6 +316,7 @@ impl SystemCollector {
             handle_count: performance.HandleCount,
             thread_count: performance.ThreadCount,
             process_count: performance.ProcessCount,
+            disk,
         };
 
         self.expected_processor_count = current_cpu_times.len();
@@ -327,6 +333,7 @@ impl SystemCollector {
             &[
                 Field::unsigned("processor_count", sample.processor_count as u64),
                 Field::boolean("cpu_delta_valid", sample.cpu_delta_valid),
+                Field::text("disk", disk_update_name(sample.disk)),
             ],
         );
         Ok(sample)
@@ -335,6 +342,14 @@ impl SystemCollector {
 
 fn duration_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn disk_update_name(update: DiskActivityUpdate) -> &'static str {
+    match update {
+        DiskActivityUpdate::Failed => "failed",
+        DiskActivityUpdate::NoRate => "no_rate",
+        DiskActivityUpdate::Rate(_) => "rate",
+    }
 }
 
 struct CpuDelta {

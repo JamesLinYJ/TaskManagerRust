@@ -51,6 +51,7 @@ use crate::infrastructure::native::{
 use crate::system::cpu_topology::{
     ProcessorTopology, format_compact_cpu_graph_label, format_cpu_graph_label,
 };
+use crate::system::disk::{ByteRateScale, DiskActivityUpdate, scale_byte_rate};
 use crate::system::sampler::SystemSample;
 use crate::ui::assets::{
     METER_LIT_GREEN_BITMAP_RESOURCE, METER_LIT_RED_BITMAP_RESOURCE, METER_UNLIT_BITMAP_RESOURCE,
@@ -61,12 +62,12 @@ use crate::ui::drawing::{HistoryBuffer, fill_black, rgb};
 use crate::ui::localization::{TextKey, text};
 use crate::ui::resource_ids::{
     IDC_AVAIL_PHYSICAL, IDC_COMMIT_LIMIT, IDC_COMMIT_PEAK, IDC_COMMIT_TOTAL, IDC_CPUGRAPH,
-    IDC_CPUMETER, IDC_CPUUSAGEFRAME, IDC_FILE_CACHE, IDC_KERNEL_NONPAGED, IDC_KERNEL_PAGED,
-    IDC_KERNEL_TOTAL, IDC_MEMBARFRAME, IDC_MEMFRAME, IDC_MEMGRAPH, IDC_MEMMETER, IDC_STATIC1,
-    IDC_STATIC2, IDC_STATIC3, IDC_STATIC4, IDC_STATIC5, IDC_STATIC6, IDC_STATIC8, IDC_STATIC9,
-    IDC_STATIC10, IDC_STATIC11, IDC_STATIC12, IDC_STATIC13, IDC_STATIC14, IDC_STATIC15,
-    IDC_STATIC16, IDC_STATIC17, IDC_TOTAL_HANDLES, IDC_TOTAL_PHYSICAL, IDC_TOTAL_PROCESSES,
-    IDC_TOTAL_THREADS, TEMPLATE_CPU_GRAPH_COUNT,
+    IDC_CPUMETER, IDC_CPUUSAGEFRAME, IDC_DISKBARFRAME, IDC_DISKFRAME, IDC_DISKGRAPH, IDC_DISKMETER,
+    IDC_FILE_CACHE, IDC_KERNEL_NONPAGED, IDC_KERNEL_PAGED, IDC_KERNEL_TOTAL, IDC_MEMBARFRAME,
+    IDC_MEMFRAME, IDC_MEMGRAPH, IDC_MEMMETER, IDC_STATIC1, IDC_STATIC2, IDC_STATIC3, IDC_STATIC4,
+    IDC_STATIC5, IDC_STATIC6, IDC_STATIC8, IDC_STATIC9, IDC_STATIC10, IDC_STATIC11, IDC_STATIC12,
+    IDC_STATIC13, IDC_STATIC14, IDC_STATIC15, IDC_STATIC16, IDC_STATIC17, IDC_TOTAL_HANDLES,
+    IDC_TOTAL_PHYSICAL, IDC_TOTAL_PROCESSES, IDC_TOTAL_THREADS, TEMPLATE_CPU_GRAPH_COUNT,
 };
 
 const STRIP_HEIGHT: i32 = 75;
@@ -114,6 +115,12 @@ const PERF_TEXT_CONTROLS: [i32; 28] = [
 ];
 
 const PERF_LAYOUT_CONTROLS: [i32; 28] = PERF_TEXT_CONTROLS;
+const DISK_CONTROLS: [i32; 4] = [
+    IDC_DISKBARFRAME,
+    IDC_DISKFRAME,
+    IDC_DISKGRAPH,
+    IDC_DISKMETER,
+];
 #[derive(Default)]
 pub struct PerformancePageState {
     // 页面级缓存包含采样结果、图表历史和绘制时会复用的 GDI 资源句柄。
@@ -147,6 +154,14 @@ pub struct PerformancePageState {
     cpu_graph_compact_labels: Vec<Vec<u16>>,
     total_cpu_label: Vec<u16>,
     mem_history: HistoryBuffer,
+    disk_history: HistoryBuffer,
+    disk_read_bps: u64,
+    disk_write_bps: u64,
+    disk_active_percent: u8,
+    disk_known: bool,
+    disk_label: Vec<u16>,
+    disk_compact_label: Vec<u16>,
+    disk_graph_hwnd: HWND,
     averaged_cpu_history: HistoryBuffer,
     averaged_kernel_history: HistoryBuffer,
     gdi_history_points: Vec<POINT>,
@@ -173,6 +188,7 @@ impl PerformancePageState {
         self.hinstance = hinstance;
         self.total_cpu_label = to_wide_null(text(TextKey::TotalCpu));
         self.ensure_history_capacity(processor_count.max(1));
+        self.set_disk_unavailable_label();
         if let Err(error) = self.load_meter_bitmaps() {
             // The vector meter is a complete renderer, not a partial bitmap approximation.
             // Keep the resource set empty and make the selected renderer explicit in diagnostics.
@@ -246,6 +262,13 @@ impl PerformancePageState {
 
         self.cpu_graph_hwnds = controls;
         self.sync_cpu_graph_accessible_text(hwnd_page);
+        let disk_graph = unsafe { GetDlgItem(hwnd_page, IDC_DISKGRAPH) };
+        if disk_graph.is_null() {
+            return Err(ERROR_INVALID_WINDOW_HANDLE);
+        }
+        unsafe { SendMessageW(disk_graph, WM_SETFONT, numeric_font as usize, 0) };
+        self.disk_graph_hwnd = disk_graph;
+        self.push_disk_graph_text(hwnd_page);
         Ok(())
     }
 
@@ -266,13 +289,16 @@ impl PerformancePageState {
                 || self.no_title != options.no_title();
             let graph_style_changed = self.show_kernel_times != options.kernel_times();
 
-            self.ensure_history_capacity(processor_count);
+            let history_reset = self.ensure_history_capacity(processor_count);
             self.cpu_history_mode = options.cpu_history_mode;
             self.show_kernel_times = options.kernel_times();
             self.no_title = options.no_title();
 
             if processor_count_changed || history_mode_changed {
                 self.sync_cpu_graph_accessible_text(hwnd_page);
+            }
+            if history_reset {
+                self.push_disk_graph_text(hwnd_page);
             }
 
             if !layout_changed && !graph_style_changed {
@@ -303,7 +329,7 @@ impl PerformancePageState {
         {
             return Err(ERROR_INVALID_DATA);
         }
-        self.ensure_history_capacity(sample.processor_count);
+        let history_reset = self.ensure_history_capacity(sample.processor_count);
         if self.processor_topology.as_deref() != Some(sample.processor_topology.as_ref()) {
             self.processor_topology = Some(Arc::clone(&sample.processor_topology));
             self.rebuild_cpu_graph_labels();
@@ -354,6 +380,24 @@ impl PerformancePageState {
             .min(100) as u8
         };
         self.mem_history.push(mem_percent);
+        let disk_label_changed = apply_disk_activity(
+            &mut self.disk_history,
+            &mut self.disk_known,
+            &mut self.disk_read_bps,
+            &mut self.disk_write_bps,
+            &mut self.disk_active_percent,
+            sample.disk,
+        );
+        if disk_label_changed {
+            if self.disk_known {
+                self.rebuild_disk_rate_label();
+            } else {
+                self.set_disk_unavailable_label();
+            }
+        }
+        if history_reset || disk_label_changed {
+            self.push_disk_graph_text(hwnd_page);
+        }
         self.scroll_offset = (self.scroll_offset + 2) % GRAPH_GRID;
 
         if !self.no_title {
@@ -371,8 +415,10 @@ impl PerformancePageState {
 
     pub fn is_graph_control(&self, control_id: i32) -> bool {
         // owner-draw 消息先通过这里判断是不是性能页图表类控件。
-        matches!(control_id, IDC_MEMGRAPH | IDC_MEMMETER | IDC_CPUMETER)
-            || self.cpu_graph_pane_index(control_id).is_some()
+        matches!(
+            control_id,
+            IDC_MEMGRAPH | IDC_MEMMETER | IDC_CPUMETER | IDC_DISKGRAPH | IDC_DISKMETER
+        ) || self.cpu_graph_pane_index(control_id).is_some()
     }
 
     pub fn cpu_graph_pane_index(&self, control_id: i32) -> Option<usize> {
@@ -393,7 +439,13 @@ impl PerformancePageState {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 图表刷新只失效图表控件本身，不整页重绘。
-            for control_id in [IDC_CPUMETER, IDC_MEMMETER, IDC_MEMGRAPH] {
+            for control_id in [
+                IDC_CPUMETER,
+                IDC_MEMMETER,
+                IDC_MEMGRAPH,
+                IDC_DISKMETER,
+                IDC_DISKGRAPH,
+            ] {
                 let control = GetDlgItem(hwnd_page, control_id);
                 if !control.is_null() {
                     InvalidateRect(control, null(), 0);
@@ -717,6 +769,35 @@ impl PerformancePageState {
         frame.end()
     }
 
+    fn draw_disk_graph_gpu(&self, hdc: HDC, rect: RECT) -> bool {
+        let Some(frame) = self.chart_renderer.begin_frame(hdc, rect) else {
+            return false;
+        };
+
+        let target_rect = frame.bounds();
+        let width = (target_rect.right - target_rect.left).max(1);
+        frame.clear_black();
+        draw_grid_width_gpu(&frame, &target_rect, width, self.scroll_offset);
+        let scale = ((width - 1) / HIST_SIZE as i32).max(0);
+        let scale = if scale == 0 { 2 } else { scale } as usize;
+        draw_history_series_gpu(
+            &frame,
+            &target_rect,
+            HistoryPlotLayout {
+                graph_height: (target_rect.bottom - target_rect.top - 1).max(1),
+                width,
+                scale,
+            },
+            HistorySeries {
+                history: &self.disk_history,
+                color: ChartColor::Cyan,
+                stop_on_zero: false,
+            },
+        );
+
+        frame.end()
+    }
+
     pub fn draw_cpu_meter(&self, hdc: HDC, rect: RECT) {
         // CPU 仪表优先复用 LED 条形位图，不可用时再退回纯 GDI 绘制。
         if self.draw_strip_meter(
@@ -767,6 +848,110 @@ impl PerformancePageState {
             0,
             rgb(255, 255, 0),
             rgb(255, 255, 0),
+        );
+    }
+
+    pub fn draw_disk_graph(&mut self, hdc: HDC, rect: RECT) {
+        // 安全性: the caller is the UI thread and `hdc` is the owner-draw DC for this control.
+        unsafe {
+            if self.draw_disk_graph_gpu(hdc, rect) {
+                draw_graph_label(
+                    self.disk_graph_hwnd,
+                    hdc,
+                    &rect,
+                    &self.disk_label,
+                    &self.disk_compact_label,
+                );
+                return;
+            }
+
+            let width = (rect.right - rect.left).max(1);
+            let height = (rect.bottom - rect.top).max(1);
+            let use_backbuffer = !self.graph_dc.is_null()
+                && self.graph_bitmap_width >= width
+                && self.graph_bitmap_height >= height;
+            let target_hdc = if use_backbuffer { self.graph_dc } else { hdc };
+            let target_rect = if use_backbuffer {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                }
+            } else {
+                rect
+            };
+
+            fill_black(target_hdc, &target_rect);
+            draw_grid_width(target_hdc, &target_rect, width, self.scroll_offset);
+            let scale = ((width - 1) / HIST_SIZE as i32).max(0);
+            let scale = if scale == 0 { 2 } else { scale } as usize;
+            draw_history_series(
+                target_hdc,
+                &target_rect,
+                HistoryPlotLayout {
+                    graph_height: (target_rect.bottom - target_rect.top - 1).max(1),
+                    width,
+                    scale,
+                },
+                HistorySeries {
+                    history: &self.disk_history,
+                    color: ChartColor::Cyan,
+                    stop_on_zero: false,
+                },
+                &mut self.gdi_history_points,
+            );
+            let label_rect = if use_backbuffer {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                }
+            } else {
+                rect
+            };
+            draw_graph_label(
+                self.disk_graph_hwnd,
+                target_hdc,
+                &label_rect,
+                &self.disk_label,
+                &self.disk_compact_label,
+            );
+
+            if use_backbuffer {
+                BitBlt(
+                    hdc,
+                    rect.left,
+                    rect.top,
+                    width,
+                    height,
+                    self.graph_dc,
+                    0,
+                    0,
+                    SRCCOPY,
+                );
+            }
+        }
+    }
+
+    pub fn draw_disk_meter(&self, hdc: HDC, rect: RECT) {
+        let (label, percent) = if self.disk_known {
+            (
+                format!("{}%", self.disk_active_percent),
+                self.disk_active_percent,
+            )
+        } else {
+            (text(TextKey::NotAvailable).to_string(), 0)
+        };
+        draw_meter(
+            hdc,
+            rect,
+            &label,
+            percent,
+            0,
+            rgb(0, 200, 255),
+            rgb(0, 200, 255),
         );
     }
 
@@ -825,7 +1010,7 @@ impl PerformancePageState {
             let layout =
                 compute_perf_layout(parent_rect, anchors, spacing, pane_count, self.no_title);
 
-            let defer_hint = (PERF_LAYOUT_CONTROLS.len() + self.cpu_graph_slot_count() + 6) as i32;
+            let defer_hint = (PERF_LAYOUT_CONTROLS.len() + self.cpu_graph_slot_count() + 10) as i32;
             let mut hdwp: HDWP = BeginDeferWindowPos(defer_hint);
             if hdwp.is_null() {
                 return;
@@ -925,6 +1110,47 @@ impl PerformancePageState {
                     layout.mem_graph_rect.bottom - layout.mem_graph_rect.top,
                     resize_flags,
                 );
+
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    GetDlgItem(hwnd_page, IDC_DISKBARFRAME),
+                    null_mut(),
+                    layout.disk_bar_frame_rect.left,
+                    layout.disk_bar_frame_rect.top,
+                    layout.disk_bar_frame_rect.right - layout.disk_bar_frame_rect.left,
+                    layout.disk_bar_frame_rect.bottom - layout.disk_bar_frame_rect.top,
+                    resize_flags,
+                );
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    GetDlgItem(hwnd_page, IDC_DISKMETER),
+                    null_mut(),
+                    layout.disk_meter_rect.left,
+                    layout.disk_meter_rect.top,
+                    layout.disk_meter_rect.right - layout.disk_meter_rect.left,
+                    layout.disk_meter_rect.bottom - layout.disk_meter_rect.top,
+                    resize_flags,
+                );
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    GetDlgItem(hwnd_page, IDC_DISKFRAME),
+                    null_mut(),
+                    layout.disk_frame_rect.left,
+                    layout.disk_frame_rect.top,
+                    layout.disk_frame_rect.right - layout.disk_frame_rect.left,
+                    layout.disk_frame_rect.bottom - layout.disk_frame_rect.top,
+                    resize_flags,
+                );
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    GetDlgItem(hwnd_page, IDC_DISKGRAPH),
+                    null_mut(),
+                    layout.disk_graph_rect.left,
+                    layout.disk_graph_rect.top,
+                    layout.disk_graph_rect.right - layout.disk_graph_rect.left,
+                    layout.disk_graph_rect.bottom - layout.disk_graph_rect.top,
+                    resize_flags,
+                );
             }
 
             for (pane_index, pane_rect) in layout.cpu_pane_rects.iter().enumerate() {
@@ -976,16 +1202,18 @@ impl PerformancePageState {
             self.destroy_meter_bitmaps();
         }
         self.cpu_graph_hwnds.clear();
+        self.disk_graph_hwnd = null_mut();
     }
 
-    fn ensure_history_capacity(&mut self, processor_count: usize) {
+    fn ensure_history_capacity(&mut self, processor_count: usize) -> bool {
         // 核心数变化时，所有按 CPU 维度分片的历史数组都需要一起重建，
         // 否则“每核图”和“汇总图”会看到不一致的采样长度。
         if self.processor_count == processor_count
             && self.cpu_history.len() == processor_count
             && self.mem_history.len() == HIST_SIZE
+            && self.disk_history.len() == HIST_SIZE
         {
-            return;
+            return false;
         }
 
         self.processor_count = processor_count;
@@ -999,7 +1227,14 @@ impl PerformancePageState {
         self.averaged_cpu_history = HistoryBuffer::zeroed(HIST_SIZE);
         self.averaged_kernel_history = HistoryBuffer::zeroed(HIST_SIZE);
         self.mem_history = HistoryBuffer::zeroed(HIST_SIZE);
+        self.disk_history = HistoryBuffer::zeroed(HIST_SIZE);
+        self.disk_known = false;
+        self.disk_read_bps = 0;
+        self.disk_write_bps = 0;
+        self.disk_active_percent = 0;
+        self.set_disk_unavailable_label();
         self.rebuild_cpu_graph_labels();
+        true
     }
 
     fn rebuild_cpu_graph_labels(&mut self) {
@@ -1446,7 +1681,16 @@ impl PerformancePageState {
                 }
             }
 
-            for control_id in [IDC_MEMGRAPH, IDC_MEMFRAME, IDC_MEMBARFRAME, IDC_MEMMETER] {
+            for control_id in [
+                IDC_MEMGRAPH,
+                IDC_MEMFRAME,
+                IDC_MEMBARFRAME,
+                IDC_MEMMETER,
+                IDC_DISKGRAPH,
+                IDC_DISKFRAME,
+                IDC_DISKBARFRAME,
+                IDC_DISKMETER,
+            ] {
                 let control = GetDlgItem(hwnd_page, control_id);
                 if !control.is_null() {
                     ShowWindow(control, detail_state);
@@ -1481,6 +1725,9 @@ impl PerformancePageState {
                 for control_id in [IDC_MEMBARFRAME, IDC_MEMMETER, IDC_MEMFRAME, IDC_MEMGRAPH] {
                     push_unique_window(&mut windows, GetDlgItem(hwnd_page, control_id));
                 }
+                for control_id in DISK_CONTROLS {
+                    push_unique_window(&mut windows, GetDlgItem(hwnd_page, control_id));
+                }
             }
         }
 
@@ -1489,6 +1736,36 @@ impl PerformancePageState {
         }
 
         windows
+    }
+
+    fn set_disk_unavailable_label(&mut self) {
+        let wide = to_wide_null(text(TextKey::NotAvailable));
+        self.disk_compact_label.clone_from(&wide);
+        self.disk_label = wide;
+    }
+
+    fn rebuild_disk_rate_label(&mut self) {
+        let read = format_byte_rate(self.disk_read_bps);
+        let write = format_byte_rate(self.disk_write_bps);
+        let total = self.disk_read_bps.saturating_add(self.disk_write_bps);
+        self.disk_label = to_wide_null(&format!(
+            "{} {read}  {} {write}",
+            text(TextKey::DiskRead),
+            text(TextKey::DiskWrite),
+        ));
+        self.disk_compact_label = to_wide_null(&format_byte_rate(total));
+    }
+
+    fn push_disk_graph_text(&self, hwnd_page: HWND) {
+        let control = if self.disk_graph_hwnd.is_null() {
+            unsafe { GetDlgItem(hwnd_page, IDC_DISKGRAPH) }
+        } else {
+            self.disk_graph_hwnd
+        };
+        if control.is_null() || self.disk_label.is_empty() {
+            return;
+        }
+        unsafe { SetWindowTextW(control, self.disk_label.as_ptr()) };
     }
 }
 
@@ -1568,5 +1845,133 @@ mod tests {
             .unwrap();
         assert_eq!(page.cpu_usage, 0);
         assert_eq!(page.kernel_usage, 0);
+    }
+}
+
+fn apply_disk_activity(
+    history: &mut HistoryBuffer,
+    known: &mut bool,
+    read_bps: &mut u64,
+    write_bps: &mut u64,
+    active_percent: &mut u8,
+    update: DiskActivityUpdate,
+) -> bool {
+    match update {
+        DiskActivityUpdate::Failed => {
+            let changed = *known;
+            *known = false;
+            changed
+        }
+        DiskActivityUpdate::NoRate => false,
+        DiskActivityUpdate::Rate(rate) => {
+            history.push(rate.active_percent);
+            let changed = !*known
+                || *read_bps != rate.read_bytes_per_second
+                || *write_bps != rate.write_bytes_per_second
+                || *active_percent != rate.active_percent;
+            *known = true;
+            *read_bps = rate.read_bytes_per_second;
+            *write_bps = rate.write_bytes_per_second;
+            *active_percent = rate.active_percent;
+            changed
+        }
+    }
+}
+
+fn format_byte_rate(bytes_per_second: u64) -> String {
+    let scaled = scale_byte_rate(bytes_per_second);
+    let unit = text(match scaled.scale {
+        ByteRateScale::Bytes => TextKey::DiskRateBytes,
+        ByteRateScale::Kilobytes => TextKey::DiskRateKilobytes,
+        ByteRateScale::Megabytes => TextKey::DiskRateMegabytes,
+        ByteRateScale::Gigabytes => TextKey::DiskRateGigabytes,
+        ByteRateScale::Terabytes => TextKey::DiskRateTerabytes,
+    });
+    match scaled.tenth {
+        Some(tenth) => format!("{}.{} {unit}", scaled.whole, tenth),
+        None => format!("{} {unit}", scaled.whole),
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::{apply_disk_activity, format_byte_rate};
+    use crate::system::disk::{DiskActivityUpdate, DiskRate};
+    use crate::ui::drawing::HistoryBuffer;
+
+    #[test]
+    fn disk_history_ignores_a_failed_sample_and_keeps_the_previous_point() {
+        let mut history = HistoryBuffer::zeroed(4);
+        let mut known = false;
+        let mut read_bps = 0;
+        let mut write_bps = 0;
+        let mut active = 0;
+        assert!(!apply_disk_activity(
+            &mut history,
+            &mut known,
+            &mut read_bps,
+            &mut write_bps,
+            &mut active,
+            DiskActivityUpdate::NoRate,
+        ));
+        assert_eq!(history.newest_value(), 0);
+
+        assert!(apply_disk_activity(
+            &mut history,
+            &mut known,
+            &mut read_bps,
+            &mut write_bps,
+            &mut active,
+            DiskActivityUpdate::Rate(DiskRate {
+                read_bytes_per_second: 2048,
+                write_bytes_per_second: 1024,
+                active_percent: 40,
+            }),
+        ));
+        assert!(known);
+        assert_eq!(history.newest_value(), 40);
+
+        assert!(apply_disk_activity(
+            &mut history,
+            &mut known,
+            &mut read_bps,
+            &mut write_bps,
+            &mut active,
+            DiskActivityUpdate::Failed,
+        ));
+        assert!(!known);
+        assert_eq!(history.newest_value(), 40);
+        assert_eq!(read_bps, 2048);
+    }
+
+    #[test]
+    fn repeated_disk_rate_still_advances_history_without_rewriting_the_label_state() {
+        let mut history = HistoryBuffer::zeroed(4);
+        let mut known = true;
+        let mut read_bps = 10;
+        let mut write_bps = 0;
+        let mut active = 5;
+        let rate = DiskActivityUpdate::Rate(DiskRate {
+            read_bytes_per_second: 10,
+            write_bytes_per_second: 0,
+            active_percent: 5,
+        });
+        assert!(!apply_disk_activity(
+            &mut history,
+            &mut known,
+            &mut read_bps,
+            &mut write_bps,
+            &mut active,
+            rate,
+        ));
+        assert_eq!(history.newest_value(), 5);
+        history.push(0);
+        assert_eq!(history.value_at(1), Some(5));
+    }
+
+    #[test]
+    fn byte_rate_text_uses_binary_units() {
+        assert_eq!(format_byte_rate(1536), "1.5 KB/s");
+        assert_eq!(format_byte_rate(0), "0 B/s");
     }
 }

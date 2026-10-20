@@ -13,5 +13,6 @@
 pub(crate) mod cpu_sampler;
 pub(crate) mod cpu_sets;
 pub(crate) mod cpu_topology;
+pub(crate) mod disk;
 pub(crate) mod process_identity;
 pub(crate) mod sampler;
