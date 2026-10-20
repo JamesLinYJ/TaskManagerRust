@@ -58,7 +58,7 @@ use crate::ui::resource_ids::{
     IDC_CPU_DETAIL_GRAPH, IDC_CPUMETER, IDC_GPU_SELECTOR, IDC_MEMGRAPH, IDC_MEMMETER,
     IDC_NICTOTALS, IDC_PROCLIST, IDC_SERVICELIST, IDC_TASKLIST, IDC_USERLIST,
     PWM_CPU_FIRMWARE_WORKER_COMPLETE, PWM_CPU_WORKER_COMPLETE, PWM_GPU_METADATA_WORKER_COMPLETE,
-    PWM_GPU_WORKER_COMPLETE, PWM_NET_WORKER_COMPLETE, PWM_PROC_DUMP_COMPLETE,
+    PWM_GPU_WORKER_COMPLETE, PWM_NET_WORKER_COMPLETE, PWM_PROC_DUMP_COMPLETE, PWM_PROC_SEARCH_COMPLETE,
     PWM_PROC_WORKER_COMPLETE, PWM_SERVICE_WORKER_COMPLETE, PWM_TASK_WORKER_COMPLETE,
     PWM_USER_WORKER_COMPLETE,
 };
@@ -621,6 +621,13 @@ impl PageState {
             PWM_PROC_DUMP_COMPLETE => match self {
                 Self::Process(state) => {
                     state.handle_dump_worker_completion();
+                    Some(1)
+                }
+                _ => None,
+            },
+            PWM_PROC_SEARCH_COMPLETE => match self {
+                Self::Process(state) => {
+                    state.handle_search_completion();
                     Some(1)
                 }
                 _ => None,

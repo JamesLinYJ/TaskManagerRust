@@ -198,6 +198,7 @@ ExpandProcess = "&Erweitern"
 CollapseProcess = "&Zuklappen"
 OpenFileLocation = "Open File &Location"
 CreateDumpFile = "Abbilddatei erstellen (&F)"
+SearchOnline = "Online &suchen"
 Debug = "&Debuggen"
 SetPriority = "&Prioritaet festlegen"
 Realtime = "&Echtzeit"
@@ -294,6 +295,7 @@ UnableToCreateDumpFile = "Die Abbilddatei konnte nicht erstellt werden"
 DumpFileCreated = "Die Abbilddatei wurde erstellt."
 DumpFileFilter = "Abbilddateien"
 DumpCleanupFailed = "Die temporäre Abbilddatei konnte nicht gelöscht werden."
+UnableToSearchOnline = "Onlinesuche nicht möglich"
 KillProcessTreePrompt = """This operation will attempt to terminate this process and any
 processes which were directly or indirectly started by it.
 
@@ -374,3 +376,4 @@ IDM_PROC_TREE = "Gruppiert Prozesse unter dem übergeordneten Prozess, der sie e
 IDM_PROC_EXPAND = "Zeigt die untergeordneten Prozesse der Auswahl"
 IDM_PROC_COLLAPSE = "Blendet die untergeordneten Prozesse der Auswahl aus"
 IDM_PROC_DUMP = "Schreibt ein vollständiges Speicherabbild dieses Prozesses in eine gewählte Datei"
+IDM_PROC_SEARCHONLINE = "Sucht im Web nach dem Abbildnamen des ausgewählten Prozesses"

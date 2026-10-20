@@ -198,6 +198,7 @@ ExpandProcess = "&Развернуть"
 CollapseProcess = "&Свернуть"
 OpenFileLocation = "Open File &Location"
 CreateDumpFile = "Создать файл дампа (&F)"
+SearchOnline = "Поиск в Интернете(&S)"
 Debug = "&Отладка"
 SetPriority = "Задать &приоритет"
 Realtime = "&Реального времени"
@@ -294,6 +295,7 @@ UnableToCreateDumpFile = "Не удалось создать файл дампа
 DumpFileCreated = "Файл дампа создан."
 DumpFileFilter = "Файлы дампа"
 DumpCleanupFailed = "Не удалось удалить временный файл дампа."
+UnableToSearchOnline = "Не удается выполнить поиск в Интернете"
 KillProcessTreePrompt = """This operation will attempt to terminate this process and any
 processes which were directly or indirectly started by it.
 
@@ -374,3 +376,4 @@ IDM_PROC_TREE = "Группирует процессы под родительс
 IDM_PROC_EXPAND = "Показывает дочерние процессы выбранного элемента"
 IDM_PROC_COLLAPSE = "Скрывает дочерние процессы выбранного элемента"
 IDM_PROC_DUMP = "Записывает полный дамп памяти этого процесса в выбранный файл"
+IDM_PROC_SEARCHONLINE = "Ищет в Интернете имя образа выбранного процесса"
