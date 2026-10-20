@@ -14,7 +14,7 @@
 
 pub const TEMPLATE_CPU_GRAPH_COUNT: usize = 32;
 
-pub const MAX_COLUMN: usize = 15;
+pub const MAX_COLUMN: usize = 22;
 pub const NUM_COLUMN: usize = MAX_COLUMN + 1;
 
 pub const WM_FINDPROC: u32 = 0x0400 + 1;
@@ -147,6 +147,13 @@ pub const IDC_NONPAGEDPOOL: i32 = 1071;
 pub const IDC_BASEPRIORITY: i32 = 1072;
 pub const IDC_HANDLECOUNT: i32 = 1073;
 pub const IDC_THREADCOUNT: i32 = 1074;
+pub const IDC_COMMANDLINE: i32 = 2615;
+pub const IDC_IOREADBYTES: i32 = 2616;
+pub const IDC_IOWRITEBYTES: i32 = 2617;
+pub const IDC_IOREADCOUNT: i32 = 2618;
+pub const IDC_IOWRITECOUNT: i32 = 2619;
+pub const IDC_GDIOBJECTS: i32 = 2620;
+pub const IDC_USEROBJECTS: i32 = 2621;
 pub const IDC_SESSIONID: i32 = 2032;
 pub const IDC_USERNAME: i32 = 2033;
 pub const IDC_MEMBARFRAME: i32 = 1064;

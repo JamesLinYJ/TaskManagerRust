@@ -108,6 +108,13 @@ const PROCESS_COLUMNS: [ProcessColumn; NUM_COLUMN] = [
     ProcessColumn::new(TextKey::ProcessColumnBasePriority, LVCFMT_RIGHT, 60),
     ProcessColumn::new(TextKey::ProcessColumnHandleCount, LVCFMT_RIGHT, 60),
     ProcessColumn::new(TextKey::ProcessColumnThreadCount, LVCFMT_RIGHT, 60),
+    ProcessColumn::new(TextKey::ProcessColumnCommandLine, LVCFMT_LEFT, 240),
+    ProcessColumn::new(TextKey::ProcessColumnIoReadBytes, LVCFMT_RIGHT, 90),
+    ProcessColumn::new(TextKey::ProcessColumnIoWriteBytes, LVCFMT_RIGHT, 90),
+    ProcessColumn::new(TextKey::ProcessColumnIoReadCount, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnIoWriteCount, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnGdiObjects, LVCFMT_RIGHT, 70),
+    ProcessColumn::new(TextKey::ProcessColumnUserObjects, LVCFMT_RIGHT, 70),
 ];
 
 const COLUMN_DIALOG_IDS: [i32; NUM_COLUMN] = [
@@ -128,6 +135,13 @@ const COLUMN_DIALOG_IDS: [i32; NUM_COLUMN] = [
     IDC_BASEPRIORITY,
     IDC_HANDLECOUNT,
     IDC_THREADCOUNT,
+    IDC_COMMANDLINE,
+    IDC_IOREADBYTES,
+    IDC_IOWRITEBYTES,
+    IDC_IOREADCOUNT,
+    IDC_IOWRITECOUNT,
+    IDC_GDIOBJECTS,
+    IDC_USEROBJECTS,
 ];
 
 const DEFAULT_MARGIN: i32 = 8;
@@ -1010,6 +1024,11 @@ impl ProcessPageState {
             generation,
             sample: ProcWorkerRequest {
                 processor_count: self.processor_count,
+            query_command_line: self.active_columns.contains(&ColumnId::CommandLine),
+            query_gui_objects: self
+                .active_columns
+                .iter()
+                .any(|column| matches!(column, ColumnId::GdiObjects | ColumnId::UserObjects)),
             },
         };
         match worker.request(request, self.hwnd_page) {
@@ -1496,10 +1515,7 @@ impl ProcessPageState {
 
             for (index, column_id) in self.active_columns.iter().enumerate() {
                 let column = PROCESS_COLUMNS[*column_id as usize];
-                let width = options
-                    .column_widths
-                    .get(index)
-                    .copied()
+                let width = Some(options.process_column_width(index))
                     .filter(|value| *value > 0)
                     .unwrap_or(column.default_width);
                 let title = text(column.title_key).to_string();
@@ -1860,15 +1876,14 @@ fn write_process_column_layout(
     columns: &[ColumnId],
     widths: &HashMap<i32, i32>,
 ) {
-    options.active_process_columns.fill(-1);
-    options.column_widths.fill(-1);
+    options.clear_process_column_slots();
     for (index, &column) in columns.iter().take(NUM_COLUMN).enumerate() {
-        options.active_process_columns[index] = column as i32;
-        options.column_widths[index] = widths
+        let width = widths
             .get(&(column as i32))
             .copied()
             .filter(|width| *width > 0)
             .unwrap_or(PROCESS_COLUMNS[column as usize].default_width);
+        options.set_process_column_slot(index, column as i32, width);
     }
 }
 
@@ -1877,11 +1892,11 @@ fn apply_selected_columns(hwnd: HWND, options: &mut Options) {
     unsafe {
         let existing_columns = columns_from_options(options);
         let mut existing_widths = HashMap::with_capacity(NUM_COLUMN);
-        for (index, value) in options.active_process_columns.iter().copied().enumerate() {
-            let Some(column) = column_id_from_i32(value) else {
+        for index in 0..NUM_COLUMN + 1 {
+            let Some(column) = column_id_from_i32(options.process_column_id(index)) else {
                 break;
             };
-            existing_widths.insert(column as i32, options.column_widths[index]);
+            existing_widths.insert(column as i32, options.process_column_width(index));
         }
 
         let mut selected = [false; NUM_COLUMN];
@@ -1915,10 +1930,9 @@ fn apply_selected_columns(hwnd: HWND, options: &mut Options) {
 }
 
 fn columns_from_options(options: &Options) -> Vec<ColumnId> {
-    options
-        .active_process_columns
-        .iter()
-        .copied()
+    (0..NUM_COLUMN + 1)
+        .map(|index| options.process_column_id(index))
+        .take_while(|column| *column != -1)
         .filter_map(column_id_from_i32)
         .collect()
 }
@@ -1942,6 +1956,13 @@ fn column_id_from_i32(value: i32) -> Option<ColumnId> {
         x if x == ColumnId::BasePriority as i32 => Some(ColumnId::BasePriority),
         x if x == ColumnId::HandleCount as i32 => Some(ColumnId::HandleCount),
         x if x == ColumnId::ThreadCount as i32 => Some(ColumnId::ThreadCount),
+        x if x == ColumnId::CommandLine as i32 => Some(ColumnId::CommandLine),
+        x if x == ColumnId::IoReadBytes as i32 => Some(ColumnId::IoReadBytes),
+        x if x == ColumnId::IoWriteBytes as i32 => Some(ColumnId::IoWriteBytes),
+        x if x == ColumnId::IoReadCount as i32 => Some(ColumnId::IoReadCount),
+        x if x == ColumnId::IoWriteCount as i32 => Some(ColumnId::IoWriteCount),
+        x if x == ColumnId::GdiObjects as i32 => Some(ColumnId::GdiObjects),
+        x if x == ColumnId::UserObjects as i32 => Some(ColumnId::UserObjects),
         _ => None,
     }
 }
@@ -1966,12 +1987,15 @@ mod tests {
     use super::{
         ProcIdentity, ProcessCollectionCompletion, ProcessCollectionRequest, ProcessPageState,
         SelectionScrollPolicy, refresh_selection_scroll_policy, reorder_process_columns,
+        column_id_from_i32, columns_from_options,
         write_process_column_layout,
     };
     use crate::config::options::{ColumnId, Options};
     use crate::infrastructure::worker::{SingleFlightWorker, replace_pending};
     use crate::system::process_identity::query_process_identity_for_pid;
     use crossbeam_channel::{Receiver, Sender, bounded};
+    use crate::ui::localization::{TextKey, text};
+    use crate::ui::resource_ids::NUM_COLUMN;
     use std::collections::{HashMap, HashSet};
     use std::env;
     use std::fs;
@@ -2031,6 +2055,13 @@ mod tests {
             priority_class: NORMAL_PRIORITY_CLASS,
             handle_count: 0,
             thread_count: 0,
+            command_line: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            io_read_count: None,
+            io_write_count: None,
+            gdi_objects: None,
+            user_objects: None,
             display_text: std::array::from_fn(|_| String::new()),
             pass_count: 0,
             dirty_columns: DirtyColumns::default(),
@@ -2127,7 +2158,11 @@ mod tests {
         let mut worker = ProcWorkerState::default();
         for pass in 0..2 {
             let snapshot = worker
-                .collect(ProcWorkerRequest { processor_count: 1 })
+                .collect(ProcWorkerRequest {
+                    processor_count: 1,
+                    query_command_line: false,
+                    query_gui_objects: false,
+                })
                 .unwrap();
             for (_, identity, mode) in &fixtures {
                 let entry = snapshot
@@ -2145,7 +2180,11 @@ mod tests {
         let identities: Vec<_> = fixtures.iter().map(|(_, identity, _)| *identity).collect();
         drop(fixtures);
         let snapshot = worker
-            .collect(ProcWorkerRequest { processor_count: 1 })
+            .collect(ProcWorkerRequest {
+                processor_count: 1,
+                query_command_line: false,
+                query_gui_objects: false,
+            })
             .unwrap();
         for identity in identities {
             assert!(
@@ -2218,6 +2257,58 @@ mod tests {
             ]
         );
         assert_eq!(&options.column_widths[..3], &[120, 44, 160]);
+        assert!(
+            options
+                .extended_process_columns
+                .iter()
+                .all(|column| *column == -1)
+        );
+    }
+
+    #[test]
+    fn extended_column_slots_keep_ids_past_the_schema2_array() {
+        let mut options = Options::default();
+        let columns = (0..NUM_COLUMN)
+            .map(|index| column_id_from_i32(index as i32).unwrap())
+            .collect::<Vec<_>>();
+        write_process_column_layout(&mut options, &columns, &HashMap::new());
+        assert_eq!(columns_from_options(&options), columns);
+        assert_eq!(
+            options.process_column_id(ColumnId::CommandLine as usize),
+            ColumnId::CommandLine as i32
+        );
+        assert_eq!(
+            options.extended_process_columns[0],
+            ColumnId::IoReadBytes as i32
+        );
+        assert_eq!(options.process_column_id(NUM_COLUMN), -1);
+    }
+
+    #[test]
+    fn unknown_detail_values_do_not_format_as_zero() {
+        let mut entry = empty_process_entry("app.exe");
+        entry.rebuild_display_columns(&[
+            ColumnId::CommandLine,
+            ColumnId::IoReadBytes,
+            ColumnId::GdiObjects,
+        ]);
+        let unknown = text(TextKey::NotAvailable);
+        assert_eq!(entry.display_text[ColumnId::CommandLine as usize], unknown);
+        assert_eq!(entry.display_text[ColumnId::IoReadBytes as usize], unknown);
+        assert_ne!(entry.display_text[ColumnId::IoReadBytes as usize], "0");
+        assert_ne!(entry.display_text[ColumnId::GdiObjects as usize], "0");
+
+        entry.command_line = Some(String::new());
+        entry.io_read_bytes = Some(0);
+        entry.gdi_objects = Some(0);
+        entry.rebuild_display_columns(&[
+            ColumnId::CommandLine,
+            ColumnId::IoReadBytes,
+            ColumnId::GdiObjects,
+        ]);
+        assert_eq!(entry.display_text[ColumnId::CommandLine as usize], "");
+        assert_eq!(entry.display_text[ColumnId::IoReadBytes as usize], "0");
+        assert_eq!(entry.display_text[ColumnId::GdiObjects as usize], "0");
     }
 
     #[test]
