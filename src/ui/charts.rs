@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1CreateFactory,
     ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::HDC as WinHdc;
 use windows_numerics::Vector2;
 
@@ -140,7 +140,9 @@ impl Direct2DRenderer {
             let properties = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_UNKNOWN,
+                    // A DC target cannot infer a surface format from its destination HDC.
+                    // Direct2D requires this explicit GDI-compatible format.
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     alphaMode: D2D1_ALPHA_MODE_IGNORE,
                 },
                 dpiX: 0.0,
@@ -396,6 +398,16 @@ fn color(red: u8, green: u8, blue: u8) -> D2D1_COLOR_F {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dc_render_target_creates_with_a_gdi_compatible_pixel_format() {
+        let renderer = Direct2DRenderer::new()
+            .unwrap_or_else(|error| panic!("DC render target creation failed: {error:#010X}"));
+        // Safety: the renderer owns a successfully created target for this whole query.
+        let format = unsafe { renderer.target.GetPixelFormat() };
+        assert_eq!(format.format, DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert_eq!(format.alphaMode, D2D1_ALPHA_MODE_IGNORE);
+    }
 
     #[test]
     fn backend_fallback_is_reported_once_per_process_state() {

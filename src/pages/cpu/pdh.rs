@@ -13,7 +13,7 @@
 //! 逻辑处理器实例必须与当前拓扑一一对应；缺失、重复或非法值会拒绝整轮结果。
 
 use std::collections::{BTreeSet, HashMap};
-use std::mem::{size_of, zeroed};
+use std::mem::{align_of, size_of, zeroed};
 use std::ptr::null_mut;
 use std::slice;
 
@@ -37,6 +37,13 @@ const CONTEXT_SWITCH_COUNTER_PATH: &str = r"\System\Context Switches/sec";
 const SYSTEM_CALL_COUNTER_PATH: &str = r"\System\System Calls/sec";
 const PROCESSOR_QUEUE_COUNTER_PATH: &str = r"\System\Processor Queue Length";
 const MAX_PDH_ARRAY_BYTES: u32 = 64 * 1024 * 1024;
+// pdh.h defines this flag, which windows-sys 0.61.2 does not currently expose.
+const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
+// Relative processor performance exceeds 100% while boosting. PDH otherwise caps it before
+// `effective_frequency_mhz` has a chance to combine it with the nominal clock.
+const PERFORMANCE_COUNTER_FORMAT: u32 = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100;
+// PDH values contain a 64-bit union even in the i686 ABI; pointer-sized storage is insufficient.
+const _: () = assert!(align_of::<u64>() >= align_of::<PDH_FMT_COUNTERVALUE_ITEM_W>());
 
 pub(super) struct CpuPdhQuery {
     query: PDH_HQUERY,
@@ -172,7 +179,7 @@ impl CpuPdhQuery {
         let performance = query_counter_array(
             self.performance,
             PERFORMANCE_COUNTER_PATH,
-            PDH_FMT_DOUBLE,
+            PERFORMANCE_COUNTER_FORMAT,
             |value| unsafe { value.Anonymous.doubleValue },
         )?;
         let (average_frequency_mhz, minimum_frequency_mhz, maximum_frequency_mhz) =
@@ -291,7 +298,7 @@ fn query_counter_array<T>(
         if byte_count == 0 || byte_count > MAX_PDH_ARRAY_BYTES {
             return invalid("CPU PDH wildcard buffer size");
         }
-        let mut storage = vec![0usize; (byte_count as usize).div_ceil(size_of::<usize>())];
+        let mut storage = vec![0u64; (byte_count as usize).div_ceil(size_of::<u64>())];
         let status = PdhGetFormattedCounterArrayW(
             counter,
             format,
@@ -307,7 +314,7 @@ fn query_counter_array<T>(
             });
         }
         let used_bytes = byte_count as usize;
-        if used_bytes > storage.len() * size_of::<usize>()
+        if used_bytes > storage.len() * size_of::<u64>()
             || (item_count as usize)
                 .checked_mul(size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>())
                 .is_none_or(|size| size > used_bytes)
@@ -589,4 +596,43 @@ unsafe fn read_bounded_wide(
         .ok_or_else(|| invalid_error("CPU PDH instance name terminator"))?;
     String::from_utf16(&units[..length])
         .map_err(|_| invalid_error("CPU PDH instance name encoding"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Performance::{PDH_RAW_COUNTER, PdhFormatFromRawValue};
+
+    #[test]
+    fn pdh_format_preserves_boost_before_effective_frequency_conversion() {
+        // winperf.h / MS-PCQ: PERF_RAW_FRACTION formats 100 * FirstValue / SecondValue.
+        // This calls PDH with controlled inputs, without depending on live turbo behavior.
+        const PERF_RAW_FRACTION: u32 = 0x2002_0400;
+        let raw = PDH_RAW_COUNTER {
+            CStatus: PDH_CSTATUS_VALID_DATA,
+            FirstValue: 150,
+            SecondValue: 100,
+            ..Default::default()
+        };
+        let mut formatted = PDH_FMT_COUNTERVALUE::default();
+        let time_base = 1i64;
+        // SAFETY: all input/output pointers remain live for the synchronous formatting call.
+        // A raw fraction uses one sample, so the second sample pointer is deliberately null.
+        let status = unsafe {
+            PdhFormatFromRawValue(
+                PERF_RAW_FRACTION,
+                PERFORMANCE_COUNTER_FORMAT,
+                &time_base,
+                &raw,
+                std::ptr::null(),
+                &mut formatted,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        validate_pdh_status(formatted.CStatus, PERFORMANCE_COUNTER_PATH).unwrap();
+        // SAFETY: PERFORMANCE_COUNTER_FORMAT requests PDH_FMT_DOUBLE.
+        let performance = unsafe { formatted.Anonymous.doubleValue };
+        assert_eq!(performance, 150.0);
+        assert_eq!(effective_frequency_mhz(2_400, performance).unwrap(), 3_600);
+    }
 }

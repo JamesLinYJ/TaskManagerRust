@@ -325,6 +325,22 @@ impl ProcCommand {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingProcessFind {
+    identity: ProcIdentity,
+    minimum_generation: u64,
+}
+
+struct ProcessCollectionRequest {
+    generation: u64,
+    sample: ProcWorkerRequest,
+}
+
+struct ProcessCollectionCompletion {
+    generation: u64,
+    result: ProcWorkerResult,
+}
+
 pub struct ProcessPageState {
     // 进程页状态对象持有采样缓存、排序设置、列配置以及当前选中项。
     hinstance: HINSTANCE,
@@ -340,7 +356,7 @@ pub struct ProcessPageState {
     tree_mode: bool,
     active_columns: Vec<ColumnId>,
     selected_identity: Option<ProcIdentity>,
-    pending_find_identity: Option<ProcIdentity>,
+    pending_find: Option<PendingProcessFind>,
     sort_column: ColumnId,
     sort_direction: i32,
     paused: bool,
@@ -351,7 +367,8 @@ pub struct ProcessPageState {
     debugger_error: Option<u32>,
     strings: ProcessStrings,
     pass_count: u64,
-    worker: Option<SingleFlightWorker<ProcWorkerRequest, ProcWorkerResult>>,
+    request_generation: u64,
+    worker: Option<SingleFlightWorker<ProcessCollectionRequest, ProcessCollectionCompletion>>,
     last_refresh_error: Option<u32>,
     last_row_error: Option<u32>,
 }
@@ -368,7 +385,7 @@ impl Default for ProcessPageState {
             tree_mode: true,
             active_columns: Vec::with_capacity(NUM_COLUMN),
             selected_identity: None,
-            pending_find_identity: None,
+            pending_find: None,
             sort_column: ColumnId::Pid,
             sort_direction: 1,
             paused: false,
@@ -379,6 +396,7 @@ impl Default for ProcessPageState {
             debugger_error: None,
             strings: ProcessStrings::default(),
             pass_count: 0,
+            request_generation: 0,
             worker: None,
             last_refresh_error: None,
             last_row_error: None,
@@ -398,7 +416,10 @@ impl ProcessPageState {
             replace_pending,
             || {
                 let mut state = ProcWorkerState::default();
-                move |request| state.collect(request)
+                move |request: ProcessCollectionRequest| ProcessCollectionCompletion {
+                    generation: request.generation,
+                    result: state.collect(request.sample),
+                }
             },
         )?);
         Ok(())
@@ -493,6 +514,7 @@ impl ProcessPageState {
 
     pub fn destroy(&mut self) {
         self.stop_worker_thread();
+        self.pending_find = None;
         self.entries.clear();
         self.visible_rows.clear();
         self.collapsed.clear();
@@ -841,13 +863,25 @@ impl ProcessPageState {
         if !identity.is_verified() {
             return false;
         }
+        // A newer explicit navigation supersedes an earlier request waiting for a snapshot,
+        // including when this target is already present and can be selected immediately.
+        self.pending_find = None;
         let Some(index) = self
             .entries
             .iter()
             .position(|entry| entry.identity == identity)
         else {
-            self.pending_find_identity = Some(identity);
-            self.refresh_processes();
+            // Only the refresh requested for this navigation may resolve it. An older
+            // completed or in-flight snapshot can legitimately predate the new process.
+            let Some(minimum_generation) = self.schedule_process_collection() else {
+                return false;
+            };
+            self.pending_find = Some(PendingProcessFind {
+                identity,
+                minimum_generation,
+            });
+            // Install the correlation before draining anything that was already completed.
+            self.drain_worker_results();
             return true;
         };
 
@@ -902,19 +936,33 @@ impl ProcessPageState {
 
     fn refresh_processes(&mut self) {
         self.drain_worker_results();
-        self.schedule_process_collection();
+        let _ = self.schedule_process_collection();
     }
 
-    fn schedule_process_collection(&mut self) {
+    fn schedule_process_collection(&mut self) -> Option<u64> {
+        // This business generation is independent of diagnostics, whose operation IDs can
+        // be zero when logging is disabled. Never wrap a value used for freshness ordering.
+        let Some(generation) = self.request_generation.checked_add(1) else {
+            self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW);
+            return None;
+        };
         let Some(worker) = self.worker.as_mut() else {
             self.set_refresh_error(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
-            return;
+            return None;
         };
-        let request = ProcWorkerRequest {
-            processor_count: self.processor_count,
+        self.request_generation = generation;
+        let request = ProcessCollectionRequest {
+            generation,
+            sample: ProcWorkerRequest {
+                processor_count: self.processor_count,
+            },
         };
-        if let Err(error) = worker.request(request, self.hwnd_page) {
-            self.set_refresh_error(error);
+        match worker.request(request, self.hwnd_page) {
+            Ok(_) => Some(generation),
+            Err(error) => {
+                self.set_refresh_error(error);
+                None
+            }
         }
     }
 
@@ -929,12 +977,24 @@ impl ProcessPageState {
             });
         }
         if let Some(error) = drain.error {
+            // Worker-level failures (including a collector panic) may have no result to
+            // correlate. Cancel navigation instead of leaving a request that cannot finish.
+            self.pending_find = None;
             self.set_refresh_error(error);
         }
     }
 
-    fn apply_worker_completion(&mut self, completion: ProcWorkerResult) {
-        match completion {
+    fn apply_worker_completion(&mut self, completion: ProcessCollectionCompletion) {
+        let requested_identity = self
+            .pending_find
+            // An ordinary refresh may replace a queued request with newer parameters and
+            // generation. Its sample still starts after navigation and can resolve it.
+            .filter(|pending| completion.generation >= pending.minimum_generation)
+            .map(|pending| {
+                self.pending_find = None;
+                pending.identity
+            });
+        match completion.result {
             Ok(snapshot) => {
                 self.last_refresh_error = None;
                 if self.last_row_error != snapshot.row_error
@@ -943,7 +1003,7 @@ impl ProcessPageState {
                     record_win32_error("process row metadata", error);
                 }
                 self.last_row_error = snapshot.row_error;
-                self.apply_process_snapshot(snapshot.entries);
+                self.apply_process_snapshot(snapshot.entries, requested_identity);
             }
             Err(error) => {
                 self.set_refresh_error(error);
@@ -951,7 +1011,11 @@ impl ProcessPageState {
         }
     }
 
-    fn apply_process_snapshot(&mut self, entries: Vec<ProcEntry>) {
+    fn apply_process_snapshot(
+        &mut self,
+        entries: Vec<ProcEntry>,
+        requested_identity: Option<ProcIdentity>,
+    ) {
         let previous_selection = self.current_selected_identity().or(self.selected_identity);
         let current_pass = self.pass_count;
         let visible_columns = DirtyColumns::from_columns(&self.active_columns);
@@ -981,9 +1045,7 @@ impl ProcessPageState {
         if sort_dirty {
             self.resort_entries();
         }
-        let requested_selection = self
-            .pending_find_identity
-            .take()
+        let requested_selection = requested_identity
             .filter(|identity| self.entries.iter().any(|entry| entry.identity == *identity));
         if let Some(identity) = requested_selection {
             self.expand_ancestors_of(identity);
@@ -1084,9 +1146,14 @@ impl ProcessPageState {
             self.selected_identity =
                 self.retarget_visible_identity(self.selected_identity, &next_rows);
             let selected_identity = self.selected_identity;
-            let focused_identity = focused
-                .filter(|identity| next_rows.iter().any(|row| row.identity == *identity))
-                .or(selected_identity);
+            let focused_identity =
+                if selection_scroll_policy == SelectionScrollPolicy::RevealSelection {
+                    selected_identity
+                } else {
+                    focused
+                        .filter(|identity| next_rows.iter().any(|row| row.identity == *identity))
+                        .or(selected_identity)
+                };
 
             if bulk_update {
                 SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
@@ -1113,15 +1180,17 @@ impl ProcessPageState {
             let selected_index =
                 selected_identity.and_then(|identity| self.visible_index(identity));
             let focused_index = focused_identity.and_then(|identity| self.visible_index(identity));
-            if bulk_update {
-                // Dynamic sort keys can move the selected process on every sample. Refreshes must
-                // preserve the user's wheel position; only an explicit navigation may reveal it.
+            if bulk_update || selection_scroll_policy == SelectionScrollPolicy::RevealSelection {
+                // Explicit navigation also changes selection when both rows are already visible
+                // and the tree layout is unchanged. Ordinary refreshes preserve the viewport.
                 self.set_list_selection(
                     list_hwnd,
                     selected_index,
                     focused_index,
                     selection_scroll_policy,
                 );
+            }
+            if bulk_update {
                 if selection_scroll_policy == SelectionScrollPolicy::PreserveViewport
                     && let Some(anchor) = anchor
                 {
@@ -1761,15 +1830,19 @@ mod tests {
     };
     use super::model::{DirtyColumns, ProcEntry, update_process_entry};
     use super::sampler::{
-        ProcWorkerRequest, ProcWorkerState, WtsProcessIdentity, cpu_percent_from_delta,
-        merge_wts_process_identity, signed_kb_delta, system_time_delta, wts_identity_matches,
+        ProcWorkerRequest, ProcWorkerResult, ProcWorkerSnapshot, ProcWorkerState,
+        WtsProcessIdentity, cpu_percent_from_delta, merge_wts_process_identity, signed_kb_delta,
+        system_time_delta, wts_identity_matches,
     };
     use super::{
-        ProcIdentity, ProcessPageState, SelectionScrollPolicy, refresh_selection_scroll_policy,
-        reorder_process_columns, write_process_column_layout,
+        ProcIdentity, ProcessCollectionCompletion, ProcessCollectionRequest, ProcessPageState,
+        SelectionScrollPolicy, refresh_selection_scroll_policy, reorder_process_columns,
+        write_process_column_layout,
     };
     use crate::config::options::{ColumnId, Options};
+    use crate::infrastructure::worker::{SingleFlightWorker, replace_pending};
     use crate::system::process_identity::query_process_identity_for_pid;
+    use crossbeam_channel::{Receiver, Sender, bounded};
     use std::collections::{HashMap, HashSet};
     use std::env;
     use std::fs;
@@ -2312,7 +2385,10 @@ mod tests {
             ..ProcessPageState::default()
         };
 
-        state.apply_worker_completion(Err(5));
+        state.apply_worker_completion(ProcessCollectionCompletion {
+            generation: 1,
+            result: Err(5),
+        });
 
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].image_name, "trusted.exe");
@@ -2353,28 +2429,37 @@ mod tests {
             ..ProcessPageState::default()
         };
 
-        state.apply_process_snapshot(vec![
-            tree_entry("child.exe", child, Some(parent)),
-            tree_entry("parent.exe", parent, None),
-            tree_entry("sibling.exe", sibling, None),
-        ]);
+        state.apply_process_snapshot(
+            vec![
+                tree_entry("child.exe", child, Some(parent)),
+                tree_entry("parent.exe", parent, None),
+                tree_entry("sibling.exe", sibling, None),
+            ],
+            None,
+        );
         assert_eq!(visible_pids(&state), vec![4, 8, 9]);
         assert_eq!(state.selected_identity, Some(child));
         assert!(!state.collapsed.contains(&parent));
 
         state.collapsed.insert(parent);
-        state.apply_process_snapshot(vec![
-            tree_entry("child.exe", child, Some(parent)),
-            tree_entry("parent.exe", parent, None),
-            tree_entry("sibling.exe", sibling, None),
-        ]);
+        state.apply_process_snapshot(
+            vec![
+                tree_entry("child.exe", child, Some(parent)),
+                tree_entry("parent.exe", parent, None),
+                tree_entry("sibling.exe", sibling, None),
+            ],
+            None,
+        );
         assert_eq!(visible_pids(&state), vec![4, 9]);
         assert_eq!(state.selected_identity, Some(parent));
 
-        state.apply_process_snapshot(vec![
-            tree_entry("parent.exe", parent, None),
-            tree_entry("sibling.exe", sibling, None),
-        ]);
+        state.apply_process_snapshot(
+            vec![
+                tree_entry("parent.exe", parent, None),
+                tree_entry("sibling.exe", sibling, None),
+            ],
+            None,
+        );
         assert_eq!(visible_pids(&state), vec![4, 9]);
         assert!(state.collapsed.contains(&parent));
         assert!(!state.entries.iter().any(|entry| entry.identity == child));
@@ -2389,10 +2474,13 @@ mod tests {
             active_columns: vec![ColumnId::Pid],
             ..ProcessPageState::default()
         };
-        state.apply_process_snapshot(vec![
-            tree_entry("parent.exe", parent, None),
-            tree_entry("child.exe", child, Some(parent)),
-        ]);
+        state.apply_process_snapshot(
+            vec![
+                tree_entry("parent.exe", parent, None),
+                tree_entry("child.exe", child, Some(parent)),
+            ],
+            None,
+        );
         assert_eq!(visible_pids(&state), vec![2, 4]);
         assert!(state.visible_rows.iter().all(|row| row.depth == 0));
 
@@ -2404,6 +2492,300 @@ mod tests {
         assert_eq!(visible_pids(&state), vec![4, 2]);
         assert_eq!(state.selected_identity, Some(child));
         assert!(!state.collapsed.contains(&parent));
+    }
+
+    #[test]
+    fn visible_tree_navigation_updates_list_selection_and_focus_without_reordering() {
+        use crate::infrastructure::native::to_wide_null;
+        use crate::ui::resource_ids::IDC_PROCLIST;
+        use std::mem::size_of;
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::Controls::{
+            ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVNI_FOCUSED,
+            LVS_OWNERDATA, LVS_REPORT, LVS_SINGLESEL,
+        };
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RIGHT};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HMENU, WS_CHILD,
+        };
+
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                // SAFETY: this test owns the hidden parent and its child on this thread.
+                unsafe { DestroyWindow(self.0) };
+            }
+        }
+        let controls = INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_LISTVIEW_CLASSES,
+        };
+        assert_ne!(unsafe { InitCommonControlsEx(&controls) }, 0);
+        let parent_class = to_wide_null("STATIC");
+        let list_class = to_wide_null("SysListView32");
+        // Only hidden test-owned controls and synthetic process identities are used.
+        let window = TestWindow(unsafe {
+            CreateWindowExW(
+                0,
+                parent_class.as_ptr(),
+                null(),
+                0,
+                0,
+                0,
+                400,
+                300,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        });
+        assert!(!window.0.is_null());
+        let list = unsafe {
+            CreateWindowExW(
+                0,
+                list_class.as_ptr(),
+                null(),
+                WS_CHILD | LVS_REPORT | LVS_OWNERDATA | LVS_SINGLESEL,
+                0,
+                0,
+                400,
+                300,
+                window.0,
+                IDC_PROCLIST as usize as HMENU,
+                null_mut(),
+                null(),
+            )
+        };
+        assert!(!list.is_null());
+
+        let parent = ProcIdentity::new(4, 50);
+        let child = ProcIdentity::new(2, 80);
+        let mut page = ProcessPageState {
+            hwnd_page: window.0,
+            selected_identity: Some(parent),
+            active_columns: vec![ColumnId::ImageName],
+            ..ProcessPageState::default()
+        };
+        page.setup_columns(&Options::default());
+        page.apply_process_snapshot(
+            vec![
+                tree_entry("parent.exe", parent, None),
+                tree_entry("child.exe", child, Some(parent)),
+            ],
+            None,
+        );
+        let initial_rows = page.visible_rows.clone();
+        assert_eq!(page.current_selected_identity(), Some(parent));
+        assert_eq!(page.identity_for_list_state(LVNI_FOCUSED), Some(parent));
+
+        assert!(page.find_process(child));
+        assert_eq!(page.visible_rows, initial_rows);
+        assert_eq!(page.current_selected_identity(), Some(child));
+        assert_eq!(page.identity_for_list_state(LVNI_FOCUSED), Some(child));
+
+        // Left/right navigation between an expanded parent and child also keeps the same
+        // row order. Query the native control, since the cached model alone can hide a bug.
+        page.handle_tree_key(VK_LEFT);
+        assert_eq!(page.current_selected_identity(), Some(parent));
+        assert_eq!(page.identity_for_list_state(LVNI_FOCUSED), Some(parent));
+        page.handle_tree_key(VK_RIGHT);
+        assert_eq!(page.visible_rows, initial_rows);
+        assert_eq!(page.current_selected_identity(), Some(child));
+        assert_eq!(page.identity_for_list_state(LVNI_FOCUSED), Some(child));
+    }
+
+    #[test]
+    fn newer_navigation_cancels_an_older_pending_find() {
+        let current = empty_process_entry("current.exe");
+        let mut missing = empty_process_entry("later.exe");
+        missing.identity = ProcIdentity::new(4321, 20);
+        missing.pid = missing.identity.pid;
+        let (mut state, started, finish) = controlled_navigation_page(current.clone());
+
+        assert!(state.find_process(missing.identity));
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(state.pending_find.unwrap().identity, missing.identity);
+        assert!(state.find_process(current.identity));
+        assert_eq!(state.pending_find, None);
+        finish
+            .send(Ok(ProcWorkerSnapshot {
+                entries: vec![current.clone(), missing],
+                row_error: None,
+            }))
+            .unwrap();
+        drain_navigation_until(&mut state, |page| page.pass_count == 1);
+        assert_eq!(state.selected_identity, Some(current.identity));
+    }
+
+    fn controlled_navigation_page(
+        current: ProcEntry,
+    ) -> (ProcessPageState, Receiver<u64>, Sender<ProcWorkerResult>) {
+        let (started_tx, started_rx) = bounded(1);
+        let (finish_tx, finish_rx) = bounded(1);
+        // Each request pauses inside a real SingleFlightWorker until the test supplies its
+        // snapshot. Only synthetic entries are used; no process or window is operated on.
+        let worker = SingleFlightWorker::spawn(
+            "process-navigation-regression",
+            0,
+            replace_pending,
+            move |request: ProcessCollectionRequest| {
+                started_tx.send(request.generation).unwrap();
+                ProcessCollectionCompletion {
+                    generation: request.generation,
+                    result: finish_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                }
+            },
+        )
+        .unwrap();
+        (
+            ProcessPageState {
+                selected_identity: Some(current.identity),
+                entries: vec![current],
+                worker: Some(worker),
+                ..ProcessPageState::default()
+            },
+            started_rx,
+            finish_tx,
+        )
+    }
+
+    fn drain_navigation_until(
+        page: &mut ProcessPageState,
+        complete: impl Fn(&ProcessPageState) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !complete(page) {
+            assert!(Instant::now() < deadline, "process worker did not complete");
+            page.handle_worker_completion();
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn older_in_flight_snapshot_cannot_consume_a_newer_process_navigation() {
+        let current = empty_process_entry("current.exe");
+        let mut target = empty_process_entry("new.exe");
+        target.identity = ProcIdentity::new(4321, 20);
+        target.pid = target.identity.pid;
+        target.parent = Some(current.identity);
+        let existing_child = ProcIdentity::new(2345, 15);
+        let unrelated_parent = ProcIdentity::new(5000, 10);
+        let unrelated_child = ProcIdentity::new(6000, 15);
+        let old_entries = vec![
+            current.clone(),
+            tree_entry("existing-child.exe", existing_child, Some(current.identity)),
+            tree_entry("unrelated-parent.exe", unrelated_parent, None),
+            tree_entry(
+                "unrelated-child.exe",
+                unrelated_child,
+                Some(unrelated_parent),
+            ),
+        ];
+        let (mut state, started, finish) = controlled_navigation_page(current.clone());
+        state.entries = old_entries.clone();
+        state.collapsed = HashSet::from([current.identity, unrelated_parent]);
+        state.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
+        assert_eq!(
+            visible_pids(&state),
+            vec![current.pid, unrelated_parent.pid]
+        );
+
+        let old_generation = state.schedule_process_collection().unwrap();
+        assert_eq!(
+            started.recv_timeout(Duration::from_secs(5)).unwrap(),
+            old_generation,
+        );
+        assert_ne!(old_generation, 0);
+        assert!(state.find_process(target.identity));
+        let pending = state.pending_find;
+        assert!(pending.unwrap().minimum_generation > old_generation);
+        // An ordinary refresh can replace the queued sampling parameters. Its newer
+        // generation must still satisfy the refresh boundary requested by navigation.
+        state.refresh_processes();
+        assert_eq!(state.pending_find, pending);
+
+        finish
+            .send(Ok(ProcWorkerSnapshot {
+                entries: old_entries.clone(),
+                row_error: None,
+            }))
+            .unwrap();
+        drain_navigation_until(&mut state, |page| page.pass_count == 1);
+        assert_eq!(state.pending_find, pending);
+        assert_eq!(state.selected_identity, Some(current.identity));
+        assert!(state.collapsed.contains(&current.identity));
+
+        let coalesced_generation = started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(coalesced_generation > pending.unwrap().minimum_generation);
+        let mut next_entries = old_entries;
+        next_entries.push(target.clone());
+        finish
+            .send(Ok(ProcWorkerSnapshot {
+                entries: next_entries,
+                row_error: None,
+            }))
+            .unwrap();
+        drain_navigation_until(&mut state, |page| page.pass_count == 2);
+        assert_eq!(state.pending_find, None);
+        assert_eq!(state.selected_identity, Some(target.identity));
+        assert!(!state.collapsed.contains(&current.identity));
+        assert!(state.collapsed.contains(&unrelated_parent));
+        assert_eq!(
+            visible_pids(&state),
+            vec![
+                current.pid,
+                existing_child.pid,
+                target.pid,
+                unrelated_parent.pid
+            ],
+        );
+    }
+
+    #[test]
+    fn navigation_finishes_when_its_own_refresh_is_missing_or_failed() {
+        for refresh_fails in [false, true] {
+            let current = empty_process_entry("current.exe");
+            let mut target = empty_process_entry("later.exe");
+            target.identity = ProcIdentity::new(4321, 20);
+            target.pid = target.identity.pid;
+            let (mut state, started, finish) = controlled_navigation_page(current.clone());
+
+            assert!(state.find_process(target.identity));
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            finish
+                .send(if refresh_fails {
+                    Err(ERROR_ACCESS_DENIED)
+                } else {
+                    Ok(ProcWorkerSnapshot {
+                        entries: vec![current.clone()],
+                        row_error: None,
+                    })
+                })
+                .unwrap();
+            drain_navigation_until(&mut state, |page| page.pending_find.is_none());
+            assert_eq!(state.selected_identity, Some(current.identity));
+            assert_eq!(
+                state.last_refresh_error,
+                refresh_fails.then_some(ERROR_ACCESS_DENIED),
+            );
+
+            // The request has finished; a later appearance must not unexpectedly move the
+            // user's selection, including after recovery from a failed sampling attempt.
+            let next_pass = state.pass_count + 1;
+            state.schedule_process_collection().unwrap();
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            finish
+                .send(Ok(ProcWorkerSnapshot {
+                    entries: vec![current.clone(), target],
+                    row_error: None,
+                }))
+                .unwrap();
+            drain_navigation_until(&mut state, |page| page.pass_count == next_pass);
+            assert_eq!(state.selected_identity, Some(current.identity));
+            assert_eq!(state.last_refresh_error, None);
+        }
     }
 
     #[test]

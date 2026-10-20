@@ -1352,8 +1352,12 @@ fn scrollbar_width() -> i32 {
     unsafe { GetSystemMetrics(SM_CXVSCROLL).max(17) }
 }
 
-fn push_history(history: &mut HistoryBuffer, value: u8) {
-    history.push(value);
+fn push_history(history: &mut HistoryBuffer, value: Option<u8>) {
+    // Missing capacity or a reset/priming interval is not a measured idle interval. Preserve
+    // that direction's last trusted history, just as the list preserves an unavailable value.
+    if let Some(value) = value {
+        history.push(value);
+    }
 }
 
 fn adapter_row_texts(adapter: &NetworkAdapterEntry) -> [&str; 4] {
@@ -1464,17 +1468,14 @@ fn directional_utilization_ratios(
     (sent, received, total)
 }
 
-fn utilization_percent_for_history(ratio_percent: Option<f64>) -> u8 {
-    let Some(ratio_percent) = ratio_percent else {
-        return 0;
-    };
-
+fn utilization_percent_for_history(ratio_percent: Option<f64>) -> Option<u8> {
+    let ratio_percent = ratio_percent?;
     let rounded = ratio_percent.round().clamp(0.0, 100.0) as u8;
-    if rounded == 0 && ratio_percent > 0.0 {
+    Some(if rounded == 0 && ratio_percent > 0.0 {
         1
     } else {
         rounded
-    }
+    })
 }
 
 fn utilization_text(ratio_percent: Option<f64>) -> String {
@@ -1874,6 +1875,28 @@ mod tests {
         history.push(30);
         assert_eq!(history.max_value(), 30);
         assert_eq!(history.iter().collect::<Vec<_>>(), vec![30, 20, 10]);
+    }
+
+    #[test]
+    fn unavailable_network_intervals_do_not_append_idle_history() {
+        let mut history = HistoryBuffer::zeroed(3);
+        push_history(&mut history, utilization_percent_for_history(Some(50.0)));
+
+        // Counter resets, unknown link capacity, and a zero interval each mean unavailable.
+        let reset_ratio = adapter_counter_delta(1, 1, Some((100, 100)))
+            .and_then(|delta| utilization_ratio_percent(delta.0, 1_000, 1.0));
+        for ratio in [
+            reset_ratio,
+            utilization_ratio_percent(100, 0, 1.0),
+            utilization_ratio_percent(100, 1_000, 0.0),
+        ] {
+            push_history(&mut history, utilization_percent_for_history(ratio));
+        }
+        assert_eq!(history.iter().collect::<Vec<_>>(), vec![50, 0, 0]);
+
+        let idle_ratio = utilization_ratio_percent(0, 1_000, 1.0);
+        push_history(&mut history, utilization_percent_for_history(idle_ratio));
+        assert_eq!(history.iter().collect::<Vec<_>>(), vec![0, 50, 0]);
     }
 
     #[test]

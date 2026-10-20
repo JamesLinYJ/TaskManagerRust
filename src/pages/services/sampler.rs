@@ -26,9 +26,9 @@ use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW,
     OpenSCManagerW, OpenServiceW, QueryServiceConfig2W, QueryServiceConfigW, QueryServiceStatusEx,
     SC_ENUM_PROCESS_INFO, SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE, SC_STATUS_PROCESS_INFO,
-    SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW, SERVICE_QUERY_CONFIG,
-    SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STATE_ALL, SERVICE_STATUS, SERVICE_STATUS_PROCESS,
-    SERVICE_STOP, SERVICE_WIN32, StartServiceW,
+    SERVICE_ACCEPT_STOP, SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW,
+    SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STATE_ALL, SERVICE_STATUS,
+    SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_WIN32, StartServiceW,
 };
 use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -41,8 +41,8 @@ use crate::system::process_identity::{
 
 use super::model::{
     OwningProcess, ServiceActionFailure, ServiceControlAction, ServiceRequest, ServiceRunState,
-    ServiceStartupType, classify_control_result, file_name_from_win32_path, startup_from_scm,
-    state_from_scm,
+    ServiceStartupType, classify_control_result, file_name_from_win32_path,
+    service_has_valid_process_id, startup_from_scm, state_from_scm,
 };
 
 const ENUM_ATTEMPT_LIMIT: usize = 10_000;
@@ -54,6 +54,7 @@ pub(super) struct ServiceRecord {
     pub(super) description: String,
     pub(super) status: ServiceRunState,
     pub(super) startup: ServiceStartupType,
+    pub(super) accepts_stop: bool,
     pub(super) process: Option<OwningProcess>,
 }
 
@@ -188,6 +189,7 @@ fn collect_services() -> Result<ServiceCollection, u32> {
             description,
             status: entry.status,
             startup,
+            accepts_stop: entry.accepts_stop,
             process,
         });
     }
@@ -201,6 +203,7 @@ fn collect_services() -> Result<ServiceCollection, u32> {
 struct EnumeratedService {
     service_name: String,
     status: ServiceRunState,
+    accepts_stop: bool,
     process_id: u32,
 }
 
@@ -260,10 +263,20 @@ fn enumerate_win32_services(
                 let service_name = unsafe {
                     crate::infrastructure::native::widestr_ptr_to_string(record.lpServiceName)
                 };
+                let status = state_from_scm(record.ServiceStatusProcess.dwCurrentState);
                 services.push(EnumeratedService {
                     service_name,
-                    status: state_from_scm(record.ServiceStatusProcess.dwCurrentState),
-                    process_id: record.ServiceStatusProcess.dwProcessId,
+                    status,
+                    accepts_stop: record.ServiceStatusProcess.dwControlsAccepted
+                        & SERVICE_ACCEPT_STOP
+                        != 0,
+                    // SCM does not guarantee the PID while starting/stopping, and stopped
+                    // services have no valid owning PID. Do not resolve an unrelated process.
+                    process_id: if service_has_valid_process_id(status) {
+                        record.ServiceStatusProcess.dwProcessId
+                    } else {
+                        0
+                    },
                 });
             }
         }

@@ -89,6 +89,7 @@ impl ServiceCommandState {
 pub(crate) struct ServiceCommandInput {
     pub(crate) status: ServiceRunState,
     pub(crate) startup: ServiceStartupType,
+    pub(crate) accepts_stop: bool,
     pub(crate) process: Option<ProcIdentity>,
 }
 
@@ -140,12 +141,24 @@ pub(crate) fn command_state(selected: Option<ServiceCommandInput>) -> ServiceCom
     ServiceCommandState {
         start: selected.status == ServiceRunState::Stopped
             && selected.startup != ServiceStartupType::Disabled,
-        stop: matches!(
-            selected.status,
-            ServiceRunState::Running | ServiceRunState::Paused
-        ),
-        go_to_process: selected.process.is_some_and(ProcIdentity::is_verified),
+        stop: selected.accepts_stop
+            && matches!(
+                selected.status,
+                ServiceRunState::Running | ServiceRunState::Paused
+            ),
+        go_to_process: service_has_valid_process_id(selected.status)
+            && selected.process.is_some_and(ProcIdentity::is_verified),
     }
+}
+
+pub(crate) fn service_has_valid_process_id(state: ServiceRunState) -> bool {
+    matches!(
+        state,
+        ServiceRunState::Running
+            | ServiceRunState::PausePending
+            | ServiceRunState::Paused
+            | ServiceRunState::ContinuePending
+    )
 }
 
 pub(crate) fn control_reached_requested_state(
@@ -236,6 +249,7 @@ mod tests {
         ServiceCommandInput {
             status,
             startup,
+            accepts_stop: true,
             process,
         }
     }
@@ -307,7 +321,44 @@ mod tests {
         )));
         assert!(!pending.start);
         assert!(!pending.stop);
-        assert!(pending.go_to_process);
+        assert!(!pending.go_to_process);
+    }
+
+    #[test]
+    fn stop_requires_the_service_to_accept_stop_controls() {
+        for status in [ServiceRunState::Running, ServiceRunState::Paused] {
+            let mut selected = input(status, ServiceStartupType::Automatic, None);
+            selected.accepts_stop = false;
+            assert!(!command_state(Some(selected)).stop);
+            selected.accepts_stop = true;
+            assert!(command_state(Some(selected)).stop);
+        }
+    }
+
+    #[test]
+    fn transitions_with_an_invalid_service_pid_cannot_enable_navigation() {
+        for status in [
+            ServiceRunState::Stopped,
+            ServiceRunState::StartPending,
+            ServiceRunState::StopPending,
+            ServiceRunState::Unknown(99),
+        ] {
+            assert!(!service_has_valid_process_id(status));
+            let selected = input(
+                status,
+                ServiceStartupType::Automatic,
+                Some(ProcIdentity::new(44, 100)),
+            );
+            assert!(!command_state(Some(selected)).go_to_process);
+        }
+        for status in [
+            ServiceRunState::Running,
+            ServiceRunState::PausePending,
+            ServiceRunState::Paused,
+            ServiceRunState::ContinuePending,
+        ] {
+            assert!(service_has_valid_process_id(status));
+        }
     }
 
     #[test]

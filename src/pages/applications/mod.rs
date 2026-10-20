@@ -390,6 +390,10 @@ impl TaskPageState {
                     1
                 }
                 code if code == LVN_COLUMNCLICK => {
+                    let selected_identities = self
+                        .selected_task_identities(true)
+                        .into_iter()
+                        .collect::<HashSet<_>>();
                     let notify = &*(lparam as *const NMLISTVIEW);
                     let clicked = ACTIVE_COLUMNS
                         .get(notify.iSubItem as usize)
@@ -402,6 +406,9 @@ impl TaskPageState {
                         self.sort_direction = -1;
                     }
                     self.resort_tasks();
+                    // Update the displayed row mapping before queuing another snapshot. Until
+                    // that refresh completes, selected indices must still name the same tasks.
+                    self.update_task_listview(&selected_identities);
                     self.refresh_tasks();
                     1
                 }
@@ -1463,6 +1470,111 @@ fn last_error_or_gen_failure() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sorting_updates_the_list_before_a_refresh_and_keeps_the_selected_task() {
+        use std::mem::size_of;
+        use windows_sys::Win32::UI::Controls::{
+            ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVS_REPORT,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HMENU, WS_CHILD,
+        };
+
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                // SAFETY: this test owns the hidden parent and child on the creating thread.
+                unsafe { DestroyWindow(self.0) };
+            }
+        }
+        let controls = INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_LISTVIEW_CLASSES,
+        };
+        assert_ne!(unsafe { InitCommonControlsEx(&controls) }, 0);
+        let parent_class = to_wide_null("STATIC");
+        let list_class = to_wide_null("SysListView32");
+        // These are hidden test-owned windows; the synthetic tasks are never acted on.
+        let parent = TestWindow(unsafe {
+            CreateWindowExW(
+                0,
+                parent_class.as_ptr(),
+                null(),
+                0,
+                0,
+                0,
+                400,
+                300,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        });
+        assert!(!parent.0.is_null());
+        let list = unsafe {
+            CreateWindowExW(
+                0,
+                list_class.as_ptr(),
+                null(),
+                WS_CHILD | LVS_REPORT,
+                0,
+                0,
+                400,
+                300,
+                parent.0,
+                IDC_TASKLIST as usize as HMENU,
+                null_mut(),
+                null(),
+            )
+        };
+        assert!(!list.is_null());
+
+        let first = TaskIdentity {
+            hwnd: 1,
+            process: ProcIdentity::new(10, 100),
+            thread_id: 20,
+        };
+        let second = TaskIdentity {
+            hwnd: 2,
+            process: ProcIdentity::new(11, 101),
+            thread_id: 21,
+        };
+        let task = |identity, title: &str| {
+            TaskEntry::from_worker(
+                WorkerTaskEntry {
+                    identity,
+                    title: title.to_string(),
+                    architecture: None,
+                    winstation: String::new(),
+                    desktop: String::new(),
+                    is_hung: false,
+                },
+                1,
+            )
+        };
+        let mut page = TaskPageState {
+            hwnd_page: parent.0,
+            tasks: vec![task(first, "Alpha"), task(second, "Bravo")],
+            pass_count: 1,
+            ..TaskPageState::default()
+        };
+        page.update_task_listview(&HashSet::from([first]));
+        assert_eq!(page.selected_task_identities(true), vec![first]);
+        let mut notification = NMLISTVIEW {
+            hdr: NMHDR {
+                hwndFrom: list,
+                idFrom: IDC_TASKLIST as usize,
+                code: LVN_COLUMNCLICK,
+            },
+            iSubItem: 0,
+            ..unsafe { zeroed() }
+        };
+        unsafe { page.handle_notify(&mut notification as *mut _ as LPARAM) };
+        assert_eq!(page.displayed_identities, vec![second, first]);
+        assert_eq!(page.selected_task_identities(true), vec![first]);
+    }
 
     #[test]
     fn missing_custom_icons_share_the_default_slot() {

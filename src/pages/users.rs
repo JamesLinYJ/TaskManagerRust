@@ -8,7 +8,7 @@
 //   作者:       OpenAI Codex
 // --------------------------------------------------------------------------
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // 用户页实现。
 // 这里负责枚举终端服务会话、刷新用户列表，并处理发送消息、断开连接、
@@ -30,9 +30,9 @@ use windows_sys::Win32::System::RemoteDesktop::{
 use windows_sys::Win32::UI::Controls::{
     LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW,
     LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN,
-    LVM_DELETEITEM, LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT, LVM_GETITEMW, LVM_GETNEXTITEM,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETITEMSTATE, LVM_SETITEMW, LVN_COLUMNCLICK,
-    LVN_ITEMCHANGED, LVNI_SELECTED, NMHDR, NMLISTVIEW,
+    LVM_DELETEITEM, LVM_GETITEMCOUNT, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_INSERTITEMW, LVM_SETITEMSTATE, LVM_SETITEMW, LVN_COLUMNCLICK, LVN_ITEMCHANGED,
+    LVNI_FOCUSED, LVNI_SELECTED, NMHDR, NMLISTVIEW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -75,6 +75,28 @@ struct UserSessionIdentity {
 impl UserSessionIdentity {
     fn is_verified(&self) -> bool {
         self.logon_time_100ns > 0 && !self.user_name.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct UserSessionSelection {
+    selected: HashSet<UserSessionIdentity>,
+    focused: Option<UserSessionIdentity>,
+}
+
+impl UserSessionSelection {
+    fn state_for(&self, identity: &UserSessionIdentity) -> u32 {
+        let selected = if self.selected.contains(identity) {
+            LVIS_SELECTED
+        } else {
+            0
+        };
+        let focused = if self.focused.as_ref() == Some(identity) {
+            LVIS_FOCUSED
+        } else {
+            0
+        };
+        selected | focused
     }
 }
 
@@ -127,7 +149,7 @@ pub struct UserPageState {
     hwnd: HWND,
     no_title: bool,
     show_domain_names: bool,
-    selected_session_identity: Option<UserSessionIdentity>,
+    updating_list: bool,
     sessions: Vec<UserSessionEntry>,
     sort_column: usize,
     sort_ascending: bool,
@@ -274,11 +296,13 @@ impl UserPageState {
             };
             if header.idFrom == IDC_USERLIST as usize && header.hwndFrom == self.list_hwnd() {
                 if header.code == LVN_ITEMCHANGED {
-                    self.selected_session_identity = self.current_selected_session_identity();
-                    self.update_ui_state();
+                    if !self.updating_list {
+                        self.update_ui_state();
+                    }
                     return 1;
                 }
                 if header.code == LVN_COLUMNCLICK {
+                    let selection = self.capture_selection();
                     let notify = &*(lparam as *const NMLISTVIEW);
                     let column = notify.iSubItem.max(0) as usize;
                     if self.sort_column == column {
@@ -288,10 +312,7 @@ impl UserPageState {
                         self.sort_ascending = true;
                     }
                     self.sort_sessions();
-                    self.update_listview();
-                    if let Some(identity) = self.selected_session_identity.clone() {
-                        self.restore_selection(&identity);
-                    }
+                    self.update_listview(&selection);
                     return 1;
                 }
             }
@@ -449,7 +470,7 @@ impl UserPageState {
     }
 
     fn apply_session_snapshot(&mut self, snapshots: Vec<UserSessionSnapshot>) {
-        let previous_selection = self.selected_session_identity.clone();
+        let selection = self.capture_selection();
         let mut sessions = Vec::with_capacity(snapshots.len());
         for snapshot in snapshots {
             let display_name =
@@ -483,18 +504,7 @@ impl UserPageState {
 
         self.sessions = sessions;
         self.sort_sessions();
-        self.update_listview();
-
-        self.selected_session_identity = previous_selection.filter(|identity| {
-            self.sessions
-                .iter()
-                .any(|entry| entry.identity == *identity)
-        });
-        if let Some(identity) = self.selected_session_identity.clone() {
-            self.restore_selection(&identity);
-        } else {
-            self.update_ui_state();
-        }
+        self.update_listview(&selection);
     }
 
     fn sort_sessions(&mut self) {
@@ -504,7 +514,7 @@ impl UserPageState {
     }
 
     fn rebuild_display_names(&mut self) {
-        let previous_selection = self.selected_session_identity.clone();
+        let selection = self.capture_selection();
         for session in &mut self.sessions {
             let display_name =
                 format_session_display_name(&session.identity, self.show_domain_names);
@@ -515,12 +525,7 @@ impl UserPageState {
             }
         }
         self.sort_sessions();
-        self.update_listview();
-        if let Some(identity) = previous_selection {
-            self.restore_selection(&identity);
-        } else {
-            self.update_ui_state();
-        }
+        self.update_listview(&selection);
     }
 
     fn set_refresh_error(&mut self, error: u32) {
@@ -530,7 +535,7 @@ impl UserPageState {
         self.last_refresh_error = Some(error);
     }
 
-    fn update_listview(&self) {
+    fn update_listview(&mut self, selection: &UserSessionSelection) {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             // 用户列表也采用增量同步策略，减少重排带来的闪烁和选择状态丢失。
@@ -539,7 +544,21 @@ impl UserPageState {
                 return;
             }
 
+            self.updating_list = true;
             SendMessageW(list, WM_SETREDRAW, 0, 0);
+            // ListView preserves state by row number when text/lParam is replaced. Clear it
+            // before changing rows, then restore only complete identities from the old model.
+            let item = LVITEMW {
+                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                state: 0,
+                ..zeroed()
+            };
+            SendMessageW(
+                list,
+                LVM_SETITEMSTATE,
+                usize::MAX,
+                &item as *const _ as LPARAM,
+            );
 
             let mut existing_count = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) as usize;
             let common_count = existing_count.min(self.sessions.len());
@@ -576,7 +595,20 @@ impl UserPageState {
                 self.insert_row(list, index, &self.sessions[index]);
             }
 
+            for (index, session) in self.sessions.iter().enumerate() {
+                let state = selection.state_for(&session.identity);
+                if state != 0 {
+                    let item = LVITEMW {
+                        stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                        state,
+                        ..zeroed()
+                    };
+                    SendMessageW(list, LVM_SETITEMSTATE, index, &item as *const _ as LPARAM);
+                }
+            }
             finish_list_view_update(list);
+            self.updating_list = false;
+            self.update_ui_state();
         }
     }
 
@@ -647,34 +679,14 @@ impl UserPageState {
         }
     }
 
-    fn restore_selection(&self, identity: &UserSessionIdentity) {
-        // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
-        unsafe {
-            let list = self.list_hwnd();
-            if list.is_null() {
-                return;
-            }
-
-            for (index, session) in self.sessions.iter().enumerate() {
-                if session.identity != *identity {
-                    continue;
-                }
-
-                let mut item = LVITEMW {
-                    stateMask: LVIS_SELECTED | LVIS_FOCUSED,
-                    state: LVIS_SELECTED | LVIS_FOCUSED,
-                    ..zeroed()
-                };
-                SendMessageW(list, LVM_SETITEMSTATE, index, &mut item as *mut _ as isize);
-                SendMessageW(list, LVM_ENSUREVISIBLE, index, 0);
-                break;
-            }
-
-            self.update_ui_state();
+    fn capture_selection(&self) -> UserSessionSelection {
+        UserSessionSelection {
+            selected: self.selected_session_identities().into_iter().collect(),
+            focused: self.current_focused_session_identity(),
         }
     }
 
-    fn current_selected_session_identity(&self) -> Option<UserSessionIdentity> {
+    fn current_focused_session_identity(&self) -> Option<UserSessionIdentity> {
         // 安全性: this function is a safe facade over Win32/FFI work; all callers run it on the owning UI thread and the existing body preserves its original handle/pointer invariants.
         unsafe {
             let list = self.list_hwnd();
@@ -683,7 +695,7 @@ impl UserPageState {
             }
 
             let index =
-                SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) as i32;
+                SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize) as i32;
             if index < 0 {
                 return None;
             }
@@ -1358,6 +1370,73 @@ mod tests {
     use super::*;
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::Controls::{
+        ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVS_REPORT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_CHILD};
+
+    struct TestWindow(HWND);
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            // SAFETY: the test owns this hidden parent and its children on the creating thread.
+            unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    fn hidden_user_list() -> (TestWindow, UserPageState) {
+        let controls = INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_LISTVIEW_CLASSES,
+        };
+        assert_ne!(unsafe { InitCommonControlsEx(&controls) }, 0);
+        let parent_class = to_wide_null("STATIC");
+        let list_class = to_wide_null("SysListView32");
+        // SAFETY: predefined classes and all buffers are live for these synchronous calls.
+        // Neither window has WS_VISIBLE; no real session or application window is touched.
+        let parent = TestWindow(unsafe {
+            CreateWindowExW(
+                0,
+                parent_class.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                400,
+                300,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                std::ptr::null(),
+            )
+        });
+        assert!(!parent.0.is_null(), "hidden test parent creation failed");
+        let list = unsafe {
+            CreateWindowExW(
+                0,
+                list_class.as_ptr(),
+                std::ptr::null(),
+                WS_CHILD | LVS_REPORT,
+                0,
+                0,
+                400,
+                300,
+                parent.0,
+                IDC_USERLIST as usize as HMENU,
+                null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!list.is_null(), "hidden test ListView creation failed");
+        let page = UserPageState {
+            hwnd: parent.0,
+            sort_column: 1,
+            sort_ascending: true,
+            ..UserPageState::default()
+        };
+        page.configure_columns();
+        (parent, page)
+    }
 
     fn identity(session_id: u32, logon_time_100ns: i64) -> UserSessionIdentity {
         UserSessionIdentity {
@@ -1401,6 +1480,55 @@ mod tests {
             validate_observed_session_identity(&expected, &current),
             Err(ERROR_INVALID_PARAMETER)
         );
+    }
+
+    #[test]
+    fn listview_reordering_and_session_reuse_preserve_only_original_selections() {
+        let (_parent, mut page) = hidden_user_list();
+        let first = identity(1, 100);
+        let second = identity(2, 200);
+        let third = identity(3, 300);
+        page.apply_session_snapshot(vec![
+            snapshot(first.clone()),
+            snapshot(second.clone()),
+            snapshot(third.clone()),
+        ]);
+        let list = page.list_hwnd();
+        for (index, state) in [(0, LVIS_SELECTED), (2, LVIS_SELECTED | LVIS_FOCUSED)] {
+            let item = LVITEMW {
+                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                state,
+                ..unsafe { zeroed() }
+            };
+            unsafe { SendMessageW(list, LVM_SETITEMSTATE, index, &item as *const _ as LPARAM) };
+        }
+
+        // Route the actual column-click handler so the test covers both the UI and list state.
+        let mut notification = NMLISTVIEW {
+            hdr: NMHDR {
+                hwndFrom: list,
+                idFrom: IDC_USERLIST as usize,
+                code: LVN_COLUMNCLICK,
+            },
+            iSubItem: 1,
+            ..unsafe { zeroed() }
+        };
+        unsafe { page.handle_notify(&mut notification as *mut _ as LPARAM) };
+        let selected = page
+            .selected_session_identities()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(selected, HashSet::from([first.clone(), third.clone()]));
+        assert_eq!(page.current_focused_session_identity(), Some(third));
+
+        let replacement = identity(3, 301);
+        page.apply_session_snapshot(vec![
+            snapshot(first.clone()),
+            snapshot(second),
+            snapshot(replacement),
+        ]);
+        assert_eq!(page.selected_session_identities(), vec![first]);
+        assert_eq!(page.current_focused_session_identity(), None);
     }
 
     #[test]

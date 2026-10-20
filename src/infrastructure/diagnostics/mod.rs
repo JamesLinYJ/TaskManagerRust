@@ -722,33 +722,39 @@ fn writer_loop(
 ) {
     let ticker = tick(FLUSH_INTERVAL);
     loop {
+        // Shutdown must also work when the bounded control queue could not accept its message.
+        // The producer flag stops new events, so draining the accepted prefix is sufficient.
+        if shared.shutdown.load(Ordering::Acquire) {
+            let _ = flush_queued_records(&shared, &mut sink, &regular_receiver, &priority_receiver);
+            break;
+        }
         select_biased! {
             recv(control_receiver) -> command => {
                 match command {
                     Ok(WriterControl::Flush(reply)) => {
-                        for record in priority_receiver.try_iter() {
-                            write_record(&shared, &mut sink, record);
-                        }
-                        for record in regular_receiver.try_iter() {
-                            write_record(&shared, &mut sink, record);
-                        }
-                        report_dropped_events(&shared, &mut sink);
-                        let _ = reply.send(flush_sink(&shared, &mut sink));
+                        let _ = reply.send(flush_queued_records(
+                            &shared,
+                            &mut sink,
+                            &regular_receiver,
+                            &priority_receiver,
+                        ));
                     }
                     Ok(WriterControl::Shutdown(reply)) => {
-                        for record in priority_receiver.try_iter() {
-                            write_record(&shared, &mut sink, record);
-                        }
-                        for record in regular_receiver.try_iter() {
-                            write_record(&shared, &mut sink, record);
-                        }
-                        report_dropped_events(&shared, &mut sink);
-                        let _ = flush_sink(&shared, &mut sink);
+                        let _ = flush_queued_records(
+                            &shared,
+                            &mut sink,
+                            &regular_receiver,
+                            &priority_receiver,
+                        );
                         let _ = reply.send(());
                         break;
                     }
                     Err(_) => break,
                 }
+            }
+            recv(ticker) -> _ => {
+                report_dropped_events(&shared, &mut sink);
+                let _ = flush_sink(&shared, &mut sink);
             }
             recv(priority_receiver) -> record => {
                 if let Ok(record) = record {
@@ -761,13 +767,33 @@ fn writer_loop(
                     write_record(&shared, &mut sink, record);
                 }
             }
-            recv(ticker) -> _ => {
-                report_dropped_events(&shared, &mut sink);
-                let _ = flush_sink(&shared, &mut sink);
-            }
         }
     }
     shared.file_active.store(false, Ordering::Release);
+}
+
+fn flush_queued_records(
+    shared: &SharedState,
+    sink: &mut Option<FileSink>,
+    regular_receiver: &Receiver<LogRecord>,
+    priority_receiver: &Receiver<LogRecord>,
+) -> Result<(), String> {
+    // Snapshot both lengths before writing. A trace producer can continuously refill either
+    // queue; a flush acknowledges this accepted prefix instead of waiting for an empty queue.
+    let priority_count = priority_receiver.len();
+    let regular_count = regular_receiver.len();
+    drain_record_prefix(priority_receiver, priority_count, |record| {
+        write_record(shared, sink, record);
+    });
+    drain_record_prefix(regular_receiver, regular_count, |record| {
+        write_record(shared, sink, record);
+    });
+    report_dropped_events(shared, sink);
+    flush_sink(shared, sink)
+}
+
+fn drain_record_prefix(receiver: &Receiver<LogRecord>, count: usize, write: impl FnMut(LogRecord)) {
+    receiver.try_iter().take(count).for_each(write);
 }
 
 fn write_record(shared: &SharedState, sink: &mut Option<FileSink>, mut record: LogRecord) {
@@ -2247,6 +2273,69 @@ mod tests {
         assert_eq!(regular_receiver.len(), 1);
         assert_eq!(shared.dropped_regular.load(Ordering::Relaxed), 2);
         assert_eq!(shared.dropped_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn flush_prefix_finishes_even_when_a_producer_refills_every_slot() {
+        let shared = test_shared(false);
+        let (sender, receiver) = bounded(3);
+        for operation in 0..3 {
+            sender
+                .send(build_record(
+                    &shared,
+                    Level::Trace,
+                    "test.refilled",
+                    "test",
+                    "continuous producer",
+                    Some(operation),
+                    None,
+                    &[],
+                    "src/test.rs",
+                    1,
+                ))
+                .expect("initial prefix should fit");
+        }
+        let mut operations = Vec::new();
+        drain_record_prefix(&receiver, receiver.len(), |record| {
+            operations.push(record.operation_id);
+            assert!(operations.len() <= 3, "flush chased newly queued records");
+            sender
+                .send(record)
+                .expect("producer should refill the released slot");
+        });
+        assert_eq!(operations, [Some(0), Some(1), Some(2)]);
+        assert_eq!(receiver.len(), 3);
+    }
+
+    #[test]
+    fn writer_stops_when_shutdown_control_cannot_be_queued() {
+        let shared = Arc::new(test_shared(false));
+        shared.shutdown.store(true, Ordering::Release);
+        let (_regular_sender, regular_receiver) = bounded(1);
+        let (_priority_sender, priority_receiver) = bounded(1);
+        let (control_sender, control_receiver) = bounded(1);
+        let (done_sender, done_receiver) = bounded(1);
+        let thread = thread::spawn(move || {
+            writer_loop(
+                shared,
+                None,
+                regular_receiver,
+                priority_receiver,
+                control_receiver,
+            );
+            let _ = done_sender.send(());
+        });
+        let stopped = done_receiver.recv_timeout(Duration::from_secs(2)).is_ok();
+        if !stopped {
+            // Rescue a regressed writer before failing so the test never leaves a live thread.
+            let (reply, _) = bounded(1);
+            let _ = control_sender.send(WriterControl::Shutdown(reply));
+        }
+        thread.join().expect("writer should exit without a panic");
+        assert!(
+            stopped,
+            "writer waited forever for an unsent shutdown command"
+        );
     }
 
     #[test]
