@@ -1905,7 +1905,7 @@ fn install_panic_hook() {
                     .map(String::as_str)
             })
             .unwrap_or("non-string panic payload");
-        let fields = location
+        let mut fields = location
             .map(|location| {
                 vec![
                     Field::text("panic_file", normalized_source_path(location.file())),
@@ -1914,7 +1914,14 @@ fn install_panic_hook() {
                 ]
             })
             .unwrap_or_default();
-        event(Level::Error, "process.panic", "runtime", message, &fields);
+        fields.push(Field::sensitive_text("panic_message", message));
+        event(
+            Level::Error,
+            "process.panic",
+            "runtime",
+            "a Rust panic occurred",
+            &fields,
+        );
         if thread::current().name() != Some("taskmgr-rs-diagnostics") {
             let _ = flush();
         }
@@ -2205,6 +2212,7 @@ mod tests {
                 )),
             ];
             assert_eq!(crate::capabilities::run_with_arguments(command), Some(2));
+            assert!(std::panic::catch_unwind(|| panic!("{PRIVATE}: controlled panic")).is_err());
             flush().unwrap();
             if sensitive {
                 // Already collected sensitive data must still require consent after disabling.
@@ -2252,6 +2260,7 @@ mod tests {
                 "diagnostics.storage_degraded",
                 "diagnostics.argument_ignored",
                 "capabilities.report_failed",
+                "process.panic",
             ] {
                 let record = records.iter().find(|r| r["event"] == event_name).unwrap();
                 assert!(!record["message"].as_str().unwrap().contains(PRIVATE));
