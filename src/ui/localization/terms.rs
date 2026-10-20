@@ -26,6 +26,16 @@ pub fn user_session_column_title() -> &'static str {
     text(TextKey::Session)
 }
 
+pub fn service_column_titles() -> [&'static str; 5] {
+    [
+        text(TextKey::ServiceColumnName),
+        text(TextKey::ServiceColumnDescription),
+        text(TextKey::Status),
+        text(TextKey::ServiceColumnStartupType),
+        text(TextKey::ServiceColumnProcess),
+    ]
+}
+
 pub fn network_column_titles() -> [&'static str; 7] {
     // 网络页列标题会被列表头和相关对话框共同复用。
     [

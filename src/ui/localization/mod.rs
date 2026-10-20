@@ -24,7 +24,7 @@ mod language_ui;
 mod text_key;
 
 pub use language_terms::{
-    adapter_state, network_column_titles, session_state, user_column_titles,
+    adapter_state, network_column_titles, service_column_titles, session_state, user_column_titles,
     user_session_column_title,
 };
 pub use language_ui::localize_dialog;

@@ -1172,6 +1172,14 @@ impl App {
                     .unwrap_or(false),
             );
         }
+        if self.options.current_page == PageId::Services.persisted() {
+            let commands = self.pages[PageId::Services.index()]
+                .service_command_state()
+                .unwrap_or_default();
+            self.enable_menu_item(menu, IDM_SERVICE_START, commands.start);
+            self.enable_menu_item(menu, IDM_SERVICE_STOP, commands.stop);
+            self.enable_menu_item(menu, IDM_SERVICE_GOTOPROCESS, commands.go_to_process);
+        }
 
         // 安全性: same menu handle as above.
         unsafe {
@@ -1184,6 +1192,17 @@ impl App {
                     } else {
                         MF_ENABLED
                     },
+            );
+        }
+    }
+
+    fn enable_menu_item(&self, menu: HMENU, item_id: u16, enabled: bool) {
+        // 安全性: caller passes a menu handle currently owned by the main window or popup menu.
+        unsafe {
+            EnableMenuItem(
+                menu,
+                u32::from(item_id),
+                MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED },
             );
         }
     }
@@ -1979,6 +1998,8 @@ impl App {
 
     fn on_init_menu(&mut self) -> isize {
         // 菜单刚弹出时先标记“暂时不能隐藏窗口”，避免右键隐藏逻辑误触发。
+        // 服务命令的可用状态跟随当前选择，在菜单打开时重新计算。
+        self.update_menu_states();
         self.menu.mark_menu_opened();
         0
     }
@@ -2251,6 +2272,17 @@ impl App {
                     if self.options.current_page == PageId::Users.persisted() {
                         let handled =
                             self.pages[PageId::Users.index()].handle_user_command(command_id);
+                        if handled {
+                            self.update_menu_states();
+                        }
+                    } else {
+                        MessageBeep(0);
+                    }
+                }
+                IDM_SERVICE_START | IDM_SERVICE_STOP | IDM_SERVICE_GOTOPROCESS => {
+                    if self.options.current_page == PageId::Services.persisted() {
+                        let handled =
+                            self.pages[PageId::Services.index()].handle_service_command(command_id);
                         if handled {
                             self.update_menu_states();
                         }

@@ -265,6 +265,31 @@ fn build_gpu_main_menu() -> MenuResult<MenuBar> {
     Ok(bar)
 }
 
+fn build_services_main_menu() -> MenuResult<MenuBar> {
+    let mut bar = MenuBar::new()?;
+    let mut view = PopupMenu::new()?;
+    append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
+    view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
+    append_common_main_menus(
+        &mut bar,
+        build_file_menu()?,
+        build_common_options_menu(false)?,
+        view,
+    )?;
+    bar.append_submenu(text(TextKey::ServicesMenu), build_service_command_menu()?)?;
+    bar.append_submenu(text(TextKey::Help), build_common_help_menu()?)?;
+    Ok(bar)
+}
+
+fn build_service_command_menu() -> MenuResult<PopupMenu> {
+    let mut menu = PopupMenu::new()?;
+    append_item(&mut menu, IDM_SERVICE_START, TextKey::ServiceStart)?;
+    append_item(&mut menu, IDM_SERVICE_STOP, TextKey::ServiceStop)?;
+    append_separator(&mut menu)?;
+    append_item(&mut menu, IDM_SERVICE_GOTOPROCESS, TextKey::GoToProcess)?;
+    Ok(menu)
+}
+
 fn build_users_main_menu() -> MenuResult<MenuBar> {
     let mut bar = MenuBar::new()?;
     let options = build_options_menu(&[
@@ -290,6 +315,10 @@ fn build_tray_popup() -> MenuResult<PopupMenu> {
     Ok(menu)
 }
 
+fn build_service_context_popup() -> MenuResult<PopupMenu> {
+    build_service_command_menu()
+}
+
 fn build_user_context_popup() -> MenuResult<PopupMenu> {
     let mut menu = PopupMenu::new()?;
     append_item(&mut menu, IDM_SENDMESSAGE, TextKey::SendMessage)?;
@@ -308,6 +337,7 @@ pub fn build_main_menu(resource_id: u16, processor_count: usize) -> MenuResult<M
         IDR_MAINMENU_GPU => build_gpu_main_menu()?,
         IDR_MAINMENU_NET => build_network_main_menu()?,
         IDR_MAINMENU_USER => build_users_main_menu()?,
+        IDR_MAINMENU_SERVICE => build_services_main_menu()?,
         _ => return Err(ERROR_RESOURCE_DATA_NOT_FOUND),
     };
     sanitize_task_manager_menu(menu.as_raw(), processor_count);
@@ -325,6 +355,7 @@ pub(crate) const fn supports_main_menu(resource_id: u16) -> bool {
             | IDR_MAINMENU_GPU
             | IDR_MAINMENU_NET
             | IDR_MAINMENU_USER
+            | IDR_MAINMENU_SERVICE
     )
 }
 
@@ -333,6 +364,7 @@ pub fn build_popup_menu(resource_id: u16) -> MenuResult<PopupMenu> {
         IDR_TASK_CONTEXT => build_task_context_popup(),
         IDR_TASKVIEW => build_task_view_popup(),
         IDR_USER_CONTEXT => build_user_context_popup(),
+        IDR_SERVICE_CONTEXT => build_service_context_popup(),
         IDR_TRAYMENU => build_tray_popup(),
         _ => Err(ERROR_RESOURCE_DATA_NOT_FOUND),
     }
