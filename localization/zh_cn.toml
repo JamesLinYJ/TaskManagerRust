@@ -293,6 +293,7 @@ UnableToOpenFileLocation = "无法打开文件位置"
 UnableToCreateDumpFile = "无法创建转储文件"
 DumpFileCreated = "已创建转储文件。"
 DumpFileFilter = "转储文件"
+DumpCleanupFailed = "无法删除临时转储文件。"
 KillProcessTreePrompt = """此操作将尝试终止该进程，以及所有由它直接或间接启动的进程。
 
 以这种方式强制终止进程可能会导致数据丢失和系统不稳定。

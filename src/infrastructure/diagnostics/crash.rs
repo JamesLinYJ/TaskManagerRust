@@ -49,6 +49,25 @@ const TEST_CRASH_ENVIRONMENT: &str = "TASKMGR_RS_DIAGNOSTIC_TEST_CRASH";
 
 static CRASH_DIRECTORY: OnceLock<Box<[u16]>> = OnceLock::new();
 static MINIDUMP_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Process-wide gate for `MiniDumpWriteDump`.
+///
+/// DbgHelp is not reentrant. The exception filter must not wait, allocate, or
+/// take a lock, so this is one atomic compare-exchange.
+static DBGHELP_DUMP_GATE: AtomicBool = AtomicBool::new(false);
+
+/// Acquires the process-wide `MiniDumpWriteDump` gate without waiting.
+///
+/// Safe on the exception thread: one atomic compare-exchange, no allocation and no lock.
+pub(crate) fn try_acquire_dbghelp_dump() -> bool {
+    DBGHELP_DUMP_GATE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Releases the gate acquired by `try_acquire_dbghelp_dump`.
+pub(crate) fn release_dbghelp_dump() {
+    DBGHELP_DUMP_GATE.store(false, Ordering::Release);
+}
 
 #[derive(Clone, Copy)]
 struct NulTerminatedWide<'a> {
@@ -187,8 +206,10 @@ unsafe extern "system" fn unhandled_exception_filter(
 
     if MINIDUMP_ENABLED.load(Ordering::Acquire)
         && let Some(path) = build_crash_path(&mut path, pid, tid, ".dmp")
+        && try_acquire_dbghelp_dump()
     {
         write_minidump(path, pid, tid, &exception);
+        release_dbghelp_dump();
     }
 
     EXCEPTION_CONTINUE_SEARCH
@@ -503,6 +524,15 @@ mod tests {
         // Safety: null is explicitly accepted by the callback-boundary contract.
         let exception = unsafe { ExceptionContext::from_callback(null()) };
         assert_eq!(exception_details(&exception), (0, 0));
+    }
+
+    #[test]
+    fn dbghelp_dump_gate_does_not_wait_for_the_holder() {
+        assert!(try_acquire_dbghelp_dump());
+        assert!(!try_acquire_dbghelp_dump());
+        release_dbghelp_dump();
+        assert!(try_acquire_dbghelp_dump());
+        release_dbghelp_dump();
     }
 
     #[test]

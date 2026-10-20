@@ -219,6 +219,7 @@ struct ProcessStrings {
     cant_open_file_location: String,
     cant_create_dump: String,
     dump_created: String,
+    dump_cleanup_failed: String,
     priority_low: String,
     priority_below_normal: String,
     priority_normal: String,
@@ -360,7 +361,7 @@ pub struct ProcessPageState {
     strings: ProcessStrings,
     pass_count: u64,
     worker: Option<SingleFlightWorker<ProcWorkerRequest, ProcWorkerResult>>,
-    dump_worker: Option<SingleFlightWorker<dump::ProcessDumpRequest, dump::ProcessDumpReport>>,
+    dump_worker: Option<dump::DumpWorker>,
     last_refresh_error: Option<u32>,
     last_row_error: Option<u32>,
 }
@@ -905,6 +906,7 @@ impl ProcessPageState {
         self.strings.cant_open_file_location = text(TextKey::UnableToOpenFileLocation).to_string();
         self.strings.cant_create_dump = text(TextKey::UnableToCreateDumpFile).to_string();
         self.strings.dump_created = text(TextKey::DumpFileCreated).to_string();
+        self.strings.dump_cleanup_failed = text(TextKey::DumpCleanupFailed).to_string();
         self.strings.priority_low = text(TextKey::Low).to_string();
         self.strings.priority_below_normal = text(TextKey::BelowNormal).to_string();
         self.strings.priority_normal = text(TextKey::Normal).to_string();

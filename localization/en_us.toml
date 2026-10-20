@@ -300,6 +300,7 @@ UnableToOpenFileLocation = "Unable to Open File Location"
 UnableToCreateDumpFile = "Unable to Create Dump File"
 DumpFileCreated = "The dump file was created."
 DumpFileFilter = "Dump Files"
+DumpCleanupFailed = "The temporary dump file could not be deleted."
 KillProcessTreePrompt = """This operation will attempt to terminate this process and any
 processes which were directly or indirectly started by it.
 

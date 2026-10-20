@@ -293,6 +293,7 @@ UnableToOpenFileLocation = "Unable to Open File Location"
 UnableToCreateDumpFile = "Não foi possível criar o arquivo de despejo"
 DumpFileCreated = "O arquivo de despejo foi criado."
 DumpFileFilter = "Arquivos de despejo"
+DumpCleanupFailed = "Não foi possível excluir o arquivo de despejo temporário."
 KillProcessTreePrompt = """This operation will attempt to terminate this process and any
 processes which were directly or indirectly started by it.
 

@@ -308,6 +308,7 @@ pub enum TextKey {
     UnableToCreateDumpFile,
     DumpFileCreated,
     DumpFileFilter,
+    DumpCleanupFailed,
     KillProcessTreePrompt,
     KillProcessTreeFailed,
     KillProcessTreeFailedBody,

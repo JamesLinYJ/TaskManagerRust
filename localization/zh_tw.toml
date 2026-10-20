@@ -293,6 +293,7 @@ UnableToOpenFileLocation = "無法開啟檔案位置"
 UnableToCreateDumpFile = "無法建立傾印檔案"
 DumpFileCreated = "已建立傾印檔案。"
 DumpFileFilter = "傾印檔案"
+DumpCleanupFailed = "無法刪除暫存傾印檔案。"
 KillProcessTreePrompt = """此操作會嘗試終止此處理程序，以及所有由它直接或間接啟動的處理程序。
 
 以這種方式強制終止處理程序可能會造成資料遺失與系統不穩定。

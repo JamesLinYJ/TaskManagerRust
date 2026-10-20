@@ -293,6 +293,7 @@ UnableToOpenFileLocation = "Unable to Open File Location"
 UnableToCreateDumpFile = "Не удалось создать файл дампа"
 DumpFileCreated = "Файл дампа создан."
 DumpFileFilter = "Файлы дампа"
+DumpCleanupFailed = "Не удалось удалить временный файл дампа."
 KillProcessTreePrompt = """This operation will attempt to terminate this process and any
 processes which were directly or indirectly started by it.
 
