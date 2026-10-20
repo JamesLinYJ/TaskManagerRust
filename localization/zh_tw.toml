@@ -317,6 +317,9 @@ ServiceStartFailed = "無法啟動服務。"
 ServiceStopFailed = "無法停止服務。"
 ServiceStateUnchanged = "服務沒有進入要求的狀態。"
 ServiceProcessPid = "PID"
+DisconnectStatusHelp = "中斷選取的使用者工作階段"
+LogoffStatusHelp = "將選取的使用者工作階段登出"
+SendMessageStatusHelp = "傳送訊息給選取的使用者工作階段"
 
 [menu_status_help]
 IDM_RUN = "Runs a new program"

@@ -87,6 +87,11 @@ struct AffinityDialogContext {
 const PROCESS_TREE_ACCESS: u32 =
     PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
 
+// `TerminateProcess` fails once a process has begun to exit, and the process object may not be
+// signaled in that same instant. This bound only applies after termination has already failed.
+// The wait returns as soon as the process exits.
+const EXITED_PROCESS_CONFIRM_MS: u32 = 250;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum DescendantProcessOutcome<T> {
     Verified(T),
@@ -1593,8 +1598,11 @@ pub(super) fn terminate_prepared_process_tree(
         }
 
         // Capture TerminateProcess's error before WaitForSingleObject can change last-error.
+        // A zero timeout treats a process that is already inside exit as a failure.
         let error = nonzero_last_error();
-        let wait_result = unsafe { WaitForSingleObject(handle.as_raw(), 0) };
+        // SAFETY: `handle` was opened with SYNCHRONIZE and is owned for this call.
+        let wait_result =
+            unsafe { WaitForSingleObject(handle.as_raw(), EXITED_PROCESS_CONFIRM_MS) };
         match classify_failed_termination(error, wait_result) {
             FailedTerminationOutcome::AlreadyTerminated => {
                 outcome.any_completed = true;

@@ -317,6 +317,9 @@ ServiceStartFailed = "无法启动该服务。"
 ServiceStopFailed = "无法停止该服务。"
 ServiceStateUnchanged = "该服务没有进入请求的状态。"
 ServiceProcessPid = "PID"
+DisconnectStatusHelp = "断开所选用户会话"
+LogoffStatusHelp = "注销所选用户会话"
+SendMessageStatusHelp = "向所选用户会话发送消息"
 
 [menu_status_help]
 IDM_RUN = "Runs a new program"

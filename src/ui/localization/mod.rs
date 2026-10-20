@@ -82,5 +82,12 @@ pub fn text(key: TextKey) -> &'static str {
 }
 
 pub fn menu_status_help(command_id: u16) -> Option<&'static str> {
-    generated_menu_status_help(current_language(), command_id)
+    // Users-page session commands publish status text through TextKey. The generated
+    // command table covers the other menu items.
+    match command_id {
+        crate::ui::resource_ids::IDM_DISCONNECT => Some(text(TextKey::DisconnectStatusHelp)),
+        crate::ui::resource_ids::IDM_LOGOFF => Some(text(TextKey::LogoffStatusHelp)),
+        crate::ui::resource_ids::IDM_SENDMESSAGE => Some(text(TextKey::SendMessageStatusHelp)),
+        _ => generated_menu_status_help(current_language(), command_id),
+    }
 }

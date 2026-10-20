@@ -328,4 +328,7 @@ pub enum TextKey {
     ServiceStopFailed,
     ServiceStateUnchanged,
     ServiceProcessPid,
+    DisconnectStatusHelp,
+    LogoffStatusHelp,
+    SendMessageStatusHelp,
 }

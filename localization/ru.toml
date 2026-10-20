@@ -320,6 +320,9 @@ ServiceStartFailed = "Не удалось запустить службу."
 ServiceStopFailed = "Не удалось остановить службу."
 ServiceStateUnchanged = "Служба не перешла в запрошенное состояние."
 ServiceProcessPid = "PID"
+DisconnectStatusHelp = "Отключает выбранный сеанс пользователя"
+LogoffStatusHelp = "Завершает выбранный сеанс пользователя"
+SendMessageStatusHelp = "Отправляет сообщение выбранному сеансу пользователя"
 
 [menu_status_help]
 IDM_RUN = "Runs a new program"
