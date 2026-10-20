@@ -24,7 +24,8 @@ use std::slice;
 
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA,
-    ERROR_NONE_MAPPED, GetLastError, HANDLE, LocalFree, RtlNtStatusToDosError,
+    ERROR_INVALID_PARAMETER, ERROR_NONE_MAPPED, GetLastError, HANDLE, LocalFree,
+    RtlNtStatusToDosError,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
@@ -47,7 +48,9 @@ use crate::infrastructure::native::{
 use crate::system::cpu_sampler::{
     ProcessorPerformance, checked_summed_processor_times, query_processor_performance,
 };
-use crate::system::process_identity::{ProcIdentity, open_process_for_identity};
+use crate::system::process_identity::{
+    ProcIdentity, open_process_for_identity, query_process_identity_for_pid,
+};
 
 #[derive(Clone, Default)]
 struct PreviousProcSample {
@@ -414,6 +417,27 @@ unsafe fn collect_process_identity_map(
     }
 }
 
+/// Whether a WTS row, which is keyed only by PID, still names `expected`.
+///
+/// `live` is `None` only when this identity has already refused `PROCESS_QUERY_LIMITED_INFORMATION`
+/// and must not be opened again. Access denied cannot prove the PID was reused, so the image and
+/// session check remains. Any other open failure, or a different creation time, means the row
+/// belongs to a process that exited or was replaced.
+pub(super) fn wts_live_identity_allows_merge(
+    expected: ProcIdentity,
+    live: Option<Result<ProcIdentity, u32>>,
+) -> bool {
+    if !expected.is_verified() {
+        return false;
+    }
+    match live {
+        None => true,
+        Some(Ok(live)) => live == expected,
+        Some(Err(ERROR_ACCESS_DENIED)) => true,
+        Some(Err(_)) => false,
+    }
+}
+
 pub(super) fn merge_wts_process_identity(
     entry: &mut ProcEntry,
     wts_identity: Option<&WtsProcessIdentity>,
@@ -422,8 +446,8 @@ pub(super) fn merge_wts_process_identity(
         return false;
     };
 
-    // WTS only keys rows by PID. Requiring the same image and a compatible session prevents a
-    // stale WTS row from overwriting a newer process after PID reuse.
+    // WTS only keys rows by PID. The caller rejects a live identity that is gone or reused
+    // before this image and session check copies an account name onto the row.
     if !wts_identity_matches(&entry.image_name_lower, entry.session_id, wts_identity) {
         return false;
     }
@@ -925,7 +949,33 @@ fn collect_process_entries(
         Ok(identity_snapshot) => {
             row_error = row_error.or(identity_snapshot.row_error);
             for entry in collected.entries.iter_mut().filter(|entry| entry.pid != 0) {
-                if merge_wts_process_identity(entry, identity_snapshot.identities.get(&entry.pid))
+                let Some(wts_identity) = identity_snapshot.identities.get(&entry.pid) else {
+                    continue;
+                };
+                if !wts_identity_matches(&entry.image_name_lower, entry.session_id, wts_identity) {
+                    continue;
+                }
+                let open_already_denied = denied.contains(&entry.identity)
+                    || cache
+                        .metadata
+                        .get(&entry.identity)
+                        .is_some_and(|metadata| metadata.query_access_denied);
+                let live = if open_already_denied {
+                    None
+                } else {
+                    Some(query_process_identity_for_pid(entry.pid))
+                };
+                if let Some(Err(error)) = live {
+                    if error == ERROR_ACCESS_DENIED && entry.identity.is_verified() {
+                        denied.insert(entry.identity);
+                    } else if error != ERROR_ACCESS_DENIED && error != ERROR_INVALID_PARAMETER {
+                        row_error.get_or_insert(error);
+                    }
+                }
+                if !wts_live_identity_allows_merge(entry.identity, live) {
+                    continue;
+                }
+                if merge_wts_process_identity(entry, Some(wts_identity))
                     && entry.identity.is_verified()
                 {
                     resolved_users.insert(entry.identity);
@@ -1097,6 +1147,7 @@ mod tests {
     use std::collections::HashMap;
     use std::mem::size_of;
 
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetCurrentProcessId, HIGH_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
@@ -1105,7 +1156,7 @@ mod tests {
     use super::{
         AccountNameCache, ParsedProcess, SystemProcessInformation, UnicodeString,
         build_process_entries, parse_system_process_information, query_process_account_name,
-        query_system_process_information,
+        query_system_process_information, wts_live_identity_allows_merge,
     };
     use crate::infrastructure::native::OwnedHandle;
     use crate::system::process_identity::{ProcIdentity, query_process_identity_for_pid};
@@ -1117,6 +1168,32 @@ mod tests {
             .expect("the current process primary token should expose TokenUser");
 
         assert!(!account_name.is_empty());
+    }
+
+    #[test]
+    fn wts_account_requires_the_same_live_process() {
+        let expected = ProcIdentity::new(77, 1_000);
+        let reused = ProcIdentity::new(77, 2_000);
+
+        assert!(wts_live_identity_allows_merge(expected, Some(Ok(expected))));
+        assert!(!wts_live_identity_allows_merge(expected, Some(Ok(reused))));
+        assert!(!wts_live_identity_allows_merge(
+            expected,
+            Some(Err(ERROR_INVALID_PARAMETER))
+        ));
+        assert!(wts_live_identity_allows_merge(
+            expected,
+            Some(Err(ERROR_ACCESS_DENIED))
+        ));
+        assert!(wts_live_identity_allows_merge(expected, None));
+        assert!(!wts_live_identity_allows_merge(
+            ProcIdentity::pid_only(77),
+            Some(Ok(ProcIdentity::pid_only(77)))
+        ));
+        assert!(!wts_live_identity_allows_merge(
+            ProcIdentity::pid_only(77),
+            None
+        ));
     }
 
     #[test]
