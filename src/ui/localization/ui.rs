@@ -35,6 +35,11 @@ pub fn localize_dialog(hwnd: HWND, dialog_id: u16) {
         }
         IDD_PROCPAGE => {
             set_dialog_item_text(hwnd, IDC_TERMINATE, TextKey::EndProcess);
+            set_dialog_item_text(
+                hwnd,
+                IDC_PROCESS_FILTER_LABEL,
+                TextKey::ProcessNameFilterLabel,
+            );
         }
         IDD_NETPAGE => {
             set_dialog_item_text(hwnd, IDC_NOADAPTERS, TextKey::NoActiveNetworkAdaptersFound);

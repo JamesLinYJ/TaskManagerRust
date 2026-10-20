@@ -195,6 +195,7 @@ fn build_process_main_menu() -> MenuResult<MenuBar> {
     append_item(&mut view, IDM_REFRESH, TextKey::RefreshNow)?;
     view.append_submenu(text(TextKey::UpdateSpeed), build_update_speed_menu()?)?;
     append_separator(&mut view)?;
+    append_item(&mut view, IDM_PROC_FILTER, TextKey::ProcessNameFilterMenu)?;
     append_item(&mut view, IDM_PROCCOLS, TextKey::SelectColumnsMenu)?;
     append_common_main_menus(
         &mut bar,

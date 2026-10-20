@@ -325,4 +325,6 @@ pub enum TextKey {
     ServiceStopFailed,
     ServiceStateUnchanged,
     ServiceProcessPid,
+    ProcessNameFilterLabel,
+    ProcessNameFilterMenu,
 }

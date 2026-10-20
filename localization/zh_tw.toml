@@ -314,6 +314,8 @@ ServiceStartFailed = "無法啟動服務。"
 ServiceStopFailed = "無法停止服務。"
 ServiceStateUnchanged = "服務沒有進入要求的狀態。"
 ServiceProcessPid = "PID"
+ProcessNameFilterLabel = "篩選:"
+ProcessNameFilterMenu = "依名稱篩選(&N)\tCtrl+F"
 
 [menu_status_help]
 IDM_RUN = "Runs a new program"
@@ -349,3 +351,4 @@ IDM_TASK_BRINGTOFRONT = "Brings the window front, but does not switch to it"
 IDM_SERVICE_START = "啟動選取的服務"
 IDM_SERVICE_STOP = "停止選取的服務"
 IDM_SERVICE_GOTOPROCESS = "在處理程序頁選取該服務的處理程序"
+IDM_PROC_FILTER = "只顯示映像名稱包含所輸入文字的處理程序"

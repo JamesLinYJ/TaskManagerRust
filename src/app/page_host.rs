@@ -506,7 +506,8 @@ impl PageState {
         match msg {
             WM_COMMAND => match self {
                 Self::Gpu(state) => Some(state.handle_command(wparam)),
-                Self::Task(_) | Self::Process(_) | Self::Users(_) | Self::Services(_) => {
+                Self::Process(state) => Some(state.handle_window_command(wparam)),
+                Self::Task(_) | Self::Users(_) | Self::Services(_) => {
                     Some(self.handle_page_command((wparam & 0xFFFF) as u16))
                 }
                 _ => None,
@@ -898,6 +899,12 @@ impl DialogPage {
         options: Option<&mut Options>,
     ) -> bool {
         self.state.handle_process_command(command_id, options)
+    }
+
+    pub fn focus_process_name_filter(&mut self) {
+        if let PageState::Process(state) = &mut self.state {
+            state.focus_name_filter();
+        }
     }
 
     pub fn handle_user_command(&mut self, command_id: u16) -> bool {

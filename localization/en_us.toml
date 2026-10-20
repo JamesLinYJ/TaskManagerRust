@@ -324,6 +324,8 @@ ServiceStartFailed = "Unable to start the service."
 ServiceStopFailed = "Unable to stop the service."
 ServiceStateUnchanged = "The service did not enter the requested state."
 ServiceProcessPid = "PID"
+ProcessNameFilterLabel = "Filter:"
+ProcessNameFilterMenu = "Filter by &Name\tCtrl+F"
 
 [menu_status_help]
 IDM_RUN = "Runs a new program"
@@ -359,3 +361,4 @@ IDM_TASK_BRINGTOFRONT = "Brings the window front, but does not switch to it"
 IDM_SERVICE_START = "Starts the selected service"
 IDM_SERVICE_STOP = "Stops the selected service"
 IDM_SERVICE_GOTOPROCESS = "Selects the service process on the Processes page"
+IDM_PROC_FILTER = "Shows only processes whose image name contains the typed text"

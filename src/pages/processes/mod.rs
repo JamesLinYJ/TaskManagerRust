@@ -9,12 +9,15 @@
 // --------------------------------------------------------------------------
 
 mod actions;
+mod filter;
 mod model;
 mod sampler;
 
 // 进程页实现。
 // 这里负责采集进程列表、计算每轮刷新之间的增量数据、维护排序状态，
 // 并处理结束进程、调试、设置优先级和亲和性等操作。
+// 名称筛选是 UI 线程上的视图：只过滤已经提交的快照，不查询进程、令牌或图标，
+// 也不把筛选条件交给采样线程。
 //
 // 线程模型：
 //   SingleFlightWorker 工作线程在后台执行 collect_process_entries() 采样，
@@ -36,28 +39,30 @@ use windows_sys::Win32::System::Threading::{
     IDLE_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
 };
 use windows_sys::Win32::UI::Controls::{
-    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked, LVCF_FMT, LVCF_SUBITEM,
-    LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVIF_STATE, LVIF_TEXT,
-    LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN, LVM_ENSUREVISIBLE,
+    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, EM_SETSEL, IsDlgButtonChecked, LVCF_FMT,
+    LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVIF_STATE,
+    LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETECOLUMN, LVM_ENSUREVISIBLE,
     LVM_GETCOLUMNORDERARRAY, LVM_GETCOLUMNWIDTH, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT,
     LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETITEMCOUNT,
     LVM_SETITEMSTATE, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED,
     LVS_SHOWSELALWAYS, LVSICF_NOINVALIDATEALL, LVSICF_NOSCROLL, NMHDR, NMLISTVIEW, NMLVDISPINFOW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EndDialog, GWL_STYLE, GetClientRect,
-    GetCursorPos, GetDlgItem, GetWindowLongW, IDCANCEL, IDOK, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetWindowLongW, TPM_RETURNCMD, TrackPopupMenuEx,
-    WM_COMMAND, WM_INITDIALOG, WM_SETREDRAW,
+    BeginDeferWindowPos, DeferWindowPos, EN_CHANGE, EndDeferWindowPos, EndDialog, GWL_STYLE,
+    GetClientRect, GetCursorPos, GetDlgItem, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+    IDCANCEL, IDOK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
+    SetWindowLongW, SetWindowTextW, TPM_RETURNCMD, TrackPopupMenuEx, WM_COMMAND, WM_INITDIALOG,
+    WM_SETREDRAW,
 };
 
 use self::actions::load_debugger_path;
+use self::filter::{ProcessNameFilter, ProcessViewUpdate, neighbor_after, plan_process_name_view};
 use self::model::{DirtyColumns, ProcEntry, column_text, compare_entries, update_process_entry};
 use self::sampler::{ProcWorkerRequest, ProcWorkerResult, ProcWorkerState};
 use crate::config::options::{ColumnId, Options, UpdateSpeed};
 use crate::infrastructure::native::{
-    copy_text_to_callback_buffer, finish_list_view_update, get_window_userdata, loword,
+    copy_text_to_callback_buffer, finish_list_view_update, get_window_userdata, hiword, loword,
     record_win32_error, set_window_userdata, subclass_list_view, to_wide_null,
     window_rect_relative_to_page,
 };
@@ -175,10 +180,8 @@ enum SelectionScrollPolicy {
     RevealSelection,
 }
 
-fn refresh_selection_scroll_policy(
-    requested_selection: Option<ProcIdentity>,
-) -> SelectionScrollPolicy {
-    if requested_selection.is_some() {
+fn refresh_selection_scroll_policy(reveal_selection: bool) -> SelectionScrollPolicy {
+    if reveal_selection {
         SelectionScrollPolicy::RevealSelection
     } else {
         SelectionScrollPolicy::PreserveViewport
@@ -302,7 +305,13 @@ pub struct ProcessPageState {
     main_hwnd: HWND,
     entries: Vec<ProcEntry>,
     displayed_identities: Vec<ProcIdentity>,
+    /// Indexes into `entries` for the rows the virtual list is currently showing.
+    visible_rows: Vec<usize>,
+    /// Image-name view. Empty shows the full snapshot. Not stored in `Options`.
+    name_filter: ProcessNameFilter,
     active_columns: Vec<ColumnId>,
+    /// Process to restore. This stays set when a filter hides the row, as long as
+    /// the identity is still in the unfiltered snapshot.
     selected_identity: Option<ProcIdentity>,
     pending_find_identity: Option<ProcIdentity>,
     sort_column: ColumnId,
@@ -318,6 +327,8 @@ pub struct ProcessPageState {
     worker: Option<SingleFlightWorker<ProcWorkerRequest, ProcWorkerResult>>,
     last_refresh_error: Option<u32>,
     last_row_error: Option<u32>,
+    suppress_selection_notify: bool,
+    suppress_filter_notify: bool,
 }
 
 impl Default for ProcessPageState {
@@ -328,6 +339,8 @@ impl Default for ProcessPageState {
             main_hwnd: null_mut(),
             entries: Vec::with_capacity(128),
             displayed_identities: Vec::with_capacity(128),
+            visible_rows: Vec::with_capacity(128),
+            name_filter: ProcessNameFilter::default(),
             active_columns: Vec::with_capacity(NUM_COLUMN),
             selected_identity: None,
             pending_find_identity: None,
@@ -344,6 +357,8 @@ impl Default for ProcessPageState {
             worker: None,
             last_refresh_error: None,
             last_row_error: None,
+            suppress_selection_notify: false,
+            suppress_filter_notify: false,
         }
     }
 }
@@ -457,6 +472,8 @@ impl ProcessPageState {
         self.stop_worker_thread();
         self.entries.clear();
         self.displayed_identities.clear();
+        self.visible_rows.clear();
+        self.name_filter = ProcessNameFilter::default();
     }
 
     /// Handles a notification forwarded by the process page dialog procedure.
@@ -485,7 +502,9 @@ impl ProcessPageState {
                 }
                 code if code == LVN_ITEMCHANGED => {
                     let notify = &*(lparam as *const NMLISTVIEW);
-                    if (notify.uChanged & LVIF_STATE) != 0 {
+                    // Programmatic selection while applying a filter must not replace the
+                    // cached identity with the temporary visible highlight.
+                    if !self.suppress_selection_notify && (notify.uChanged & LVIF_STATE) != 0 {
                         self.selected_identity = self.current_selected_identity();
                         self.update_ui_state();
                     }
@@ -504,16 +523,28 @@ impl ProcessPageState {
                         self.sort_column = clicked;
                         self.sort_direction = -1;
                     }
-                    self.selected_identity =
-                        self.current_selected_identity().or(self.selected_identity);
+                    let visible_selection = self.current_selected_identity();
                     self.resort_entries();
-                    self.rebuild_listview(SelectionScrollPolicy::PreserveViewport);
+                    self.rebuild_listview(visible_selection, None, ProcessViewUpdate::Refresh);
                     self.refresh_processes();
                     1
                 }
                 _ => 0,
             }
         }
+    }
+
+    /// Handles a `WM_COMMAND` delivered to the process page, including edit notifications.
+    pub fn handle_window_command(&mut self, wparam: WPARAM) -> isize {
+        let command_id = loword(wparam);
+        if command_id as i32 == IDC_PROCESS_FILTER {
+            if hiword(wparam) == EN_CHANGE as u16 {
+                self.on_name_filter_changed();
+            }
+            return 1;
+        }
+        self.handle_command(command_id, None);
+        1
     }
 
     // 将命令 ID 分派到具体的进程操作（结束、调试、优先级、亲和性等）。
@@ -563,13 +594,19 @@ impl ProcessPageState {
 
     pub fn show_context_menu(&mut self, x: i32, y: i32) {
         unsafe {
-            // 右键菜单会按当前选中进程和系统能力动态裁剪。
-            self.selected_identity = self.current_selected_identity();
-            let Some(entry) = self.selected_entry() else {
+            // 右键菜单作用于列表里看得见的行，不把隐藏的缓存身份写成新的选择。
+            let Some(identity) = self.current_selected_identity() else {
+                return;
+            };
+            let Some(entry_index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.identity == identity)
+            else {
                 return;
             };
 
-            let popup = match self.build_context_menu(entry) {
+            let popup = match self.build_context_menu(&self.entries[entry_index]) {
                 Ok(popup) => popup,
                 Err(error) => {
                     record_win32_error("process popup menu creation", error);
@@ -710,6 +747,7 @@ impl ProcessPageState {
 
             let terminate_hwnd = GetDlgItem(self.hwnd_page, IDC_TERMINATE);
             let list_hwnd = self.list_hwnd();
+            let filter_hwnd = GetDlgItem(self.hwnd_page, IDC_PROCESS_FILTER);
             if terminate_hwnd.is_null() || list_hwnd.is_null() {
                 EndDeferWindowPos(hdwp);
                 return;
@@ -731,45 +769,68 @@ impl ProcessPageState {
             );
 
             let list_rect = window_rect_relative_to_page(list_hwnd, self.hwnd_page);
+            let list_width = (terminate_rect.right - list_rect.left + dx).max(0);
             hdwp = DeferWindowPos(
                 hdwp,
                 list_hwnd,
                 null_mut(),
                 0,
                 0,
-                (terminate_rect.right - list_rect.left + dx).max(0),
+                list_width,
                 (terminate_rect.top - list_rect.top + dy - DEFAULT_MARGIN).max(0),
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
+
+            if !filter_hwnd.is_null() {
+                let filter_rect = window_rect_relative_to_page(filter_hwnd, self.hwnd_page);
+                let filter_width = (list_rect.left + list_width - filter_rect.left).max(0);
+                hdwp = DeferWindowPos(
+                    hdwp,
+                    filter_hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    filter_width,
+                    filter_rect.bottom - filter_rect.top,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
 
             EndDeferWindowPos(hdwp);
         }
     }
 
-    // 从进程页跳转到指定 PID 的行并高亮选中。由任务页的“转到进程”命令触发。
+    // 从进程页跳转到指定进程并高亮选中。由“转到进程”命令触发。
+    // 先清空名称筛选，这样目标行在快照里时会重新成为可见选择。
     pub fn find_process(&mut self, identity: ProcIdentity) -> bool {
         if !identity.is_verified() {
             return false;
         }
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.identity == identity)
-        else {
+        if !self.name_filter.is_empty() {
+            self.clear_name_filter();
+        }
+        if self.entries.iter().any(|entry| entry.identity == identity) {
+            let visible_selection = self.current_selected_identity();
+            self.selected_identity = Some(identity);
+            self.rebuild_listview(visible_selection, None, ProcessViewUpdate::RevealIdentity);
+            true
+        } else {
             self.pending_find_identity = Some(identity);
+            self.selected_identity = Some(identity);
             self.refresh_processes();
-            return true;
-        };
+            true
+        }
+    }
 
-        self.selected_identity = Some(self.entries[index].identity);
-        let list_hwnd = self.list_hwnd();
-        self.set_list_selection(
-            list_hwnd,
-            Some(index),
-            SelectionScrollPolicy::RevealSelection,
-        );
-        self.update_ui_state();
-        true
+    pub fn focus_name_filter(&mut self) {
+        unsafe {
+            let edit = GetDlgItem(self.hwnd_page, IDC_PROCESS_FILTER);
+            if edit.is_null() {
+                return;
+            }
+            SetFocus(edit);
+            SendMessageW(edit, EM_SETSEL, 0, -1);
+        }
     }
 
     fn list_hwnd(&self) -> HWND {
@@ -867,7 +928,10 @@ impl ProcessPageState {
     }
 
     fn apply_process_snapshot(&mut self, entries: Vec<ProcEntry>) {
-        let previous_selection = self.current_selected_identity().or(self.selected_identity);
+        let visible_selection = self.current_selected_identity();
+        let neighbor_hint = self
+            .selected_identity
+            .and_then(|identity| neighbor_after(&self.entry_identities(), identity));
         let current_pass = self.pass_count;
         let visible_columns = DirtyColumns::from_columns(&self.active_columns);
         let mut sort_dirty = false;
@@ -900,9 +964,13 @@ impl ProcessPageState {
             .pending_find_identity
             .take()
             .filter(|identity| self.entries.iter().any(|entry| entry.identity == *identity));
-        let selection_scroll_policy = refresh_selection_scroll_policy(requested_selection);
-        self.selected_identity = requested_selection.or(previous_selection);
-        self.rebuild_listview(selection_scroll_policy);
+        let update = if let Some(identity) = requested_selection {
+            self.selected_identity = Some(identity);
+            ProcessViewUpdate::RevealIdentity
+        } else {
+            ProcessViewUpdate::Refresh
+        };
+        self.rebuild_listview(visible_selection, neighbor_hint, update);
         self.pass_count = self.pass_count.wrapping_add(1);
     }
 
@@ -931,68 +999,105 @@ impl ProcessPageState {
         previous_len != self.entries.len()
     }
 
-    fn rebuild_listview(&mut self, selection_scroll_policy: SelectionScrollPolicy) {
+    fn rebuild_listview(
+        &mut self,
+        visible_selection: Option<ProcIdentity>,
+        neighbor_hint: Option<ProcIdentity>,
+        update: ProcessViewUpdate,
+    ) {
         unsafe {
-            // 进程列表使用 LVS_OWNERDATA；刷新只更新虚拟项数量和索引映射，
-            // 不再为每个进程创建、删除或移动 Win32 ListView 项。
+            // 进程列表使用 LVS_OWNERDATA。虚拟项只覆盖筛选后的行，隐藏行不会进入
+            // LVN_GETDISPINFOW，因此也不会被格式化。
             let list_hwnd = self.list_hwnd();
             if list_hwnd.is_null() {
                 return;
             }
-            let selected_identity = self.selected_identity;
-            let selected_index = selected_identity.and_then(|identity| {
-                self.entries
-                    .iter()
-                    .position(|entry| entry.identity == identity)
+            let rows = self
+                .entries
+                .iter()
+                .map(|entry| (entry.identity, entry.image_name_lower.as_str()))
+                .collect::<Vec<_>>();
+            let plan = plan_process_name_view(
+                &rows,
+                &self.name_filter,
+                self.selected_identity,
+                visible_selection,
+                neighbor_hint,
+                update,
+            );
+            let highlight_identity = plan.selected_list_index.and_then(|list_index| {
+                plan.visible_indices
+                    .get(list_index)
+                    .and_then(|&entry_index| self.entries.get(entry_index))
+                    .map(|entry| entry.identity)
             });
             let existing_count = SendMessageW(list_hwnd, LVM_GETITEMCOUNT, 0, 0) as usize;
-            let structure_changed = existing_count != self.entries.len();
-            let order_changed = self.displayed_identities.len() != self.entries.len()
+            let structure_changed = existing_count != plan.visible_indices.len();
+            let next_identities = plan
+                .visible_indices
+                .iter()
+                .map(|&index| self.entries[index].identity);
+            let order_changed = self.displayed_identities.len() != plan.visible_indices.len()
                 || self
                     .displayed_identities
                     .iter()
                     .copied()
-                    .ne(self.entries.iter().map(|entry| entry.identity));
+                    .ne(next_identities);
             let bulk_update = structure_changed || order_changed;
+            let selection_changed = highlight_identity != visible_selection;
 
             if bulk_update {
                 SendMessageW(list_hwnd, WM_SETREDRAW, 0, 0);
             }
 
             let mut dirty_rows = DirtyRowRange::default();
-            for (index, entry) in self.entries.iter_mut().enumerate() {
-                if entry.dirty_columns.any() {
-                    entry.dirty_columns = DirtyColumns::default();
-                    dirty_rows.mark(index);
+            for (entry_index, entry) in self.entries.iter_mut().enumerate() {
+                if !entry.dirty_columns.any() {
+                    continue;
+                }
+                entry.dirty_columns = DirtyColumns::default();
+                if let Ok(list_index) = plan.visible_indices.binary_search(&entry_index) {
+                    dirty_rows.mark(list_index);
                 }
             }
+
+            self.visible_rows.clone_from(&plan.visible_indices);
 
             if structure_changed {
                 SendMessageW(
                     list_hwnd,
                     LVM_SETITEMCOUNT,
-                    self.entries.len(),
+                    plan.visible_indices.len(),
                     (LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL) as LPARAM,
                 );
             }
 
-            if bulk_update {
+            if bulk_update || selection_changed {
                 // Dynamic sort keys can move the selected process on every sample. Refreshes must
-                // preserve the user's wheel position; only an explicit navigation may reveal it.
-                self.set_list_selection(list_hwnd, selected_index, selection_scroll_policy);
+                // preserve the user's wheel position; only an explicit navigation or a filter
+                // change that moves the highlight may reveal it.
+                self.suppress_selection_notify = true;
+                self.set_list_selection(list_hwnd, plan.selected_list_index, plan.scroll);
+                self.suppress_selection_notify = false;
+            } else if plan.scroll == SelectionScrollPolicy::RevealSelection
+                && let Some(index) = plan.selected_list_index
+            {
+                SendMessageW(list_hwnd, LVM_ENSUREVISIBLE, index, 0);
+            }
+
+            if bulk_update {
                 finish_list_view_update(list_hwnd);
             } else {
-                dirty_rows.redraw_visible(list_hwnd, self.entries.len());
+                dirty_rows.redraw_visible(list_hwnd, plan.visible_indices.len());
             }
 
             self.displayed_identities.clear();
-            self.displayed_identities
-                .extend(self.entries.iter().map(|entry| entry.identity));
-
-            if selected_index.is_none() {
-                self.selected_identity = None;
-            }
-
+            self.displayed_identities.extend(
+                self.visible_rows
+                    .iter()
+                    .filter_map(|&index| self.entries.get(index).map(|entry| entry.identity)),
+            );
+            self.selected_identity = plan.identity_cache;
             self.update_ui_state();
         }
     }
@@ -1048,8 +1153,7 @@ impl ProcessPageState {
                 return;
             }
 
-            let entry = self.entries.get(item.iItem as usize);
-            let Some(entry) = entry else {
+            let Some(entry) = self.entry_for_list_index(item.iItem as usize) else {
                 *item.pszText = 0;
                 return;
             };
@@ -1096,12 +1200,12 @@ impl ProcessPageState {
                 );
             }
 
-            if !self.entries.is_empty() {
+            if !self.visible_rows.is_empty() {
                 SendMessageW(
                     list_hwnd,
                     LVM_REDRAWITEMS,
                     0,
-                    self.entries.len().saturating_sub(1) as LPARAM,
+                    self.visible_rows.len().saturating_sub(1) as LPARAM,
                 );
             }
         }
@@ -1147,6 +1251,9 @@ impl ProcessPageState {
     fn current_selected_identity(&self) -> Option<ProcIdentity> {
         unsafe {
             let list_hwnd = self.list_hwnd();
+            if list_hwnd.is_null() {
+                return None;
+            }
             let index = SendMessageW(
                 list_hwnd,
                 LVM_GETNEXTITEM,
@@ -1157,13 +1264,68 @@ impl ProcessPageState {
                 return None;
             }
 
-            self.entries.get(index as usize).map(|entry| entry.identity)
+            self.entry_for_list_index(index as usize)
+                .map(|entry| entry.identity)
         }
     }
 
-    fn selected_entry(&self) -> Option<&ProcEntry> {
-        let identity = self.selected_identity?;
-        self.entries.iter().find(|entry| entry.identity == identity)
+    fn entry_for_list_index(&self, list_index: usize) -> Option<&ProcEntry> {
+        let entry_index = *self.visible_rows.get(list_index)?;
+        self.entries.get(entry_index)
+    }
+
+    fn entry_identities(&self) -> Vec<ProcIdentity> {
+        self.entries.iter().map(|entry| entry.identity).collect()
+    }
+
+    fn on_name_filter_changed(&mut self) {
+        if self.suppress_filter_notify {
+            return;
+        }
+        let filter = ProcessNameFilter::from_text(&self.read_filter_text());
+        if filter == self.name_filter {
+            return;
+        }
+        self.name_filter = filter;
+        // An empty visible list is a successful filter result, not a refresh error.
+        let visible_selection = self.current_selected_identity();
+        self.rebuild_listview(visible_selection, None, ProcessViewUpdate::FilterChanged);
+    }
+
+    fn read_filter_text(&self) -> String {
+        unsafe {
+            let edit = GetDlgItem(self.hwnd_page, IDC_PROCESS_FILTER);
+            if edit.is_null() {
+                return String::new();
+            }
+            let length = GetWindowTextLengthW(edit);
+            if length <= 0 {
+                return String::new();
+            }
+            let mut buffer = vec![0u16; length as usize + 1];
+            let Ok(capacity) = i32::try_from(buffer.len()) else {
+                return String::new();
+            };
+            let copied = GetWindowTextW(edit, buffer.as_mut_ptr(), capacity);
+            if copied <= 0 {
+                return String::new();
+            }
+            let copied = usize::try_from(copied).unwrap_or(0);
+            String::from_utf16_lossy(&buffer[..copied.min(buffer.len())])
+        }
+    }
+
+    fn clear_name_filter(&mut self) {
+        self.name_filter = ProcessNameFilter::default();
+        self.suppress_filter_notify = true;
+        unsafe {
+            let edit = GetDlgItem(self.hwnd_page, IDC_PROCESS_FILTER);
+            if !edit.is_null() {
+                let empty = to_wide_null("");
+                SetWindowTextW(edit, empty.as_ptr());
+            }
+        }
+        self.suppress_filter_notify = false;
     }
 
     // 打开“选择列”对话框。通过 ColumnDialogContext 传递页面和选项指针给 dialog proc。
@@ -1578,7 +1740,7 @@ mod tests {
     #[test]
     fn periodic_refresh_preserves_the_process_list_viewport() {
         assert_eq!(
-            refresh_selection_scroll_policy(None),
+            refresh_selection_scroll_policy(false),
             SelectionScrollPolicy::PreserveViewport
         );
     }
@@ -1586,7 +1748,7 @@ mod tests {
     #[test]
     fn explicit_find_reveals_the_requested_process() {
         assert_eq!(
-            refresh_selection_scroll_policy(Some(ProcIdentity::new(1234, 10))),
+            refresh_selection_scroll_policy(true),
             SelectionScrollPolicy::RevealSelection
         );
     }
