@@ -293,6 +293,7 @@ pub enum TextKey {
     NetworkUtilization,
     LinkSpeed,
     State,
+    Ipv4Address,
     BytesSent,
     BytesReceived,
     BytesTotal,
