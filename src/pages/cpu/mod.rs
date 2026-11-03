@@ -555,6 +555,9 @@ impl CpuPageState {
             self.kernel_history.push(sample.kernel_usage);
             self.history_valid = true;
             self.graph_scroll_offset = (self.graph_scroll_offset + 2) % GRAPH_GRID;
+        } else if self.cpu_usage.is_some() {
+            // Keep the previous percent, but do not present it as a current measurement.
+            self.system_sample_stale = true;
         }
         match sample.cpu_diagnostics {
             Ok(diagnostics) => {
@@ -1692,7 +1695,13 @@ fn last_error_or_gen_failure() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use windows_sys::Win32::System::Threading::{ALL_PROCESSOR_GROUPS, GetActiveProcessorCount};
+
     use super::*;
+    use crate::system::cpu_topology::query_processor_topology;
+    use crate::system::disk::DiskActivityUpdate;
 
     #[test]
     fn queued_refresh_keeps_the_strongest_reason() {
@@ -1770,5 +1779,88 @@ mod tests {
         }));
         assert!(component.is_stale());
         assert_eq!(component.value, Some(42));
+    }
+
+    #[test]
+    fn invalid_cpu_delta_marks_retained_usage_stale_until_measured_zero() {
+        let processor_count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) } as usize;
+        assert!(processor_count > 0);
+        let topology = Arc::new(query_processor_topology(processor_count));
+        assert_eq!(topology.error(), None);
+        assert!(topology.identity().is_some());
+
+        let mut page = CpuPageState::new();
+        let mut sample = system_sample(Arc::clone(&topology), false, 0, 0);
+        page.apply_system_sample(&sample, false).unwrap();
+        assert_eq!(page.cpu_usage, None);
+        assert!(!page.history_valid);
+        assert_eq!(page.graph_scroll_offset, 0);
+        assert!(!page.system_sample_stale);
+
+        sample = system_sample(Arc::clone(&topology), true, 40, 10);
+        page.apply_system_sample(&sample, false).unwrap();
+        assert_eq!(page.cpu_usage, Some(40));
+        assert_eq!(page.total_history.value_at(0), Some(40));
+        assert_eq!(page.kernel_history.value_at(0), Some(10));
+        assert!(page.history_valid);
+        assert_eq!(page.graph_scroll_offset, 2);
+        assert!(!page.system_sample_stale);
+
+        sample = system_sample(topology, false, 0, 0);
+        page.apply_system_sample(&sample, false).unwrap();
+        assert_eq!(page.cpu_usage, Some(40));
+        assert_eq!(page.total_history.value_at(0), Some(40));
+        assert_eq!(page.kernel_history.value_at(0), Some(10));
+        assert_eq!(page.graph_scroll_offset, 2);
+        assert!(page.system_sample_stale);
+        assert_eq!(page.derive_status(), CpuPageStatus::Stale);
+        assert_eq!(page.status, CpuPageStatus::Stale);
+
+        sample.cpu_delta_valid = true;
+        page.apply_system_sample(&sample, false).unwrap();
+        assert_eq!(page.cpu_usage, Some(0));
+        assert_eq!(page.total_history.value_at(0), Some(0));
+        assert_eq!(page.total_history.value_at(1), Some(40));
+        assert_eq!(page.kernel_history.value_at(0), Some(0));
+        assert_eq!(page.kernel_history.value_at(1), Some(10));
+        assert_eq!(page.graph_scroll_offset, 4);
+        assert!(!page.system_sample_stale);
+        assert_ne!(page.status, CpuPageStatus::Stale);
+        assert_ne!(page.derive_status(), CpuPageStatus::Stale);
+    }
+
+    fn system_sample(
+        topology: Arc<crate::system::cpu_topology::ProcessorTopology>,
+        cpu_delta_valid: bool,
+        cpu_usage: u8,
+        kernel_usage: u8,
+    ) -> SystemSample {
+        let processor_count = topology.processors().len();
+        SystemSample {
+            processor_count,
+            processor_topology: topology,
+            cpu_delta_valid,
+            cpu_usage,
+            kernel_usage,
+            processor_cpu_usage: vec![cpu_usage; processor_count],
+            processor_kernel_usage: vec![kernel_usage; processor_count],
+            cpu_diagnostics: Ok(CpuDiagnosticSample::default()),
+            uptime_ms: 1_000,
+            physical_mem_usage_kb: 0,
+            physical_mem_limit_kb: 0,
+            commit_total_kb: 0,
+            commit_limit_kb: 0,
+            commit_peak_kb: 0,
+            total_physical_kb: 0,
+            avail_physical_kb: 0,
+            file_cache_kb: 0,
+            kernel_total_kb: 0,
+            kernel_paged_kb: 0,
+            kernel_nonpaged_kb: 0,
+            handle_count: 0,
+            thread_count: 0,
+            process_count: 0,
+            disk: DiskActivityUpdate::NoRate,
+        }
     }
 }
