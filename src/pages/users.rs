@@ -1029,15 +1029,30 @@ enum UserWorkerCompletion {
 }
 
 /// Keeps a confirmed session action ahead of a coalesced refresh, and queues a later action
-/// behind one that has not started.
+/// behind one that has not started. A command whose kind and session identities are already
+/// queued is not appended again. A coalesced refresh still does not erase queued actions.
 fn merge_user_requests(pending: &mut UserWorkerRequest, incoming: UserWorkerRequest) {
     match (&mut *pending, incoming) {
         (UserWorkerRequest::Actions(queued), UserWorkerRequest::Actions(more)) => {
-            queued.extend(more);
+            for command in more {
+                if session_action_already_queued(queued, &command) {
+                    continue;
+                }
+                queued.push(command);
+            }
         }
         (UserWorkerRequest::Actions(_), UserWorkerRequest::Refresh) => {}
         (pending, incoming) => *pending = incoming,
     }
+}
+
+fn session_action_already_queued(
+    queued: &[UserSessionCommand],
+    command: &UserSessionCommand,
+) -> bool {
+    queued
+        .iter()
+        .any(|existing| existing.kind == command.kind && existing.sessions == command.sessions)
 }
 
 fn perform_user_request(request: UserWorkerRequest) -> UserWorkerCompletion {
@@ -1770,6 +1785,34 @@ mod tests {
         let mut pending = action.clone();
         merge_user_requests(&mut pending, UserWorkerRequest::Refresh);
         assert_eq!(pending, action);
+    }
+
+    #[test]
+    fn identical_session_actions_collapse_and_different_sessions_remain() {
+        let first = session_command(UserSessionKind::Logoff);
+        let mut other_session = session_command(UserSessionKind::Logoff);
+        other_session.sessions = vec![identity(2, 100)];
+        let mut other_logon = session_command(UserSessionKind::Logoff);
+        other_logon.sessions = vec![identity(1, 200)];
+        let mut pending = UserWorkerRequest::Actions(vec![first.clone()]);
+
+        merge_user_requests(
+            &mut pending,
+            UserWorkerRequest::Actions(vec![first.clone(), other_session.clone()]),
+        );
+        assert_eq!(
+            pending,
+            UserWorkerRequest::Actions(vec![first.clone(), other_session.clone()])
+        );
+
+        merge_user_requests(
+            &mut pending,
+            UserWorkerRequest::Actions(vec![other_logon.clone()]),
+        );
+        assert_eq!(
+            pending,
+            UserWorkerRequest::Actions(vec![first, other_session, other_logon])
+        );
     }
 
     #[test]
