@@ -912,7 +912,14 @@ mod tests {
             .expect("follow-up request should coalesce");
         assert!(worker.has_pending());
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // The collector publishes `CollectorPanicked` only after the panic hook
+        // flushes diagnostics and the default hook captures a backtrace. CI sets
+        // `RUST_BACKTRACE=1`, so a loaded Windows runner needs this longer poll
+        // before that report and the reinitialized follow-up can be observed.
+        const DRAIN_BUDGET: Duration = Duration::from_secs(30);
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+        let deadline = Instant::now() + DRAIN_BUDGET;
         loop {
             let drained = worker.drain(null_mut());
             if drained.error == Some(ERROR_GEN_FAILURE) {
@@ -922,10 +929,10 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "panic report timed out");
-            thread::yield_now();
+            thread::sleep(POLL_INTERVAL);
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + DRAIN_BUDGET;
         loop {
             let drained = worker.drain(null_mut());
             assert_eq!(drained.error, None);
@@ -939,7 +946,7 @@ mod tests {
                 Instant::now() < deadline,
                 "reinitialized collector timed out"
             );
-            thread::yield_now();
+            thread::sleep(POLL_INTERVAL);
         }
     }
 

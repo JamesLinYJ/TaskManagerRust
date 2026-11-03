@@ -1051,6 +1051,9 @@ impl NetworkPageState {
                 (titles[2], 90, LVCFMT_RIGHT),
                 (titles[3], 120, LVCFMT_LEFT),
                 (titles[4], 140, LVCFMT_LEFT),
+                (titles[5], 110, LVCFMT_RIGHT),
+                (titles[6], 120, LVCFMT_RIGHT),
+                (titles[7], 110, LVCFMT_RIGHT),
             ];
 
             for (index, (title, width, fmt)) in columns.iter().enumerate() {
@@ -1406,13 +1409,16 @@ fn push_history(history: &mut HistoryBuffer, value: Option<u8>) {
     }
 }
 
-fn adapter_row_texts(adapter: &NetworkAdapterEntry) -> [&str; 5] {
+fn adapter_row_texts(adapter: &NetworkAdapterEntry) -> [&str; 8] {
     [
         &adapter.name,
         &adapter.utilization,
         &adapter.link_speed,
         &adapter.state,
         &adapter.ipv4,
+        &adapter.bytes_sent,
+        &adapter.bytes_received,
+        &adapter.bytes_total,
     ]
 }
 
@@ -2064,7 +2070,20 @@ mod tests {
         let adapter = test_adapter("Renamed Ethernet");
         let columns = adapter_row_texts(&adapter);
         assert_eq!(columns[0], "Renamed Ethernet");
+        assert_eq!(columns[2], "1.0 Gbps");
         assert_eq!(columns[4], "192.168.0.2");
+        assert_eq!(columns[5], "10");
+        assert_eq!(columns[6], "20");
+        assert_eq!(columns[7], "30");
+
+        let mut failed = adapter;
+        failed.bytes_sent = "-".to_string();
+        failed.bytes_received = "-".to_string();
+        failed.bytes_total = "-".to_string();
+        let failed_columns = adapter_row_texts(&failed);
+        assert_eq!(failed_columns[5], "-");
+        assert_eq!(failed_columns[6], "-");
+        assert_eq!(failed_columns[7], "-");
     }
 
     #[test]
