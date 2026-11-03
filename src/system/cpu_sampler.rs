@@ -61,23 +61,69 @@ pub(crate) fn query_processor_performance(
             )
         };
 
-        if status >= 0 {
-            if returned != 0 {
-                let returned = returned as usize;
-                if !returned.is_multiple_of(item_size) || returned > byte_len as usize {
-                    return Err(STATUS_INVALID_BUFFER_SIZE);
-                }
-                if returned / item_size != count {
-                    return Err(STATUS_INFO_LENGTH_MISMATCH);
-                }
-            }
-            return Ok(());
+        match take_processor_performance_query(output, status, returned, byte_len, count) {
+            Ok(ProcessorPerformanceQuery::Complete) => return Ok(()),
+            Ok(ProcessorPerformanceQuery::GrowTo(next_count)) => count = next_count,
+            Err(error) => return Err(error),
         }
+    }
+}
 
-        if status != STATUS_INFO_LENGTH_MISMATCH || returned as usize <= byte_len as usize {
-            return Err(status);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessorPerformanceQuery {
+    Complete,
+    GrowTo(usize),
+}
+
+/// Classifies one processor-performance query.
+///
+/// A success status with a zero returned length is an error. A nonzero length is
+/// accepted only when it is an exact multiple of the struct and matches `count`.
+fn decide_processor_performance_query(
+    status: i32,
+    returned: u32,
+    buffer_bytes: u32,
+    count: usize,
+) -> Result<ProcessorPerformanceQuery, i32> {
+    let item_size = size_of::<ProcessorPerformance>();
+    if status >= 0 {
+        if returned == 0 {
+            return Err(STATUS_INVALID_BUFFER_SIZE);
         }
-        count = (returned as usize).div_ceil(item_size);
+        let returned_len = returned as usize;
+        let buffer_len = buffer_bytes as usize;
+        if !returned_len.is_multiple_of(item_size) || returned_len > buffer_len {
+            return Err(STATUS_INVALID_BUFFER_SIZE);
+        }
+        if returned_len / item_size != count {
+            return Err(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        return Ok(ProcessorPerformanceQuery::Complete);
+    }
+
+    if status != STATUS_INFO_LENGTH_MISMATCH || returned as usize <= buffer_bytes as usize {
+        return Err(status);
+    }
+    Ok(ProcessorPerformanceQuery::GrowTo(
+        (returned as usize).div_ceil(item_size),
+    ))
+}
+
+fn take_processor_performance_query(
+    output: &mut Vec<ProcessorPerformance>,
+    status: i32,
+    returned: u32,
+    buffer_bytes: u32,
+    count: usize,
+) -> Result<ProcessorPerformanceQuery, i32> {
+    match decide_processor_performance_query(status, returned, buffer_bytes, count) {
+        // A successful query that wrote nothing leaves the caller's default-zero
+        // rows in place. Drop them so they cannot be read as idle counters.
+        Err(error) if status >= 0 && returned == 0 => {
+            output.clear();
+            Err(error)
+        }
+        decision => decision,
     }
 }
 
@@ -100,8 +146,13 @@ pub(crate) fn checked_summed_processor_times(
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use super::{
-        ProcessorPerformance, checked_summed_processor_times, query_processor_performance,
+        ProcessorPerformance, ProcessorPerformanceQuery, STATUS_INFO_LENGTH_MISMATCH,
+        STATUS_INVALID_BUFFER_SIZE, checked_summed_processor_times,
+        decide_processor_performance_query, query_processor_performance,
+        take_processor_performance_query,
     };
     use windows_sys::Win32::System::Threading::{ALL_PROCESSOR_GROUPS, GetActiveProcessorCount};
 
@@ -154,5 +205,97 @@ mod tests {
             checked_summed_processor_times(&processors),
             Some((15, 70, 27))
         );
+    }
+
+    #[test]
+    fn success_with_zero_returned_length_is_an_error() {
+        let bytes = size_of::<ProcessorPerformance>() as u32;
+        assert!(decide_processor_performance_query(0, 0, bytes, 1).is_err());
+        assert!(decide_processor_performance_query(0, 0, bytes, 0).is_err());
+    }
+
+    #[test]
+    fn success_with_exact_multiple_is_ok() {
+        let item_size = size_of::<ProcessorPerformance>();
+        let count = 3;
+        let bytes = u32::try_from(item_size * count).unwrap();
+        assert_eq!(
+            decide_processor_performance_query(0, bytes, bytes, count),
+            Ok(ProcessorPerformanceQuery::Complete)
+        );
+    }
+
+    #[test]
+    fn non_multiple_returned_length_is_an_error() {
+        let bytes = size_of::<ProcessorPerformance>() as u32;
+        assert_eq!(
+            decide_processor_performance_query(0, bytes - 1, bytes, 1),
+            Err(STATUS_INVALID_BUFFER_SIZE)
+        );
+    }
+
+    #[test]
+    fn short_buffer_keeps_invalid_buffer_size() {
+        let one = size_of::<ProcessorPerformance>() as u32;
+        assert_eq!(
+            decide_processor_performance_query(0, one * 2, one, 2),
+            Err(STATUS_INVALID_BUFFER_SIZE)
+        );
+    }
+
+    #[test]
+    fn count_mismatch_keeps_length_mismatch() {
+        let one = size_of::<ProcessorPerformance>() as u32;
+        let bytes = one * 2;
+        assert_eq!(
+            decide_processor_performance_query(0, bytes, bytes, 1),
+            Err(STATUS_INFO_LENGTH_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn length_mismatch_grows_when_the_kernel_reports_a_larger_buffer() {
+        let one = size_of::<ProcessorPerformance>() as u32;
+        assert_eq!(
+            decide_processor_performance_query(STATUS_INFO_LENGTH_MISMATCH, one * 3, one, 1),
+            Ok(ProcessorPerformanceQuery::GrowTo(3))
+        );
+    }
+
+    #[test]
+    fn length_mismatch_without_a_larger_return_keeps_the_status() {
+        let bytes = size_of::<ProcessorPerformance>() as u32;
+        assert_eq!(
+            decide_processor_performance_query(STATUS_INFO_LENGTH_MISMATCH, bytes, bytes, 1),
+            Err(STATUS_INFO_LENGTH_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn zero_returned_length_drops_default_processor_times() {
+        let mut processors = vec![ProcessorPerformance::default(); 2];
+        let bytes = size_of::<ProcessorPerformance>() as u32;
+        assert!(take_processor_performance_query(&mut processors, 0, 0, bytes, 2).is_err());
+        assert!(processors.is_empty());
+    }
+
+    #[test]
+    fn failed_zero_return_keeps_existing_rows() {
+        let mut processors = vec![ProcessorPerformance {
+            idle_time: 4,
+            ..ProcessorPerformance::default()
+        }];
+        let bytes = size_of::<ProcessorPerformance>() as u32;
+        assert_eq!(
+            take_processor_performance_query(
+                &mut processors,
+                STATUS_INFO_LENGTH_MISMATCH,
+                0,
+                bytes,
+                1
+            ),
+            Err(STATUS_INFO_LENGTH_MISMATCH)
+        );
+        assert_eq!(processors[0].idle_time, 4);
     }
 }
