@@ -119,6 +119,10 @@ const MENU_STATUS_HELP_KEYS: &[(&str, &str)] = &[
         "crate::ui::resource_ids::IDM_SERVICE_CONTINUE",
     ),
     (
+        "IDM_SERVICE_RESTART",
+        "crate::ui::resource_ids::IDM_SERVICE_RESTART",
+    ),
+    (
         "IDM_SERVICE_GOTOPROCESS",
         "crate::ui::resource_ids::IDM_SERVICE_GOTOPROCESS",
     ),

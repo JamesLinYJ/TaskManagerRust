@@ -57,6 +57,7 @@ pub(crate) enum ServiceStartupType {
 pub(crate) enum ServiceControlAction {
     Start,
     Stop,
+    Restart,
     Pause,
     Continue,
 }
@@ -74,6 +75,7 @@ pub(crate) enum ServiceRequest {
 pub(crate) struct ServiceCommandState {
     pub(crate) start: bool,
     pub(crate) stop: bool,
+    pub(crate) restart: bool,
     pub(crate) pause: bool,
     pub(crate) continue_service: bool,
     pub(crate) go_to_process: bool,
@@ -84,6 +86,7 @@ impl ServiceCommandState {
         Self {
             start: false,
             stop: false,
+            restart: false,
             pause: false,
             continue_service: false,
             go_to_process: false,
@@ -145,14 +148,16 @@ pub(crate) fn command_state(selected: Option<ServiceCommandInput>) -> ServiceCom
     let Some(selected) = selected else {
         return ServiceCommandState::disabled();
     };
+    let stop = selected.accepts_stop
+        && matches!(
+            selected.status,
+            ServiceRunState::Running | ServiceRunState::Paused
+        );
     ServiceCommandState {
         start: selected.status == ServiceRunState::Stopped
             && selected.startup != ServiceStartupType::Disabled,
-        stop: selected.accepts_stop
-            && matches!(
-                selected.status,
-                ServiceRunState::Running | ServiceRunState::Paused
-            ),
+        stop,
+        restart: stop,
         go_to_process: service_has_valid_process_id(selected.status)
             && selected.process.is_some_and(ProcIdentity::is_verified),
         pause: selected.accepts_pause_continue && selected.status == ServiceRunState::Running,
@@ -184,6 +189,12 @@ pub(crate) fn control_reached_requested_state(
             state,
             ServiceRunState::Stopped | ServiceRunState::StopPending
         ),
+        // Restart's start half uses the same accepted states as Start. Stop-pending,
+        // stopped, and unknown are not a successful restart.
+        ServiceControlAction::Restart => matches!(
+            state,
+            ServiceRunState::Running | ServiceRunState::StartPending
+        ),
         ServiceControlAction::Pause => matches!(
             state,
             ServiceRunState::Paused | ServiceRunState::PausePending
@@ -203,6 +214,23 @@ pub(crate) fn classify_control_result(
         Err(code) => Err(ServiceActionFailure::Api(code)),
         Ok(state) if control_reached_requested_state(action, state) => Ok(state),
         Ok(state) => Err(ServiceActionFailure::StateUnchanged { observed: state }),
+    }
+}
+
+/// Stop has finished only when the service is stopped. Pending and unknown are not completion.
+pub(crate) fn stop_has_completed(state: ServiceRunState) -> bool {
+    state == ServiceRunState::Stopped
+}
+
+/// Starts a restart only after stop completed. A stop error or any other observed state is
+/// returned unchanged and `start` is not called.
+pub(crate) fn restart_after_stop(
+    stop: Result<ServiceRunState, u32>,
+    start: impl FnOnce() -> Result<ServiceRunState, u32>,
+) -> Result<ServiceRunState, u32> {
+    match stop {
+        Ok(state) if stop_has_completed(state) => start(),
+        other => other,
     }
 }
 
@@ -307,6 +335,7 @@ mod tests {
         )));
         assert!(stopped.start);
         assert!(!stopped.stop);
+        assert!(!stopped.restart);
         assert!(!stopped.pause);
         assert!(!stopped.continue_service);
         assert!(!stopped.go_to_process);
@@ -325,6 +354,7 @@ mod tests {
         )));
         assert!(!running.start);
         assert!(running.stop);
+        assert!(running.restart);
         assert!(running.pause);
         assert!(!running.continue_service);
         assert!(!running.go_to_process);
@@ -335,6 +365,7 @@ mod tests {
             Some(ProcIdentity::new(44, 100)),
         )));
         assert!(verified.stop);
+        assert!(verified.restart);
         assert!(!verified.pause);
         assert!(verified.continue_service);
         assert!(verified.go_to_process);
@@ -346,6 +377,7 @@ mod tests {
         )));
         assert!(!pending.start);
         assert!(!pending.stop);
+        assert!(!pending.restart);
         assert!(!pending.pause);
         assert!(!pending.continue_service);
         assert!(!pending.go_to_process);
@@ -356,9 +388,13 @@ mod tests {
         for status in [ServiceRunState::Running, ServiceRunState::Paused] {
             let mut selected = input(status, ServiceStartupType::Automatic, None);
             selected.accepts_stop = false;
-            assert!(!command_state(Some(selected)).stop);
+            let blocked = command_state(Some(selected));
+            assert!(!blocked.stop);
+            assert!(!blocked.restart);
             selected.accepts_stop = true;
-            assert!(command_state(Some(selected)).stop);
+            let allowed = command_state(Some(selected));
+            assert!(allowed.stop);
+            assert!(allowed.restart);
         }
     }
 
@@ -474,6 +510,90 @@ mod tests {
         assert_eq!(
             classify_control_result(ServiceControlAction::Stop, Ok(ServiceRunState::Stopped)),
             Ok(ServiceRunState::Stopped)
+        );
+    }
+
+    #[test]
+    fn restart_starts_only_after_a_completed_stop_and_unknown_is_not_success() {
+        assert!(stop_has_completed(ServiceRunState::Stopped));
+        assert!(!stop_has_completed(ServiceRunState::StopPending));
+        assert!(!stop_has_completed(ServiceRunState::Running));
+        assert!(!stop_has_completed(ServiceRunState::Unknown(0)));
+
+        let mut starts = 0u32;
+        let rejected = restart_after_stop(Err(1060), || {
+            starts += 1;
+            Ok(ServiceRunState::Running)
+        });
+        assert_eq!(rejected, Err(1060));
+        assert_eq!(starts, 0);
+
+        for state in [
+            ServiceRunState::StopPending,
+            ServiceRunState::Running,
+            ServiceRunState::Paused,
+            ServiceRunState::Unknown(7),
+        ] {
+            let observed = restart_after_stop(Ok(state), || {
+                starts += 1;
+                Ok(ServiceRunState::Running)
+            });
+            assert_eq!(observed, Ok(state));
+        }
+        assert_eq!(starts, 0);
+
+        let start_error = restart_after_stop(Ok(ServiceRunState::Stopped), || {
+            starts += 1;
+            Err(5)
+        });
+        assert_eq!(start_error, Err(5));
+        assert_eq!(starts, 1);
+        assert_eq!(
+            classify_control_result(ServiceControlAction::Restart, start_error),
+            Err(ServiceActionFailure::Api(5))
+        );
+
+        assert!(control_reached_requested_state(
+            ServiceControlAction::Restart,
+            ServiceRunState::Running
+        ));
+        assert!(control_reached_requested_state(
+            ServiceControlAction::Restart,
+            ServiceRunState::StartPending
+        ));
+        assert!(!control_reached_requested_state(
+            ServiceControlAction::Restart,
+            ServiceRunState::Stopped
+        ));
+        assert!(!control_reached_requested_state(
+            ServiceControlAction::Restart,
+            ServiceRunState::StopPending
+        ));
+        assert!(!control_reached_requested_state(
+            ServiceControlAction::Restart,
+            ServiceRunState::Unknown(0)
+        ));
+        assert_eq!(
+            classify_control_result(
+                ServiceControlAction::Restart,
+                Ok(ServiceRunState::StartPending)
+            ),
+            Ok(ServiceRunState::StartPending)
+        );
+        assert_eq!(
+            classify_control_result(
+                ServiceControlAction::Restart,
+                Ok(ServiceRunState::Unknown(9))
+            ),
+            Err(ServiceActionFailure::StateUnchanged {
+                observed: ServiceRunState::Unknown(9)
+            })
+        );
+        assert_eq!(
+            classify_control_result(ServiceControlAction::Restart, Ok(ServiceRunState::Stopped)),
+            Err(ServiceActionFailure::StateUnchanged {
+                observed: ServiceRunState::Stopped
+            })
         );
     }
 

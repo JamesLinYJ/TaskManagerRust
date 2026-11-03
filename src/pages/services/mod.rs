@@ -12,7 +12,7 @@
 mod model;
 mod sampler;
 
-// 服务页列出本机 Win32 服务，并在后台 worker 上启动、停止、暂停或继续服务。
+// 服务页列出本机 Win32 服务，并在后台 worker 上启动、停止、重新启动、暂停或继续服务。
 // UI 线程只提交请求、维护列表选择和绘制。刷新保留服务名对应的选择、焦点和滚动位置。
 // “转到进程”只使用带创建时间的 ProcIdentity；没有校验过的进程时该命令保持禁用。
 
@@ -48,8 +48,8 @@ use crate::ui::localization::{TextKey, service_column_titles, text};
 use crate::ui::menus::build_popup_menu;
 use crate::ui::resource_ids::{
     IDC_SERVICELIST, IDM_SERVICE_CONTINUE, IDM_SERVICE_GOTOPROCESS, IDM_SERVICE_PAUSE,
-    IDM_SERVICE_START, IDM_SERVICE_STOP, IDR_SERVICE_CONTEXT, PWM_SERVICE_WORKER_COMPLETE,
-    WM_FINDPROC,
+    IDM_SERVICE_RESTART, IDM_SERVICE_START, IDM_SERVICE_STOP, IDR_SERVICE_CONTEXT,
+    PWM_SERVICE_WORKER_COMPLETE, WM_FINDPROC,
 };
 
 pub(crate) use self::model::ServiceCommandState;
@@ -172,6 +172,7 @@ impl ServicePageState {
             state.start = false;
             state.stop = false;
         }
+        state.restart = state.stop;
         state
     }
 
@@ -183,6 +184,10 @@ impl ServicePageState {
             }
             IDM_SERVICE_STOP => {
                 self.request_control(ServiceControlAction::Stop);
+                true
+            }
+            IDM_SERVICE_RESTART => {
+                self.request_control(ServiceControlAction::Restart);
                 true
             }
             IDM_SERVICE_PAUSE => {
@@ -268,6 +273,7 @@ impl ServicePageState {
         unsafe {
             enable_command(popup.as_raw(), IDM_SERVICE_START, state.start);
             enable_command(popup.as_raw(), IDM_SERVICE_STOP, state.stop);
+            enable_command(popup.as_raw(), IDM_SERVICE_RESTART, state.restart);
             enable_command(popup.as_raw(), IDM_SERVICE_PAUSE, state.pause);
             enable_command(popup.as_raw(), IDM_SERVICE_CONTINUE, state.continue_service);
             enable_command(popup.as_raw(), IDM_SERVICE_GOTOPROCESS, state.go_to_process);
@@ -378,6 +384,7 @@ impl ServicePageState {
         let allowed = match action {
             ServiceControlAction::Start => state.start,
             ServiceControlAction::Stop => state.stop,
+            ServiceControlAction::Restart => state.restart,
             ServiceControlAction::Pause => state.pause,
             ServiceControlAction::Continue => state.continue_service,
         };
@@ -704,6 +711,7 @@ impl ServicePageState {
         let summary = match action {
             ServiceControlAction::Start => text(TextKey::ServiceStartFailed),
             ServiceControlAction::Stop => text(TextKey::ServiceStopFailed),
+            ServiceControlAction::Restart => text(TextKey::ServiceRestartFailed),
             ServiceControlAction::Pause => text(TextKey::ServicePauseFailed),
             ServiceControlAction::Continue => text(TextKey::ServiceContinueFailed),
         };
@@ -868,6 +876,34 @@ mod tests {
         assert!(page.rows[0].process_sort.is_empty());
         assert!(!page.command_state().go_to_process);
         assert_eq!(page.last_refresh_error, Some(ERROR_BROKEN_PIPE));
+    }
+
+    #[test]
+    fn restart_is_enabled_exactly_when_stop_is_and_a_pending_control_disables_it() {
+        let mut page = ServicePageState {
+            rows: vec![service_row(
+                self::sampler::ServiceRecord {
+                    service_name: "test-service".to_string(),
+                    description: String::new(),
+                    status: ServiceRunState::Running,
+                    startup: ServiceStartupType::Manual,
+                    accepts_stop: true,
+                    accepts_pause_continue: false,
+                    process: None,
+                },
+                "PID",
+            )],
+            selected_service: Some("test-service".to_string()),
+            ..ServicePageState::default()
+        };
+        let enabled = page.command_state();
+        assert!(enabled.stop);
+        assert!(enabled.restart);
+        page.pending_control = Some(ServiceControlAction::Restart);
+        let pending = page.command_state();
+        assert!(!pending.stop);
+        assert!(!pending.restart);
+        assert!(!pending.start);
     }
 
     #[test]
