@@ -74,7 +74,7 @@ use crate::infrastructure::native::{
     finish_list_view_update, new_task_allowed, record_win32_error, subclass_list_view,
     to_wide_null, window_rect_relative_to_page,
 };
-use crate::infrastructure::worker::{SingleFlightWorker, keep_pending, replace_pending};
+use crate::infrastructure::worker::{SingleFlightWorker, keep_pending};
 use crate::system::process_identity::{
     FindProcPayload, ProcIdentity, find_proc_lparam, query_process_identity_for_pid,
 };
@@ -218,7 +218,7 @@ pub struct TaskPageState {
     pass_count: u64,
     snapshot_worker: Option<SingleFlightWorker<isize, TaskWorkerResult>>,
     icon_worker: Option<SingleFlightWorker<TaskIconBatchRequest, TaskIconCompletion>>,
-    end_task_worker: Option<SingleFlightWorker<EndTaskRequest, Option<u32>>>,
+    end_task_worker: Option<SingleFlightWorker<Vec<EndTaskRequest>, Option<u32>>>,
     pending_icon_identities: HashSet<TaskIdentity>,
     icon_generation: u64,
     last_refresh_error: Option<u32>,
@@ -998,7 +998,7 @@ impl TaskPageState {
         if targets.is_empty() {
             return;
         }
-        let request = EndTaskRequest { targets, force };
+        let request = vec![EndTaskRequest { targets, force }];
         let Some(worker) = self.end_task_worker.as_mut() else {
             self.report_end_task_failure(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
             return;
@@ -1095,7 +1095,7 @@ impl TaskPageState {
             self.end_task_worker = Some(SingleFlightWorker::spawn_cancellable_initialized(
                 "taskmgr-rs-task-end",
                 PWM_TASK_WORKER_COMPLETE,
-                replace_pending,
+                queue_end_tasks,
                 |_stop| run_end_tasks,
             )?);
         }
@@ -1543,29 +1543,49 @@ struct EndTaskRequest {
     force: bool,
 }
 
-fn run_end_tasks(request: EndTaskRequest) -> Option<u32> {
-    end_matching_tasks(
-        &request.targets,
-        request.force,
-        window_matches_identity,
-        |hwnd, force| {
-            // SAFETY: `window_matches_identity` just accepted this HWND on this thread. EndTask
-            // does not retain the handle after it returns.
-            let ended = unsafe { EndTask(hwnd, 0, if force { 1 } else { 0 }) } != 0;
-            if ended {
-                Ok(())
-            } else {
-                Err(last_error_or_gen_failure())
-            }
-        },
-    )
+fn queue_end_tasks(pending: &mut Vec<EndTaskRequest>, incoming: Vec<EndTaskRequest>) {
+    // An accepted End Task is not a refresh sample. Append it; do not replace an earlier command.
+    pending.extend(incoming);
+}
+
+fn run_end_tasks(requests: Vec<EndTaskRequest>) -> Option<u32> {
+    run_end_task_queue(&requests, window_matches_identity, |hwnd, force| {
+        // SAFETY: `window_matches_identity` just accepted this HWND on this thread. EndTask
+        // does not retain the handle after it returns.
+        let ended = unsafe { EndTask(hwnd, 0, if force { 1 } else { 0 }) } != 0;
+        if ended {
+            Ok(())
+        } else {
+            Err(last_error_or_gen_failure())
+        }
+    })
+}
+
+fn run_end_task_queue<Match, End>(
+    requests: &[EndTaskRequest],
+    mut matches: Match,
+    mut end_task: End,
+) -> Option<u32>
+where
+    Match: FnMut(TaskIdentity) -> bool,
+    End: FnMut(HWND, bool) -> Result<(), u32>,
+{
+    let mut first_error = None;
+    for request in requests {
+        let error =
+            end_matching_tasks(&request.targets, request.force, &mut matches, &mut end_task);
+        if first_error.is_none() {
+            first_error = error;
+        }
+    }
+    first_error
 }
 
 fn end_matching_tasks<Match, End>(
     targets: &[TaskIdentity],
     force: bool,
-    mut matches: Match,
-    mut end_task: End,
+    matches: &mut Match,
+    end_task: &mut End,
 ) -> Option<u32>
 where
     Match: FnMut(TaskIdentity) -> bool,
@@ -1728,8 +1748,8 @@ mod tests {
         let error = end_matching_tasks(
             &[skipped, failed, succeeded, failed_again],
             true,
-            |identity| identity.process.is_verified(),
-            |hwnd, force| {
+            &mut |identity: TaskIdentity| identity.process.is_verified(),
+            &mut |hwnd, force| {
                 calls.push((hwnd as isize, force));
                 if hwnd as isize == failed.hwnd {
                     Err(5)
@@ -1748,6 +1768,36 @@ mod tests {
                 (failed_again.hwnd, true)
             ]
         );
+        assert_eq!(error, Some(5));
+    }
+
+    #[test]
+    fn pending_end_task_commands_run_in_submission_order() {
+        let command = |hwnd: isize, force: bool| EndTaskRequest {
+            targets: vec![TaskIdentity {
+                hwnd,
+                process: ProcIdentity::new(10, 100),
+                thread_id: 2,
+            }],
+            force,
+        };
+        let mut pending = vec![command(1, false)];
+        queue_end_tasks(&mut pending, vec![command(2, true)]);
+        queue_end_tasks(&mut pending, vec![command(3, false)]);
+
+        let mut calls = Vec::new();
+        let error = run_end_task_queue(&pending, |_| true, &mut |hwnd, force| {
+            calls.push((hwnd as isize, force));
+            if hwnd as isize == 2 {
+                Err(5)
+            } else if hwnd as isize == 3 {
+                Err(9)
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(calls, vec![(1, false), (2, true), (3, false)]);
         assert_eq!(error, Some(5));
     }
 
