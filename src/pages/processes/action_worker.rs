@@ -1,6 +1,6 @@
 // +-------------------------------------------------------------------------
 //
-//   taskmgr-rs - 进程结束与优先级
+//   taskmgr-rs - 进程结束、优先级与亲和性
 //
 //   文件:       src/pages/processes/action_worker.rs
 //
@@ -9,17 +9,20 @@
 //   作者:       OpenAI Codex
 // --------------------------------------------------------------------------
 
-//! End Process, End Process Tree, and Set Priority after the UI confirmation.
+//! End Process, End Process Tree, Set Priority, and Set Affinity after the UI
+//! confirmation.
 //!
 //! One persistent [`SingleFlightWorker`] owns every confirmed action. The page
 //! posts no extra window message: completion reuses `PWM_PROC_WORKER_COMPLETE`
 //! and is drained beside the process sampler. Dropping the worker retires it
-//! without joining on the UI thread, including while a tree walk is still
-//! inside the collector.
+//! without joining on the UI thread, including while a tree walk or an affinity
+//! update is still inside the collector.
 //!
 //! Each action re-opens its target with `open_process_for_identity` and requires
 //! both the pid and `creation_time_100ns`. An unknown or mismatched identity
-//! returns before `TerminateProcess`, the tree walk, or `SetPriorityClass`.
+//! returns before `TerminateProcess`, the tree walk, `SetPriorityClass`,
+//! `SetProcessAffinityMask`, or `SetProcessDefaultCpuSets`. A group or mask that
+//! the native `KAFFINITY` cannot express fails before those calls.
 
 #[cfg(test)]
 use std::sync::mpsc::{Receiver, Sender};
@@ -34,8 +37,8 @@ use windows_sys::Win32::System::Threading::{
 
 use super::ProcPriority;
 use super::actions::{
-    ProcessTreePrepareError, ProcessTreeTerminationOutcome, prepare_process_tree_termination,
-    terminate_prepared_process_tree,
+    ProcessTreePrepareError, ProcessTreeTerminationOutcome, apply_confirmed_affinity,
+    prepare_process_tree_termination, terminate_prepared_process_tree,
 };
 use crate::infrastructure::native::OwnedHandle;
 use crate::infrastructure::worker::SingleFlightWorker;
@@ -45,12 +48,26 @@ use crate::ui::resource_ids::PWM_PROC_WORKER_COMPLETE;
 pub(super) type ProcessActionWorker =
     SingleFlightWorker<Vec<ProcessAction>, Vec<ProcessActionReport>>;
 
+/// Group-qualified affinity bits chosen in the dialog.
+///
+/// `mask` is the full group mask. A later conversion that would keep only the
+/// low bits of `KAFFINITY` is rejected instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AffinityGroupMask {
+    pub(super) group: u16,
+    pub(super) mask: u64,
+}
+
 pub(super) enum ProcessAction {
     End(ProcIdentity),
     EndTree(ProcIdentity),
     SetPriority {
         identity: ProcIdentity,
         priority: ProcPriority,
+    },
+    SetAffinity {
+        identity: ProcIdentity,
+        masks: Vec<AffinityGroupMask>,
     },
     #[cfg(test)]
     Block {
@@ -72,6 +89,7 @@ pub(super) enum ProcessActionFeedback {
     None,
     CantKill(u32),
     CantChangePriority(u32),
+    CantSetAffinity(u32),
     /// `show_failure_message` with the existing tree-failure body.
     KillTreePrepare(u32),
     /// Existing warning dialog. This is not a full success.
@@ -80,7 +98,8 @@ pub(super) enum ProcessActionFeedback {
 
 pub(super) fn spawn_process_action_worker() -> Result<ProcessActionWorker, u32> {
     // Asynchronous retirement closes completion posts and does not join a worker
-    // that is still inside TerminateProcess, Toolhelp, or SetPriorityClass.
+    // that is still inside TerminateProcess, Toolhelp, SetPriorityClass, or an
+    // affinity update.
     SingleFlightWorker::spawn_cancellable_initialized(
         "taskmgr-rs-process-actions",
         PWM_PROC_WORKER_COMPLETE,
@@ -137,6 +156,7 @@ fn run_process_action(action: ProcessAction) -> ProcessActionReport {
         ProcessAction::SetPriority { identity, priority } => {
             execute_set_priority(identity, priority)
         }
+        ProcessAction::SetAffinity { identity, masks } => execute_set_affinity(identity, masks),
         #[cfg(test)]
         ProcessAction::Block { entered, release } => {
             let _ = entered.send(());
@@ -176,6 +196,21 @@ fn execute_end_tree(identity: ProcIdentity) -> ProcessActionReport {
     match prepare_process_tree_termination(identity) {
         Ok(prepared) => report_end_tree_outcome(terminate_prepared_process_tree(prepared)),
         Err(error) => report_end_tree_prepare_error(error),
+    }
+}
+
+fn execute_set_affinity(
+    identity: ProcIdentity,
+    masks: Vec<AffinityGroupMask>,
+) -> ProcessActionReport {
+    // Reject an unknown identity before `apply_confirmed_affinity` opens the
+    // process and reaches either affinity API.
+    if let Err(error) = require_action_identity(identity) {
+        return affinity_failure(error);
+    }
+    match apply_confirmed_affinity(identity, &masks) {
+        Ok(()) => succeeded(),
+        Err(error) => affinity_failure(error),
     }
 }
 
@@ -227,6 +262,13 @@ const fn priority_failure(error: u32) -> ProcessActionReport {
     }
 }
 
+const fn affinity_failure(error: u32) -> ProcessActionReport {
+    ProcessActionReport {
+        refresh: false,
+        feedback: ProcessActionFeedback::CantSetAffinity(error),
+    }
+}
+
 const fn succeeded() -> ProcessActionReport {
     ProcessActionReport {
         refresh: true,
@@ -238,9 +280,10 @@ const fn succeeded() -> ProcessActionReport {
 mod tests {
     use super::super::actions::ProcessTreePrepareError;
     use super::{
-        ProcessAction, ProcessActionFeedback, ProcessTreeTerminationOutcome,
-        append_process_actions, report_end_tree_outcome, report_end_tree_prepare_error,
-        require_action_identity, run_process_action, spawn_process_action_worker,
+        AffinityGroupMask, ProcessAction, ProcessActionFeedback, ProcessTreeTerminationOutcome,
+        affinity_failure, append_process_actions, report_end_tree_outcome,
+        report_end_tree_prepare_error, require_action_identity, run_process_action,
+        spawn_process_action_worker,
     };
     use crate::system::process_identity::ProcIdentity;
     use std::ptr::null_mut;
@@ -270,6 +313,13 @@ mod tests {
             ProcessAction::SetPriority {
                 identity: ProcIdentity::new(0, 50),
                 priority: super::super::ProcPriority::High,
+            },
+            ProcessAction::SetAffinity {
+                identity: ProcIdentity::pid_only(12),
+                masks: vec![AffinityGroupMask {
+                    group: 0,
+                    mask: 0b1111,
+                }],
             },
         ] {
             let report = run_process_action(action);
@@ -334,6 +384,19 @@ mod tests {
                     identity: first,
                     priority: super::super::ProcPriority::Normal,
                 },
+                ProcessAction::SetAffinity {
+                    identity: second,
+                    masks: vec![
+                        AffinityGroupMask {
+                            group: 0,
+                            mask: 0b0011,
+                        },
+                        AffinityGroupMask {
+                            group: 1,
+                            mask: 1u64 << 63,
+                        },
+                    ],
+                },
             ],
         );
         assert!(matches!(pending[0], ProcessAction::End(identity) if identity == first));
@@ -343,6 +406,24 @@ mod tests {
             ProcessAction::SetPriority { identity, priority: super::super::ProcPriority::Normal }
                 if identity == first
         ));
+        assert!(matches!(
+            &pending[3],
+            ProcessAction::SetAffinity { identity, masks }
+                if *identity == second
+                    && masks.len() == 2
+                    && masks[0] == AffinityGroupMask { group: 0, mask: 0b0011 }
+                    && masks[1] == AffinityGroupMask { group: 1, mask: 1u64 << 63 }
+        ));
+    }
+
+    #[test]
+    fn affinity_failure_does_not_refresh_or_count_as_success() {
+        let report = affinity_failure(ERROR_INVALID_PARAMETER);
+        assert!(!report.refresh);
+        assert_eq!(
+            report.feedback,
+            ProcessActionFeedback::CantSetAffinity(ERROR_INVALID_PARAMETER)
+        );
     }
 
     #[test]
@@ -369,6 +450,39 @@ mod tests {
         assert_eq!(
             reports[0].feedback,
             ProcessActionFeedback::CantKill(ERROR_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn worker_completion_does_not_apply_affinity_for_an_unverified_process() {
+        let mut worker = spawn_process_action_worker().expect("action worker should start");
+        worker
+            .request(
+                vec![ProcessAction::SetAffinity {
+                    identity: ProcIdentity::new(0, 80),
+                    masks: vec![AffinityGroupMask {
+                        group: 1,
+                        mask: 1u64 << 63,
+                    }],
+                }],
+                null_mut(),
+            )
+            .expect("request should submit");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let reports = loop {
+            let drained = worker.drain(null_mut());
+            assert_eq!(drained.error, None);
+            if let Some(completion) = drained.completions.into_iter().next() {
+                break completion.value;
+            }
+            assert!(Instant::now() < deadline, "affinity completion timed out");
+            thread::yield_now();
+        };
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].refresh);
+        assert_eq!(
+            reports[0].feedback,
+            ProcessActionFeedback::CantSetAffinity(ERROR_INVALID_PARAMETER)
         );
     }
 

@@ -11,9 +11,9 @@
 //! Centralizes destructive and identity-sensitive process operations.
 //! Every target process is reopened through `ProcIdentity` immediately before use.
 //!
-//! End Process, End Process Tree, and Set Priority confirm on the UI thread, then
-//! run on one persistent worker. Debug, Open File Location, and Affinity stay on
-//! this thread.
+//! End Process, End Process Tree, Set Priority, and Set Affinity confirm on the UI
+//! thread, then run on one persistent worker. The affinity dialog stays on this
+//! thread. Debug and Open File Location stay on this thread.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -66,7 +66,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::action_worker::{
-    ProcessAction, ProcessActionFeedback, ProcessActionReport, spawn_process_action_worker,
+    AffinityGroupMask, ProcessAction, ProcessActionFeedback, ProcessActionReport,
+    require_action_identity, spawn_process_action_worker,
 };
 use super::{ProcPriority, ProcessPageState};
 use crate::infrastructure::native::{
@@ -87,11 +88,15 @@ struct AffinityDialogContext {
     topology: CpuSetTopology,
     selected_masks: Vec<usize>,
     selected_group_index: usize,
-    original_default_ids: Vec<u32>,
 }
 
 const PROCESS_TREE_ACCESS: u32 =
     PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+
+const AFFINITY_QUERY_ACCESS: u32 = PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION;
+
+const AFFINITY_UPDATE_ACCESS: u32 =
+    AFFINITY_QUERY_ACCESS | PROCESS_SET_INFORMATION | PROCESS_SET_LIMITED_INFORMATION;
 
 // `TerminateProcess` fails once a process has begun to exit, and the process object may not be
 // signaled in that same instant. This bound only applies after termination has already failed.
@@ -501,6 +506,9 @@ impl ProcessPageState {
             ProcessActionFeedback::CantChangePriority(error) => {
                 self.show_failure_message(&self.strings.cant_change_priority, error);
             }
+            ProcessActionFeedback::CantSetAffinity(error) => {
+                self.show_failure_message(&self.strings.cant_set_affinity, error);
+            }
             ProcessActionFeedback::KillTreePrepare(error) => {
                 self.show_failure_message(&self.strings.kill_tree_fail_body, error);
             }
@@ -523,20 +531,26 @@ impl ProcessPageState {
         }
     }
 
-    // Single-group processes retain the classic hard-affinity API. Multi-group systems use CPU
-    // Set IDs, whose group-qualified identities do not collapse at the 64-processor boundary.
+    // 亲和性对话框留在 UI 线程。确认后把身份和各组掩码交给持久 worker。
+    // SetProcessAffinityMask 与 SetProcessDefaultCpuSets 在 worker 上执行。
     pub(super) fn set_affinity(&mut self, identity: ProcIdentity) -> bool {
-        let handle = match open_process_for_identity(
-            identity,
-            PROCESS_QUERY_INFORMATION
-                | PROCESS_QUERY_LIMITED_INFORMATION
-                | PROCESS_SET_INFORMATION
-                | PROCESS_SET_LIMITED_INFORMATION,
-        ) {
+        let Some(masks) = self.confirmed_affinity_masks(identity) else {
+            return false;
+        };
+        self.submit_process_action(ProcessAction::SetAffinity { identity, masks })
+    }
+
+    // Query-only handle for the dialog. It is dropped before the action is queued,
+    // so the worker re-opens the process before it writes a mask.
+    fn confirmed_affinity_masks(
+        &mut self,
+        identity: ProcIdentity,
+    ) -> Option<Vec<AffinityGroupMask>> {
+        let handle = match open_process_for_identity(identity, AFFINITY_QUERY_ACCESS) {
             Ok(handle) => handle,
             Err(error) => {
                 self.show_failure_message(&self.strings.cant_set_affinity, error);
-                return false;
+                return None;
             }
         };
 
@@ -544,21 +558,21 @@ impl ProcessPageState {
             Ok(topology) => topology,
             Err(error) => {
                 self.show_failure_message(&self.strings.cant_set_affinity, error.win32_code());
-                return false;
+                return None;
             }
         };
         let original_default_ids = match query_process_default_cpu_sets(handle.as_raw()) {
             Ok(ids) => ids,
             Err(error) => {
                 self.show_failure_message(&self.strings.cant_set_affinity, error.win32_code());
-                return false;
+                return None;
             }
         };
         let original_process_groups = match query_process_groups(handle.as_raw()) {
             Ok(groups) => groups,
             Err(error) => {
                 self.show_failure_message(&self.strings.cant_set_affinity, error);
-                return false;
+                return None;
             }
         };
         let selected_masks = match initial_affinity_masks(
@@ -570,7 +584,7 @@ impl ProcessPageState {
             Ok(masks) => masks,
             Err(error) => {
                 self.show_failure_message(&self.strings.cant_set_affinity, error);
-                return false;
+                return None;
             }
         };
         let selected_group_index = selected_masks
@@ -582,7 +596,6 @@ impl ProcessPageState {
             topology,
             selected_masks,
             selected_group_index,
-            original_default_ids,
         };
 
         match dialog_box(
@@ -592,22 +605,17 @@ impl ProcessPageState {
             Some(affinity_dialog_proc),
             &mut context as *mut AffinityDialogContext as LPARAM,
         ) {
-            Ok(result) if result == IDOK as isize => {
-                match apply_affinity_selection(handle.as_raw(), identity.pid, &context) {
-                    Ok(()) => {
-                        self.refresh_processes();
-                        true
-                    }
-                    Err(error) => {
-                        self.show_failure_message(&self.strings.cant_set_affinity, error);
-                        false
-                    }
+            Ok(result) if result == IDOK as isize => match confirmed_group_masks(&context) {
+                Ok(masks) => Some(masks),
+                Err(error) => {
+                    self.show_failure_message(&self.strings.cant_set_affinity, error);
+                    None
                 }
-            }
-            Ok(_) => false,
+            },
+            Ok(_) => None,
             Err(error) => {
                 self.show_failure_message(&self.strings.cant_set_affinity, error);
-                false
+                None
             }
         }
     }
@@ -616,12 +624,14 @@ impl ProcessPageState {
 enum ActionFailureKind {
     Kill,
     Priority,
+    Affinity,
 }
 
 fn action_failure_kind(action: &ProcessAction) -> ActionFailureKind {
     match action {
         ProcessAction::End(_) | ProcessAction::EndTree(_) => ActionFailureKind::Kill,
         ProcessAction::SetPriority { .. } => ActionFailureKind::Priority,
+        ProcessAction::SetAffinity { .. } => ActionFailureKind::Affinity,
         #[cfg(test)]
         ProcessAction::Block { .. } => ActionFailureKind::Kill,
     }
@@ -633,8 +643,28 @@ fn failure_report(kind: ActionFailureKind, error: u32) -> ProcessActionReport {
         feedback: match kind {
             ActionFailureKind::Kill => ProcessActionFeedback::CantKill(error),
             ActionFailureKind::Priority => ProcessActionFeedback::CantChangePriority(error),
+            ActionFailureKind::Affinity => ProcessActionFeedback::CantSetAffinity(error),
         },
     }
+}
+
+fn confirmed_group_masks(context: &AffinityDialogContext) -> Result<Vec<AffinityGroupMask>, u32> {
+    context
+        .topology
+        .groups()
+        .iter()
+        .zip(context.selected_masks.iter().copied())
+        .map(|(group, mask)| {
+            // `u64` can hold every `usize` bit. A failed conversion is reported
+            // instead of submitting a shorter mask.
+            u64::try_from(mask)
+                .map(|mask| AffinityGroupMask {
+                    group: group.number,
+                    mask,
+                })
+                .map_err(|_| ERROR_NOT_SUPPORTED)
+        })
+        .collect()
 }
 
 fn initial_affinity_masks(
@@ -678,48 +708,167 @@ fn initial_affinity_masks(
     Ok(masks)
 }
 
+/// How a validated selection is written. A multi-group selection stays a list of
+/// group masks and is never folded into `SetProcessAffinityMask`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum AffinityUpdatePlan {
+    ProcessMask(usize),
+    GroupCpuSets(Vec<usize>),
+}
+
+pub(super) fn plan_affinity_update(masks: &[usize]) -> Result<AffinityUpdatePlan, u32> {
+    if masks.is_empty() || masks.iter().all(|mask| *mask == 0) {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    if masks.len() == 1 {
+        Ok(AffinityUpdatePlan::ProcessMask(masks[0]))
+    } else {
+        Ok(AffinityUpdatePlan::GroupCpuSets(masks.to_vec()))
+    }
+}
+
+/// Place each selected mask on the topology group with the same number.
+///
+/// A missing group, a duplicated group, a bit outside the assignable mask, or a
+/// mask wider than native `KAFFINITY` is an error. Bits are not clipped to the
+/// low half of the mask or moved onto another group.
+pub(super) fn align_affinity_selection(
+    topology_groups: &[(u16, usize)],
+    selected: &[(u16, u64)],
+) -> Result<Vec<usize>, u32> {
+    if topology_groups.is_empty() || selected.len() != topology_groups.len() {
+        return Err(ERROR_NOT_SUPPORTED);
+    }
+    if duplicate_group_ids(topology_groups.iter().map(|(group, _)| *group))
+        || duplicate_group_ids(selected.iter().map(|(group, _)| *group))
+    {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+
+    let mut masks = Vec::with_capacity(topology_groups.len());
+    for &(group, assignable) in topology_groups {
+        let Some(&(_, wide_mask)) = selected.iter().find(|(number, _)| *number == group) else {
+            return Err(ERROR_NOT_SUPPORTED);
+        };
+        let native = usize::try_from(wide_mask).map_err(|_| ERROR_NOT_SUPPORTED)?;
+        if native & !assignable != 0 {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        masks.push(native);
+    }
+    if masks.iter().all(|mask| *mask == 0) {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    Ok(masks)
+}
+
+fn duplicate_group_ids(mut groups: impl Iterator<Item = u16>) -> bool {
+    let mut seen = HashSet::<u16>::new();
+    groups.any(|group| !seen.insert(group))
+}
+
+pub(super) fn apply_confirmed_affinity(
+    identity: ProcIdentity,
+    selected: &[AffinityGroupMask],
+) -> Result<(), u32> {
+    // Unknown and mismatched identities fail here, before either mask API.
+    require_action_identity(identity)?;
+    let handle = open_process_for_identity(identity, AFFINITY_UPDATE_ACCESS)?;
+    let topology = CpuSetTopology::query(handle.as_raw()).map_err(|error| error.win32_code())?;
+    let original_default_ids =
+        query_process_default_cpu_sets(handle.as_raw()).map_err(|error| error.win32_code())?;
+    let topology_groups = topology
+        .groups()
+        .iter()
+        .map(|group| (group.number, group.assignable_mask))
+        .collect::<Vec<_>>();
+    let selected_pairs = selected
+        .iter()
+        .map(|group| (group.group, group.mask))
+        .collect::<Vec<_>>();
+    let masks = align_affinity_selection(&topology_groups, &selected_pairs)?;
+    apply_affinity_selection(
+        handle.as_raw(),
+        identity,
+        &topology,
+        &masks,
+        &original_default_ids,
+    )
+}
+
 fn apply_affinity_selection(
     process: HANDLE,
-    process_id: u32,
-    context: &AffinityDialogContext,
+    identity: ProcIdentity,
+    topology: &CpuSetTopology,
+    selected_masks: &[usize],
+    original_default_ids: &[u32],
 ) -> Result<(), u32> {
-    let selected_ids = context
-        .topology
-        .ids_for_masks(&context.selected_masks)
+    let selected_ids = topology
+        .ids_for_masks(selected_masks)
         .map_err(|error| error.win32_code())?;
     if selected_ids.is_empty() {
         return Err(ERROR_INVALID_PARAMETER);
     }
+    if selected_masks.len() != topology.groups().len() {
+        return Err(ERROR_NOT_SUPPORTED);
+    }
 
-    if context.topology.groups().len() == 1 {
-        set_process_default_cpu_sets(process, &[])?;
-        if unsafe { SetProcessAffinityMask(process, context.selected_masks[0]) } == 0 {
-            let error = nonzero_last_error();
-            let _ = set_process_default_cpu_sets(process, &context.original_default_ids);
-            return Err(error);
+    // Validation is finished. The handle was opened for this identity above.
+    match plan_affinity_update(selected_masks)? {
+        AffinityUpdatePlan::ProcessMask(mask) => {
+            if topology.groups().len() != 1 {
+                return Err(ERROR_NOT_SUPPORTED);
+            }
+            set_process_default_cpu_sets(process, &[])?;
+            if unsafe { SetProcessAffinityMask(process, mask) } == 0 {
+                let error = nonzero_last_error();
+                let _ = set_process_default_cpu_sets(process, original_default_ids);
+                // The CPU-set clear already landed. Restoring it does not make the
+                // failed mask a success.
+                return Err(error);
+            }
+            Ok(())
         }
-        return Ok(());
-    }
+        AffinityUpdatePlan::GroupCpuSets(masks) => {
+            if masks.len() != topology.groups().len() || topology.groups().len() < 2 {
+                return Err(ERROR_NOT_SUPPORTED);
+            }
+            set_process_default_cpu_sets(process, &selected_ids)?;
+            let selected_groups = topology
+                .groups()
+                .iter()
+                .zip(masks.iter().copied())
+                .filter(|(_, mask)| *mask != 0)
+                .map(|(group, mask)| (group.number, mask))
+                .collect::<Vec<_>>();
+            // Thread masks are applied by PID. Re-check the identity first so a
+            // reused PID does not receive this process's group masks. A mismatch
+            // after the CPU-set update is still a failure.
+            match query_process_identity_for_pid(identity.pid) {
+                Ok(current) if current == identity => {}
+                Ok(_) => {
+                    let _ = set_process_default_cpu_sets(process, original_default_ids);
+                    return Err(ERROR_INVALID_PARAMETER);
+                }
+                Err(error) => {
+                    let _ = set_process_default_cpu_sets(process, original_default_ids);
+                    return Err(error);
+                }
+            }
 
-    set_process_default_cpu_sets(process, &selected_ids)?;
-    let selected_groups = context
-        .topology
-        .groups()
-        .iter()
-        .zip(context.selected_masks.iter().copied())
-        .filter(|(_, mask)| *mask != 0)
-        .map(|(group, mask)| (group.number, mask))
-        .collect::<Vec<_>>();
-
-    // CPU Sets span groups, but a restrictive thread affinity mask takes precedence over a
-    // conflicting CPU Set assignment. Apply a group-qualified hard mask to every existing thread
-    // so an old per-thread affinity cannot keep using a CPU the user just deselected. The process
-    // default CPU Sets above cover threads created after the verified thread snapshot.
-    if let Err(error) = apply_thread_group_affinities(process_id, &selected_groups) {
-        let _ = set_process_default_cpu_sets(process, &context.original_default_ids);
-        return Err(error);
+            // CPU Sets span groups, but a restrictive thread affinity mask takes
+            // precedence over a conflicting CPU Set assignment. Apply a
+            // group-qualified hard mask to every existing thread so an old
+            // per-thread affinity cannot keep using a CPU the user just
+            // deselected. The process default CPU Sets above cover threads
+            // created after the verified thread snapshot.
+            if let Err(error) = apply_thread_group_affinities(identity.pid, &selected_groups) {
+                let _ = set_process_default_cpu_sets(process, original_default_ids);
+                return Err(error);
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 fn set_process_default_cpu_sets(process: HANDLE, ids: &[u32]) -> Result<(), u32> {
@@ -1941,5 +2090,109 @@ mod tree_identity_tests {
             ProcIdentity::pid_only(20),
             1_200
         ));
+    }
+}
+
+#[cfg(test)]
+mod affinity_selection_tests {
+    use super::{
+        AffinityGroupMask, AffinityUpdatePlan, align_affinity_selection, apply_confirmed_affinity,
+        plan_affinity_update,
+    };
+    use crate::system::process_identity::ProcIdentity;
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED};
+
+    #[test]
+    fn unverified_identity_does_not_apply_a_mask() {
+        let masks = [AffinityGroupMask {
+            group: 0,
+            mask: 0b1111,
+        }];
+        assert_eq!(
+            apply_confirmed_affinity(ProcIdentity::pid_only(4), &masks),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            apply_confirmed_affinity(ProcIdentity::new(0, 100), &masks),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn multigroup_plan_does_not_collapse_to_the_low_group() {
+        let masks = [0b0011usize, 0b1100];
+        assert_eq!(
+            plan_affinity_update(&masks),
+            Ok(AffinityUpdatePlan::GroupCpuSets(vec![0b0011, 0b1100]))
+        );
+        assert_ne!(
+            plan_affinity_update(&masks),
+            Ok(AffinityUpdatePlan::ProcessMask(0b0011))
+        );
+        assert_eq!(
+            plan_affinity_update(&[0b1010]),
+            Ok(AffinityUpdatePlan::ProcessMask(0b1010))
+        );
+    }
+
+    #[test]
+    fn inexpressible_group_or_mask_is_not_truncated() {
+        let topology = [(0u16, 0b0011usize), (1u16, 0b1100)];
+        // Bit 0 of group 0 is expressible. Bit 3 is not, so the mask is not reduced to bit 0.
+        assert_eq!(
+            align_affinity_selection(&topology, &[(0, 0b1001), (1, 0b0100)]),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+        // Group 2 is absent. Its bits are not applied to group 0 or group 1.
+        assert_eq!(
+            align_affinity_selection(&topology, &[(0, 0b0001), (2, 0b0100)]),
+            Err(ERROR_NOT_SUPPORTED)
+        );
+        assert_eq!(
+            align_affinity_selection(&topology, &[(1, 0b1000), (0, 0b0010)]).unwrap(),
+            vec![0b0010, 0b1000]
+        );
+    }
+
+    #[test]
+    fn mask_wider_than_native_kaffinity_is_not_truncated() {
+        let wide = 1u64 << 63;
+        let result = align_affinity_selection(&[(0, usize::MAX)], &[(0, wide)]);
+        if usize::BITS < 64 {
+            assert_eq!(result, Err(ERROR_NOT_SUPPORTED));
+        } else {
+            assert_eq!(result.unwrap(), vec![usize::try_from(wide).unwrap()]);
+        }
+
+        // Truncating to 32 bits would leave 0x1. That value must not be applied.
+        let widened = (1u64 << 32) | 1;
+        let narrowed = align_affinity_selection(&[(0, usize::MAX)], &[(0, widened)]);
+        if usize::BITS < 64 {
+            assert_eq!(narrowed, Err(ERROR_NOT_SUPPORTED));
+        } else {
+            assert_eq!(narrowed.unwrap(), vec![usize::try_from(widened).unwrap()]);
+        }
+    }
+
+    #[test]
+    fn highest_native_affinity_bit_survives_alignment() {
+        let high = 1usize << (usize::BITS - 1);
+        assert_eq!(
+            align_affinity_selection(&[(3, high)], &[(3, u64::try_from(high).unwrap())]).unwrap(),
+            vec![high]
+        );
+    }
+
+    #[test]
+    fn empty_or_duplicate_affinity_selection_is_rejected() {
+        assert_eq!(
+            align_affinity_selection(&[(0, 0b1)], &[(0, 0)]),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(plan_affinity_update(&[0, 0]), Err(ERROR_INVALID_PARAMETER));
+        assert_eq!(
+            align_affinity_selection(&[(0, 1), (0, 1)], &[(0, 1), (1, 1)]),
+            Err(ERROR_INVALID_PARAMETER)
+        );
     }
 }

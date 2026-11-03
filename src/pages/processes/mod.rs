@@ -26,11 +26,13 @@ mod tree;
 // 线程模型：
 //   SingleFlightWorker 工作线程在后台执行 collect_process_entries() 采样，
 //   UI 线程只提交刷新意图并异步提交结果；CPU delta 基线由 worker 独占。
-//   结束进程、结束进程树和设置优先级在确认后进入同一个持久 SingleFlightWorker。
-//   确认框留在 UI 线程。TerminateProcess、进程树遍历和 SetPriorityClass 在该
-//   worker 上执行，执行前用 open_process_for_identity 核对 pid 与创建时间。
-//   完成通知复用 PWM_PROC_WORKER_COMPLETE，和采样结果一起排空。页面销毁时丢弃
-//   该 worker，不在 UI 线程上 join。
+//   结束进程、结束进程树、设置优先级和设置亲和性在确认后进入同一个持久
+//   SingleFlightWorker。确认框和亲和性对话框留在 UI 线程。TerminateProcess、
+//   进程树遍历、SetPriorityClass、SetProcessAffinityMask 和
+//   SetProcessDefaultCpuSets 在该 worker 上执行，执行前用
+//   open_process_for_identity 核对 pid 与创建时间。完成通知复用
+//   PWM_PROC_WORKER_COMPLETE，和采样结果一起排空。页面销毁时丢弃该 worker，
+//   不在 UI 线程上 join。
 //   创建转储文件使用另一个 worker。保存对话框留在 UI 线程，
 //   MiniDumpWriteDump 在该 worker 上执行，不与采样请求合并。
 //
