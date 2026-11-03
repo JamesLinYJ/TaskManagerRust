@@ -308,14 +308,16 @@ impl AdapterHistory {
                 .all(|engine_id| self.engine_histories.contains_key(engine_id))
         );
 
-        if let Some(usage) = sample.dedicated_usage_bytes {
-            self.dedicated_history
-                .push(memory_percentage(usage, sample.info.dedicated_limit_bytes));
-        }
-        if let Some(usage) = sample.shared_usage_bytes {
-            self.shared_history
-                .push(memory_percentage(usage, sample.info.shared_limit_bytes));
-        }
+        record_memory_history(
+            &mut self.dedicated_history,
+            sample.dedicated_usage_bytes,
+            sample.info.dedicated_limit_bytes,
+        );
+        record_memory_history(
+            &mut self.shared_history,
+            sample.shared_usage_bytes,
+            sample.info.shared_limit_bytes,
+        );
     }
 
     fn engine_options(&self) -> Vec<(GpuEngineId, GpuEngineKind)> {
@@ -1685,6 +1687,19 @@ fn memory_percentage(usage: u64, limit: Option<u64>) -> u8 {
     rounded.min(100) as u8
 }
 
+fn record_memory_history(history: &mut HistoryBuffer, usage: Option<u64>, limit: Option<u64>) {
+    // A missing or zero limit makes memory_percentage return 0. That clamp is not a measured
+    // empty GPU, so this sample must not advance the graph. A later sample with a non-zero
+    // limit and real 0% usage still advances.
+    let Some(usage) = usage else {
+        return;
+    };
+    if limit.filter(|limit| *limit != 0).is_none() {
+        return;
+    }
+    history.push(memory_percentage(usage, limit));
+}
+
 fn status_after_refresh_error(has_snapshot: bool, unsupported: bool) -> GpuPageStatus {
     if has_snapshot {
         GpuPageStatus::Stale
@@ -1962,6 +1977,65 @@ mod tests {
         assert_eq!(memory_percentage(1, Some(3)), 33);
         assert_eq!(memory_percentage(1, None), 0);
         assert_eq!(memory_percentage(1, Some(0)), 0);
+    }
+
+    fn adapter_with_limits(
+        dedicated_limit_bytes: Option<u64>,
+        shared_limit_bytes: Option<u64>,
+    ) -> Arc<GpuAdapterInfo> {
+        let mut info = (*staged_adapter()).clone();
+        info.dedicated_limit_bytes = dedicated_limit_bytes;
+        info.shared_limit_bytes = shared_limit_bytes;
+        Arc::new(info)
+    }
+
+    fn memory_sample(
+        info: &Arc<GpuAdapterInfo>,
+        dedicated_usage_bytes: Option<u64>,
+        shared_usage_bytes: Option<u64>,
+    ) -> GpuAdapterSample {
+        GpuAdapterSample {
+            info: Arc::clone(info),
+            overall_utilization_percent: None,
+            engines: Vec::new(),
+            dedicated_usage_bytes,
+            shared_usage_bytes,
+            temperature_deci_c: None,
+            row_errors: Vec::new(),
+        }
+    }
+
+    fn history_values(history: &HistoryBuffer) -> Vec<u8> {
+        (0..history.len())
+            .map(|index| history.value_at(index).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn unknown_memory_limit_does_not_advance_history() {
+        let mut history = AdapterHistory::new();
+        let limited = adapter_with_limits(Some(1_000), Some(2_000));
+        history.push(&memory_sample(&limited, Some(500), Some(500)));
+        assert_eq!(history.dedicated_history.newest_value(), 50);
+        assert_eq!(history.shared_history.newest_value(), 25);
+        let dedicated_before = history_values(&history.dedicated_history);
+        let shared_before = history_values(&history.shared_history);
+
+        let missing_limit = adapter_with_limits(None, None);
+        history.push(&memory_sample(&missing_limit, Some(1), Some(1)));
+        assert_eq!(history_values(&history.dedicated_history), dedicated_before);
+        assert_eq!(history_values(&history.shared_history), shared_before);
+
+        let zero_limit = adapter_with_limits(Some(0), Some(0));
+        history.push(&memory_sample(&zero_limit, Some(1), Some(1)));
+        assert_eq!(history_values(&history.dedicated_history), dedicated_before);
+        assert_eq!(history_values(&history.shared_history), shared_before);
+
+        history.push(&memory_sample(&limited, Some(0), Some(0)));
+        assert_eq!(history.dedicated_history.newest_value(), 0);
+        assert_eq!(history.shared_history.newest_value(), 0);
+        assert_eq!(history.dedicated_history.value_at(1), Some(50));
+        assert_eq!(history.shared_history.value_at(1), Some(25));
     }
 
     #[test]
