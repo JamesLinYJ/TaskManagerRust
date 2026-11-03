@@ -296,19 +296,16 @@ impl SecureDirectory {
                     restart_scan,
                 )
             };
-            if status == STATUS_NO_MORE_FILES {
-                break;
+            // A failed query must not discard names already parsed from earlier calls by
+            // pretending the scan finished. Only `STATUS_NO_MORE_FILES` completes successfully.
+            match classify_directory_query(status, status_block.Information)? {
+                DirectoryQuery::Finished => break,
+                DirectoryQuery::Data(returned) => {
+                    let bytes = directory_query_bytes(&storage, returned)?;
+                    parse_directory_entries(bytes, &mut entries)?;
+                    restart_scan = false;
+                }
             }
-            if status < 0 && status != STATUS_BUFFER_OVERFLOW {
-                return Err(ntstatus_error(status));
-            }
-            let returned = status_block.Information;
-            if returned == 0 {
-                break;
-            }
-            let bytes = directory_query_bytes(&storage, returned)?;
-            parse_directory_entries(bytes, &mut entries)?;
-            restart_scan = false;
         }
         Ok(entries)
     }
@@ -550,6 +547,27 @@ fn validate_handle(file: &File, expected: ExpectedKind, reject_hard_links: bool)
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryQuery {
+    Finished,
+    Data(usize),
+}
+
+fn classify_directory_query(status: i32, returned: usize) -> io::Result<DirectoryQuery> {
+    if status == STATUS_NO_MORE_FILES {
+        return Ok(DirectoryQuery::Finished);
+    }
+    if status < 0 && status != STATUS_BUFFER_OVERFLOW {
+        return Err(ntstatus_error(status));
+    }
+    // Success and overflow describe bytes written, not the end of the directory.
+    // A zero length would hide every name the next query could still return.
+    if returned == 0 {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    Ok(DirectoryQuery::Data(returned))
 }
 
 fn directory_query_bytes(storage: &[u64], initialized_len: usize) -> io::Result<&[u8]> {
@@ -914,6 +932,8 @@ fn current_user_sid_string() -> io::Result<String> {
 mod tests {
     use super::*;
 
+    use windows_sys::Win32::Foundation::STATUS_SUCCESS;
+
     fn write_u32_field(buffer: &mut [u8], offset: usize, value: u32) {
         buffer[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
     }
@@ -946,6 +966,30 @@ mod tests {
             record[start..start + size_of::<u16>()].copy_from_slice(&unit.to_ne_bytes());
         }
         record
+    }
+
+    #[test]
+    fn empty_directory_query_is_rejected_without_finishing_the_scan() {
+        let success = classify_directory_query(STATUS_SUCCESS, 0)
+            .expect_err("success with no bytes is not the end of the directory");
+        assert_eq!(success.kind(), io::ErrorKind::InvalidData);
+        let overflow = classify_directory_query(STATUS_BUFFER_OVERFLOW, 0)
+            .expect_err("overflow with no bytes is not the end of the directory");
+        assert_eq!(overflow.kind(), io::ErrorKind::InvalidData);
+
+        assert_eq!(
+            classify_directory_query(STATUS_NO_MORE_FILES, 0).expect("no more files ends the scan"),
+            DirectoryQuery::Finished
+        );
+        assert_eq!(
+            classify_directory_query(STATUS_SUCCESS, 48).expect("a populated query is readable"),
+            DirectoryQuery::Data(48)
+        );
+        assert_eq!(
+            classify_directory_query(STATUS_BUFFER_OVERFLOW, 48)
+                .expect("a populated overflow query is readable"),
+            DirectoryQuery::Data(48)
+        );
     }
 
     #[test]
