@@ -952,6 +952,35 @@ mod tests {
     }
 
     #[test]
+    fn pointer_width_group_builds_one_bit_per_processor() {
+        let count = usize::BITS as usize;
+        let ids = (0..usize::BITS)
+            .map(|number| id(0, number as u8))
+            .collect::<Vec<_>>();
+        let records = (0..usize::BITS)
+            .map(|number| {
+                // A shift of `usize::BITS` is out of range for this pointer width.
+                let mask = if number < usize::BITS {
+                    1usize << number
+                } else {
+                    0
+                };
+                record(0, &[(0, mask)])
+            })
+            .collect::<Vec<_>>();
+
+        let topology = build_topology(&ids, &[usize::BITS], records).unwrap();
+        assert!(topology.matches_sample_len(count));
+    }
+
+    #[test]
+    fn active_count_above_pointer_width_is_out_of_range() {
+        let active_count = usize::BITS + 1;
+        let topology = build_topology(&[id(0, 0)], &[active_count], vec![record(0, &[(0, 1)])]);
+        assert_eq!(topology, Err(CpuTopologyError::OutOfRangeAffinityMask));
+    }
+
+    #[test]
     fn malformed_variable_records_are_rejected() {
         let valid = encoded_record(0, &[(0, 1)]);
         assert_eq!(parse_core_records(&valid).unwrap().len(), 1);
