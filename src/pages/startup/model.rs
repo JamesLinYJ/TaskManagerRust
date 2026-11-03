@@ -134,12 +134,35 @@ impl StartupToggle {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum StartupRequest {
-    Refresh,
-    SetEnabled {
-        id: StartupEntryId,
-        toggle: StartupToggle,
-    },
+pub(crate) struct StartupToggleCommand {
+    pub(crate) id: StartupEntryId,
+    pub(crate) toggle: StartupToggle,
+}
+
+/// One coalesced worker request.
+///
+/// Enable and disable commands stay in [`StartupRequest::toggles`] in acceptance order.
+/// `refresh` records that a snapshot is also wanted. Neither field replaces the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StartupRequest {
+    pub(crate) toggles: Vec<StartupToggleCommand>,
+    pub(crate) refresh: bool,
+}
+
+impl StartupRequest {
+    pub(crate) fn refresh() -> Self {
+        Self {
+            toggles: Vec::new(),
+            refresh: true,
+        }
+    }
+
+    pub(crate) fn toggle(id: StartupEntryId, toggle: StartupToggle) -> Self {
+        Self {
+            toggles: vec![StartupToggleCommand { id, toggle }],
+            refresh: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -271,6 +294,22 @@ pub(crate) fn classify_startup_result(
     }
 }
 
+/// `stored` is the identity the page already kept for this command.
+///
+/// The worker reads the live entry immediately before the registry or startup-folder write and
+/// passes that entry here. A missing entry, or one that is no longer the same source and name,
+/// is [`StartupActionFailure::Missing`]. The caller skips the write.
+pub(crate) fn confirm_startup_identity(
+    stored: &StartupEntryId,
+    observed: Option<&StartupEntryId>,
+) -> Result<(), StartupActionFailure> {
+    if observed.is_some_and(|observed| stored.matches(observed)) {
+        Ok(())
+    } else {
+        Err(StartupActionFailure::Missing)
+    }
+}
+
 pub(crate) fn command_state(selected: Option<StartupEnabledState>) -> StartupCommandState {
     let Some(state) = selected else {
         return StartupCommandState::disabled();
@@ -281,12 +320,11 @@ pub(crate) fn command_state(selected: Option<StartupEnabledState>) -> StartupCom
     }
 }
 
-/// Keeps a pending enable or disable ahead of a coalesced refresh.
+/// Appends every accepted enable or disable. A refresh does not erase that queue, and a toggle
+/// is not dropped when a refresh is already pending.
 pub(crate) fn merge_startup_requests(pending: &mut StartupRequest, incoming: StartupRequest) {
-    match (&*pending, &incoming) {
-        (StartupRequest::SetEnabled { .. }, StartupRequest::Refresh) => {}
-        _ => *pending = incoming,
-    }
+    pending.toggles.extend(incoming.toggles);
+    pending.refresh = pending.refresh || incoming.refresh;
 }
 
 pub(crate) const fn refresh_scroll_policy() -> StartupScrollPolicy {
@@ -616,30 +654,91 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pending_toggle_survives_a_coalesced_refresh() {
-        let original = StartupRequest::SetEnabled {
-            id: id(StartupSource::CurrentUserRun, "OneDrive"),
-            toggle: StartupToggle::Disable,
-        };
-        let mut pending = original.clone();
-        merge_startup_requests(&mut pending, StartupRequest::Refresh);
-        assert_eq!(pending, original);
+    fn queued_toggle(
+        source: StartupSource,
+        name: &str,
+        toggle: StartupToggle,
+    ) -> StartupToggleCommand {
+        StartupToggleCommand {
+            id: id(source, name),
+            toggle,
+        }
+    }
 
+    #[test]
+    fn two_pending_toggles_survive_a_merge_and_a_refresh() {
+        let first = queued_toggle(
+            StartupSource::CurrentUserRun,
+            "OneDrive",
+            StartupToggle::Disable,
+        );
+        let second = queued_toggle(
+            StartupSource::LocalMachineRun,
+            "SecurityHealth",
+            StartupToggle::Enable,
+        );
+        let mut pending = StartupRequest::toggle(first.id.clone(), first.toggle);
         merge_startup_requests(
             &mut pending,
-            StartupRequest::SetEnabled {
-                id: id(StartupSource::LocalMachineRun, "SecurityHealth"),
-                toggle: StartupToggle::Enable,
-            },
+            StartupRequest::toggle(second.id.clone(), second.toggle),
         );
-        assert!(matches!(
+        assert_eq!(
             pending,
-            StartupRequest::SetEnabled {
-                toggle: StartupToggle::Enable,
-                ..
+            StartupRequest {
+                toggles: vec![first.clone(), second.clone()],
+                refresh: false,
             }
-        ));
+        );
+
+        merge_startup_requests(&mut pending, StartupRequest::refresh());
+        assert_eq!(
+            pending,
+            StartupRequest {
+                toggles: vec![first.clone(), second],
+                refresh: true,
+            }
+        );
+
+        let mut refresh_first = StartupRequest::refresh();
+        merge_startup_requests(
+            &mut refresh_first,
+            StartupRequest::toggle(first.id.clone(), first.toggle),
+        );
+        assert_eq!(
+            refresh_first,
+            StartupRequest {
+                toggles: vec![first],
+                refresh: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_changed_startup_identity_is_the_existing_missing_failure() {
+        let stored = id(StartupSource::CurrentUserRun, "OneDrive");
+        assert_eq!(confirm_startup_identity(&stored, Some(&stored)), Ok(()));
+        assert_eq!(
+            confirm_startup_identity(
+                &stored,
+                Some(&id(StartupSource::CurrentUserRun, "onedrive"))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            confirm_startup_identity(&stored, None),
+            Err(StartupActionFailure::Missing)
+        );
+        assert_eq!(
+            confirm_startup_identity(
+                &stored,
+                Some(&id(StartupSource::LocalMachineRun, "OneDrive"))
+            ),
+            Err(StartupActionFailure::Missing)
+        );
+        assert_eq!(
+            confirm_startup_identity(&stored, Some(&id(StartupSource::CurrentUserRun, "Teams"))),
+            Err(StartupActionFailure::Missing)
+        );
     }
 
     #[test]
