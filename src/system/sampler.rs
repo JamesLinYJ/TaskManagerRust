@@ -377,6 +377,12 @@ fn calculate_cpu_delta(
     if current.is_empty() || current.len() != previous.len() {
         return delta;
     }
+    // Detail-counter failures must not skip this check. A missing interval is not a
+    // measurement, so its processor percents stay unpublished.
+    let Some(elapsed_ms) = elapsed_ms.filter(|elapsed| *elapsed != 0) else {
+        delta.diagnostics = Err(CpuDiagnosticError::InvalidElapsedTime);
+        return delta;
+    };
 
     let mut idle_sum = 0u128;
     let mut kernel_sum = 0u128;
@@ -471,10 +477,6 @@ fn calculate_cpu_delta(
         delta.diagnostics = Err(error);
         return delta;
     }
-    let Some(elapsed_ms) = elapsed_ms.filter(|elapsed| *elapsed != 0) else {
-        delta.diagnostics = Err(CpuDiagnosticError::InvalidElapsedTime);
-        return delta;
-    };
     let (Some(user_usage), Some(dpc_usage), Some(interrupt_usage)) = (
         checked_percent_u128(user_sum, total_sum),
         checked_percent_u128(dpc_sum, total_sum),
@@ -646,10 +648,52 @@ mod tests {
         let previous = [times(100, 100, 100, 10, 5, 100)];
         let current = [times(120, 140, 140, 18, 8, 120)];
         let delta = calculate_cpu_delta(&current, &previous, Some(0));
-        assert!(delta.valid);
+        assert!(!delta.valid);
+        assert_eq!(delta.cpu_usage, 0);
+        assert_eq!(delta.processor_cpu_usage, vec![0]);
+        assert_eq!(delta.processor_kernel_usage, vec![0]);
         assert_eq!(
             delta.diagnostics,
             Err(CpuDiagnosticError::InvalidElapsedTime)
+        );
+    }
+
+    #[test]
+    fn zero_elapsed_with_regressed_detail_is_not_valid_but_idle_zero_percent_is() {
+        let previous = [times(100, 100, 100, 10, 5, 100)];
+        let regressed = [times(120, 140, 140, 18, 8, 90)];
+        let rejected = calculate_cpu_delta(&regressed, &previous, Some(0));
+        assert!(!rejected.valid);
+        assert_eq!(rejected.cpu_usage, 0);
+        assert_eq!(rejected.processor_cpu_usage, vec![0]);
+        assert_eq!(rejected.processor_kernel_usage, vec![0]);
+        assert_eq!(
+            rejected.diagnostics,
+            Err(CpuDiagnosticError::InvalidElapsedTime)
+        );
+
+        let missing = calculate_cpu_delta(&regressed, &previous, None);
+        assert!(!missing.valid);
+        assert_eq!(
+            missing.diagnostics,
+            Err(CpuDiagnosticError::InvalidElapsedTime)
+        );
+
+        let idle = [times(200, 100, 100, 10, 5, 100)];
+        let later = calculate_cpu_delta(&idle, &previous, Some(1000));
+        assert!(later.valid);
+        assert_eq!(later.cpu_usage, 0);
+        assert_eq!(later.kernel_usage, 0);
+        assert_eq!(later.processor_cpu_usage, vec![0]);
+        assert_eq!(
+            later.diagnostics,
+            Ok(CpuDiagnosticSample {
+                user_usage: 0,
+                kernel_usage: 0,
+                dpc_usage: 0,
+                interrupt_usage: 0,
+                interrupts_per_second: 0,
+            })
         );
     }
 
