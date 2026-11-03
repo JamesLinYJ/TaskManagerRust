@@ -8,6 +8,7 @@
 //   作者:       OpenAI Codex
 // --------------------------------------------------------------------------
 
+mod action_worker;
 mod actions;
 mod dump;
 mod filter;
@@ -25,7 +26,12 @@ mod tree;
 // 线程模型：
 //   SingleFlightWorker 工作线程在后台执行 collect_process_entries() 采样，
 //   UI 线程只提交刷新意图并异步提交结果；CPU delta 基线由 worker 独占。
-//   创建转储文件使用另一个 SingleFlightWorker。保存对话框留在 UI 线程，
+//   结束进程、结束进程树和设置优先级在确认后进入同一个持久 SingleFlightWorker。
+//   确认框留在 UI 线程。TerminateProcess、进程树遍历和 SetPriorityClass 在该
+//   worker 上执行，执行前用 open_process_for_identity 核对 pid 与创建时间。
+//   完成通知复用 PWM_PROC_WORKER_COMPLETE，和采样结果一起排空。页面销毁时丢弃
+//   该 worker，不在 UI 线程上 join。
+//   创建转储文件使用另一个 worker。保存对话框留在 UI 线程，
 //   MiniDumpWriteDump 在该 worker 上执行，不与采样请求合并。
 //
 // 缓存失效策略：
@@ -408,6 +414,7 @@ pub struct ProcessPageState {
     pass_count: u64,
     request_generation: u64,
     worker: Option<SingleFlightWorker<ProcessCollectionRequest, ProcessCollectionCompletion>>,
+    action_worker: Option<action_worker::ProcessActionWorker>,
     dump_worker: Option<dump::DumpWorker>,
     search_worker:
         Option<SingleFlightWorker<ProcessSearchRequest, Result<(), ProcessSearchFailure>>>,
@@ -443,6 +450,7 @@ impl Default for ProcessPageState {
             pass_count: 0,
             request_generation: 0,
             worker: None,
+            action_worker: None,
             dump_worker: None,
             search_worker: None,
             last_refresh_error: None,
@@ -454,28 +462,31 @@ impl Default for ProcessPageState {
 }
 
 impl ProcessPageState {
-    // 创建持久采样线程。线程、通道和单在途语义由 SingleFlightWorker 统一负责。
+    // 创建持久采样线程和进程操作线程。通道和单在途语义由 SingleFlightWorker 负责。
     fn start_worker_thread(&mut self) -> Result<(), u32> {
-        if self.worker.is_some() {
-            return Ok(());
+        if self.worker.is_none() {
+            self.worker = Some(SingleFlightWorker::spawn_initialized(
+                "taskmgr-rs-process-sampler",
+                PWM_PROC_WORKER_COMPLETE,
+                replace_pending,
+                || {
+                    let mut state = ProcWorkerState::default();
+                    move |request: ProcessCollectionRequest| ProcessCollectionCompletion {
+                        generation: request.generation,
+                        result: state.collect(request.sample),
+                    }
+                },
+            )?);
         }
-        self.worker = Some(SingleFlightWorker::spawn_initialized(
-            "taskmgr-rs-process-sampler",
-            PWM_PROC_WORKER_COMPLETE,
-            replace_pending,
-            || {
-                let mut state = ProcWorkerState::default();
-                move |request: ProcessCollectionRequest| ProcessCollectionCompletion {
-                    generation: request.generation,
-                    result: state.collect(request.sample),
-                }
-            },
-        )?);
+        if self.action_worker.is_none() {
+            self.action_worker = Some(action_worker::spawn_process_action_worker()?);
+        }
         Ok(())
     }
 
     fn stop_worker_thread(&mut self) {
         self.worker = None;
+        self.action_worker = None;
         self.search_worker = None;
     }
 
@@ -1106,21 +1117,26 @@ impl ProcessPageState {
     }
 
     fn drain_worker_results(&mut self) {
-        let drain = match self.worker.as_mut() {
-            Some(worker) => worker.drain(self.hwnd_page),
-            None => return,
-        };
-        for completion in drain.completions {
-            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
-                self.apply_worker_completion(completion.value)
-            });
+        let drain = self
+            .worker
+            .as_mut()
+            .map(|worker| worker.drain(self.hwnd_page));
+        if let Some(drain) = drain {
+            for completion in drain.completions {
+                crate::infrastructure::diagnostics::with_operation_id(
+                    completion.operation_id,
+                    || self.apply_worker_completion(completion.value),
+                );
+            }
+            if let Some(error) = drain.error {
+                // Worker-level failures (including a collector panic) may have no result to
+                // correlate. Cancel navigation instead of leaving a request that cannot finish.
+                self.pending_find = None;
+                self.set_refresh_error(error);
+            }
         }
-        if let Some(error) = drain.error {
-            // Worker-level failures (including a collector panic) may have no result to
-            // correlate. Cancel navigation instead of leaving a request that cannot finish.
-            self.pending_find = None;
-            self.set_refresh_error(error);
-        }
+        // The action worker posts the same completion message as the sampler.
+        self.drain_process_action_results();
     }
 
     fn apply_worker_completion(&mut self, completion: ProcessCollectionCompletion) {

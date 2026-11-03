@@ -10,6 +10,10 @@
 
 //! Centralizes destructive and identity-sensitive process operations.
 //! Every target process is reopened through `ProcIdentity` immediately before use.
+//!
+//! End Process, End Process Tree, and Set Priority confirm on the UI thread, then
+//! run on one persistent worker. Debug, Open File Location, and Affinity stay on
+//! this thread.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -19,9 +23,9 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
     ERROR_BUSY, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
-    ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, FILETIME, GetLastError, HANDLE,
-    HWND, LPARAM, WAIT_OBJECT_0, WPARAM,
+    ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_INVALID_WINDOW_HANDLE,
+    ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, FILETIME,
+    GetLastError, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
@@ -41,17 +45,15 @@ use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows_sys::Win32::System::Threading::{
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, CREATE_NEW_CONSOLE, CreateEventW,
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetProcessAffinityMask, GetProcessGroupAffinity, GetProcessIdOfThread, GetThreadGroupAffinity,
-    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, InitializeProcThreadAttributeList, IsWow64Process2,
-    LPPROC_THREAD_ATTRIBUTE_LIST, NORMAL_PRIORITY_CLASS, OpenThread,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION,
-    PROCESS_TERMINATE, QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, STARTUPINFOEXW,
-    STARTUPINFOW, SetPriorityClass, SetProcessAffinityMask, SetProcessDefaultCpuSets,
-    SetThreadGroupAffinity, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_INFORMATION,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NEW_CONSOLE, CreateEventW, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetProcessAffinityMask, GetProcessGroupAffinity,
+    GetProcessIdOfThread, GetThreadGroupAffinity, InitializeProcThreadAttributeList,
+    IsWow64Process2, LPPROC_THREAD_ATTRIBUTE_LIST, OpenThread, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, STARTUPINFOEXW, STARTUPINFOW, SetProcessAffinityMask,
+    SetProcessDefaultCpuSets, SetThreadGroupAffinity, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SET_INFORMATION, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked,
@@ -63,9 +65,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, SendMessageW, SetWindowTextW, WM_COMMAND, WM_INITDIALOG,
 };
 
+use super::action_worker::{
+    ProcessAction, ProcessActionFeedback, ProcessActionReport, spawn_process_action_worker,
+};
 use super::{ProcPriority, ProcessPageState};
 use crate::infrastructure::native::{
-    OwnedHandle, get_window_userdata, hiword, loword, set_window_userdata, to_wide_null,
+    OwnedHandle, get_window_userdata, hiword, loword, record_win32_error, set_window_userdata,
+    to_wide_null,
 };
 use crate::system::cpu_sets::{CpuSetTopology, query_process_default_cpu_sets};
 use crate::system::process_identity::{
@@ -149,10 +155,10 @@ pub(super) struct PreparedProcessTree {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ProcessTreeTerminationOutcome {
-    any_success: bool,
-    any_completed: bool,
-    any_failure: bool,
-    root_error: u32,
+    pub(super) any_success: bool,
+    pub(super) any_completed: bool,
+    pub(super) any_failure: bool,
+    pub(super) root_error: u32,
 }
 
 impl ProcessTreeTerminationOutcome {
@@ -162,10 +168,6 @@ impl ProcessTreeTerminationOutcome {
 
     pub(super) const fn any_failure(self) -> bool {
         self.any_failure
-    }
-
-    const fn completed_without_failure(self) -> bool {
-        self.any_completed && !self.any_failure
     }
 }
 
@@ -211,82 +213,20 @@ impl ProcessPageState {
         }
     }
 
-    // 结束指定 PID 的进程。先弹确认框，再通过 TerminateProcess 终止。
+    // 结束指定进程。确认留在 UI 线程；TerminateProcess 在持久 worker 上执行。
     pub(super) fn kill_process(&mut self, identity: ProcIdentity) -> bool {
         if !self.quick_confirm(&self.strings.warning, &self.strings.kill) {
             return false;
         }
-
-        let handle = match open_process_for_identity(
-            identity,
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.show_failure_message(&self.strings.cant_kill, error);
-                return false;
-            }
-        };
-
-        // SAFETY: `open_process_for_identity` returned a live handle with PROCESS_TERMINATE
-        // access for the exact verified identity.
-        if unsafe { TerminateProcess(handle.as_raw(), 1) } == 0 {
-            let error = unsafe { GetLastError() };
-            self.show_failure_message(&self.strings.cant_kill, error);
-            false
-        } else {
-            self.paused = false;
-            self.refresh_processes();
-            true
-        }
+        self.submit_process_action(ProcessAction::End(identity))
     }
 
-    // 结束进程以及所有子进程。按叶子优先的顺序遍历进程树，逐进程 TerminateProcess。
+    // 结束进程以及所有子进程。确认留在 UI 线程；树遍历和 TerminateProcess 在持久 worker 上执行。
     pub(super) fn kill_process_tree(&mut self, identity: ProcIdentity) -> bool {
         if !self.quick_confirm(&self.strings.warning, &self.strings.kill_tree) {
             return false;
         }
-
-        let prepared = match prepare_process_tree_termination(identity) {
-            Ok(prepared) => prepared,
-            Err(ProcessTreePrepareError::Root(error)) => {
-                self.show_failure_message(&self.strings.cant_kill, error);
-                return false;
-            }
-            Err(ProcessTreePrepareError::Tree(error)) => {
-                self.show_failure_message(&self.strings.kill_tree_fail_body, error);
-                return false;
-            }
-        };
-        let outcome = terminate_prepared_process_tree(prepared);
-
-        if outcome.any_completed {
-            self.paused = false;
-            self.refresh_processes();
-        }
-
-        if outcome.root_error != 0 && !outcome.any_success() {
-            self.show_failure_message(&self.strings.cant_kill, outcome.root_error);
-            return false;
-        }
-
-        if outcome.any_failure() {
-            let body_wide = to_wide_null(&self.strings.kill_tree_fail_body);
-            let title_wide = to_wide_null(&self.strings.kill_tree_fail);
-            // SAFETY: the page HWND is borrowed and both terminated buffers outlive this
-            // synchronous message box call.
-            unsafe {
-                MessageBoxW(
-                    self.hwnd_page,
-                    body_wide.as_ptr(),
-                    title_wide.as_ptr(),
-                    MB_OK | MB_ICONEXCLAMATION,
-                );
-            }
-            return false;
-        }
-
-        outcome.completed_without_failure()
+        self.submit_process_action(ProcessAction::EndTree(identity))
     }
 
     // 使用目标进程位数对应的 AeDebug 命令模板启动调试器。完整模板中的第一个
@@ -482,41 +422,104 @@ impl ProcessPageState {
         }
     }
 
-    // 通过 SetPriorityClass 修改进程优先级类。先弹确认框，操作成功后刷新列表。
+    // 修改进程优先级类。确认留在 UI 线程；SetPriorityClass 在持久 worker 上执行。
     pub(super) fn set_priority(&mut self, identity: ProcIdentity, priority: ProcPriority) -> bool {
-        let priority_class = match priority {
-            ProcPriority::Low => IDLE_PRIORITY_CLASS,
-            ProcPriority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
-            ProcPriority::Normal => NORMAL_PRIORITY_CLASS,
-            ProcPriority::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS,
-            ProcPriority::High => HIGH_PRIORITY_CLASS,
-            ProcPriority::Realtime => REALTIME_PRIORITY_CLASS,
-        };
-
         if !self.quick_confirm(&self.strings.warning, &self.strings.prichange) {
             return false;
         }
+        self.submit_process_action(ProcessAction::SetPriority { identity, priority })
+    }
 
-        let handle = match open_process_for_identity(
-            identity,
-            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.show_failure_message(&self.strings.cant_change_priority, error);
-                return false;
+    fn submit_process_action(&mut self, action: ProcessAction) -> bool {
+        let failure_kind = action_failure_kind(&action);
+        if self.hwnd_page.is_null() {
+            self.present_process_action_report(failure_report(
+                failure_kind,
+                ERROR_INVALID_WINDOW_HANDLE,
+            ));
+            return false;
+        }
+        if self.action_worker.is_none() {
+            match spawn_process_action_worker() {
+                Ok(worker) => self.action_worker = Some(worker),
+                Err(error) => {
+                    self.present_process_action_report(failure_report(failure_kind, error));
+                    return false;
+                }
             }
-        };
+        }
+        let requested = self
+            .action_worker
+            .as_mut()
+            .map(|worker| worker.request(vec![action], self.hwnd_page));
+        match requested {
+            Some(Ok(_)) => true,
+            Some(Err(error)) => {
+                record_win32_error("process action submit", error);
+                self.present_process_action_report(failure_report(failure_kind, error));
+                false
+            }
+            None => false,
+        }
+    }
 
-        // SAFETY: the identity-validated handle has PROCESS_SET_INFORMATION access.
-        if unsafe { SetPriorityClass(handle.as_raw(), priority_class) } == 0 {
-            let error = unsafe { GetLastError() };
-            self.show_failure_message(&self.strings.cant_change_priority, error);
-            false
-        } else {
+    pub(super) fn drain_process_action_results(&mut self) {
+        let awaiting_result = self
+            .action_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_in_flight() || worker.has_pending());
+        let drain = match self.action_worker.as_mut() {
+            Some(worker) => worker.drain(self.hwnd_page),
+            None => return,
+        };
+        let worker_error = drain.error;
+        for completion in drain.completions {
+            crate::infrastructure::diagnostics::with_operation_id(completion.operation_id, || {
+                for report in completion.value {
+                    self.present_process_action_report(report);
+                }
+            });
+        }
+        if let Some(error) = worker_error {
+            record_win32_error("process action", error);
+            if awaiting_result {
+                self.show_failure_message(&self.strings.cant_kill, error);
+            }
+        }
+    }
+
+    fn present_process_action_report(&mut self, report: ProcessActionReport) {
+        if report.refresh {
             self.paused = false;
             self.refresh_processes();
-            true
+        }
+        match report.feedback {
+            ProcessActionFeedback::None => {}
+            ProcessActionFeedback::CantKill(error) => {
+                self.show_failure_message(&self.strings.cant_kill, error);
+            }
+            ProcessActionFeedback::CantChangePriority(error) => {
+                self.show_failure_message(&self.strings.cant_change_priority, error);
+            }
+            ProcessActionFeedback::KillTreePrepare(error) => {
+                self.show_failure_message(&self.strings.kill_tree_fail_body, error);
+            }
+            ProcessActionFeedback::PartialTree => self.show_partial_tree_failure(),
+        }
+    }
+
+    fn show_partial_tree_failure(&self) {
+        let body_wide = to_wide_null(&self.strings.kill_tree_fail_body);
+        let title_wide = to_wide_null(&self.strings.kill_tree_fail);
+        // SAFETY: the page HWND is borrowed and both terminated buffers outlive this
+        // synchronous message box call.
+        unsafe {
+            MessageBoxW(
+                self.hwnd_page,
+                body_wide.as_ptr(),
+                title_wide.as_ptr(),
+                MB_OK | MB_ICONEXCLAMATION,
+            );
         }
     }
 
@@ -607,6 +610,30 @@ impl ProcessPageState {
                 false
             }
         }
+    }
+}
+
+enum ActionFailureKind {
+    Kill,
+    Priority,
+}
+
+fn action_failure_kind(action: &ProcessAction) -> ActionFailureKind {
+    match action {
+        ProcessAction::End(_) | ProcessAction::EndTree(_) => ActionFailureKind::Kill,
+        ProcessAction::SetPriority { .. } => ActionFailureKind::Priority,
+        #[cfg(test)]
+        ProcessAction::Block { .. } => ActionFailureKind::Kill,
+    }
+}
+
+fn failure_report(kind: ActionFailureKind, error: u32) -> ProcessActionReport {
+    ProcessActionReport {
+        refresh: false,
+        feedback: match kind {
+            ActionFailureKind::Kill => ProcessActionFeedback::CantKill(error),
+            ActionFailureKind::Priority => ProcessActionFeedback::CantChangePriority(error),
+        },
     }
 }
 
