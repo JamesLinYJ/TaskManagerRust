@@ -19,6 +19,12 @@ This is not a copy of the modern Task Manager. CPU and GPU details come from sys
 - **Services** lists Win32 services with description, status, startup type, and the owning process. Start, stop, pause, continue, and Go to Process run only when the current row allows them. Go to Process requires a process id plus creation time.
 - **Startup** lists Run-key and Startup-folder apps with name, publisher or command, location, and enabled state. Enable and disable write the StartupApproved value and report a failure immediately when the entry is missing or the new state cannot be read back. Entries are not deleted.
 
+On the Applications page, every **End Task** action asks for confirmation, then terminates
+all selected applications' processes, including their other windows. Unsaved data will be lost;
+the applications are not asked to save first. The button, context menu and Delete shortcut use
+the same behavior. Holding Ctrl does not bypass confirmation. Cancelling leaves the processes
+running. Targets are captured before the confirmation dialog and checked again before termination.
+
 ## Download
 
 The current build is on the [Releases page](https://github.com/JamesLinYJ/taskmgr-rs/releases/latest):

@@ -64,7 +64,10 @@ jobs:
       - name: Install Rust toolchain
         run: |
           rustup set profile minimal
-          rustup toolchain install stable --profile minimal
+          $channel = Select-String -Path rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([^"]+)"'
+          if ($null -eq $channel) { throw 'rust-toolchain.toml has no channel' }
+          $toolchain = $channel.Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal
           rustup show active-toolchain
 
       - name: Resolve or create release tag
@@ -188,7 +191,10 @@ jobs:
       - name: Install Rust toolchain
         run: |
           rustup set profile minimal
-          rustup toolchain install stable --profile minimal
+          $channel = Select-String -Path rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([^"]+)"'
+          if ($null -eq $channel) { throw 'rust-toolchain.toml has no channel' }
+          $toolchain = $channel.Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal
           rustup show active-toolchain
 
       - name: Validate tag and package version
@@ -254,7 +260,10 @@ jobs:
         id: toolchain
         run: |
           rustup set profile minimal
-          rustup toolchain install stable `
+          $channel = Select-String -Path rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([^"]+)"'
+          if ($null -eq $channel) { throw 'rust-toolchain.toml has no channel' }
+          $toolchain = $channel.Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain `
               --target '${{ matrix.target }}'
           rustup show active-toolchain
           $commit = @(

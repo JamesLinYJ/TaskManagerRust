@@ -53,7 +53,10 @@ jobs:
         id: toolchain
         run: |
           rustup set profile minimal
-          rustup toolchain install stable `
+          $channel = Select-String -Path rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([^"]+)"'
+          if ($null -eq $channel) { throw 'rust-toolchain.toml has no channel' }
+          $toolchain = $channel.Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain `
             --component rustfmt `
             --component clippy `
             --target x86_64-pc-windows-msvc
@@ -138,7 +141,10 @@ jobs:
         id: toolchain
         run: |
           rustup set profile minimal
-          rustup toolchain install stable `
+          $channel = Select-String -Path rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([^"]+)"'
+          if ($null -eq $channel) { throw 'rust-toolchain.toml has no channel' }
+          $toolchain = $channel.Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain `
             --component clippy `
             --target '${{ matrix.target }}'
           rustup show active-toolchain

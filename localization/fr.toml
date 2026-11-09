@@ -1,4 +1,5 @@
 [text]
+EndApplicationsWarning = "La fin des tâches terminera les processus de toutes les applications sélectionnées, y compris leurs autres fenêtres. Les données non enregistrées seront perdues. Continuer ?"
 AppTitle = "Gestionnaire des tâches Windows NT"
 RunTitle = "Exécuter"
 RunPrompt = "Tapez le nom d’un programme, dossier, document ou d’une ressource Internet, et Windows l’ouvrira pour vous."
