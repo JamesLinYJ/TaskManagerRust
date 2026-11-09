@@ -1,4 +1,5 @@
 [text]
+EndApplicationsWarning = "Finalizar las tareas terminará los procesos de todas las aplicaciones seleccionadas, incluidas sus otras ventanas. Se perderán los datos sin guardar. ¿Continuar?"
 AppTitle = "Administrador de tareas de Windows NT"
 RunTitle = "Ejecutar"
 RunPrompt = "Escriba el nombre de un programa, carpeta, documento o recurso de Internet, y Windows lo abrirá por usted."

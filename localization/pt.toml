@@ -1,4 +1,5 @@
 [text]
+EndApplicationsWarning = "Terminar as tarefas encerrará os processos de todas as aplicações selecionadas, incluindo as outras janelas desses processos. Os dados não guardados serão perdidos. Continuar?"
 AppTitle = "Gerenciador de Tarefas do Windows NT"
 RunTitle = "Executar"
 RunPrompt = "Digite o nome de um programa, pasta, documento ou recurso da Internet, e o Windows o abrirá para você."

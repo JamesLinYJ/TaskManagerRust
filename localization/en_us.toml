@@ -1,4 +1,5 @@
 [text]
+EndApplicationsWarning = "Ending tasks will terminate the processes of all selected applications, including their other windows. Unsaved data will be lost. Continue?"
 AppTitle = "Windows NT Task Manager"
 RunTitle = "Run"
 RunPrompt = "Type the name of a program, folder, document, or Internet resource, and Windows will open it for you."

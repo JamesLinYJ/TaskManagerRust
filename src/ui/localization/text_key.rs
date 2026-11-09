@@ -30,6 +30,7 @@ pub enum TextKey {
     WarningTitle,
     PriorityChangeWarning,
     KillProcessWarning,
+    EndApplicationsWarning,
     DebugProcessWarning,
     InvalidOptionTitle,
     NoAffinityMaskMessage,

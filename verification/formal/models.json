@@ -1,0 +1,186 @@
+{
+  "worker": {
+    "module": "Worker",
+    "title": "后台任务：关闭通知，再销毁窗口",
+    "bounds": "一个页面、一个后台任务、一次关闭；通知检查与 PostMessage 同处互斥锁。只验证已封闭通知之后不会调用 PostMessage，不验证已排队消息的 HWND 复用。",
+    "expected_tlc_exit": 0,
+    "skill": ".agents/skills/taskmgr-verify-worker",
+    "sync_commit": "7003888753316de6662996112f8e3100ee470208",
+    "coverage": [
+      {
+        "path": "src/infrastructure/worker.rs",
+        "symbols": "WorkerStopSignal::close_notifications / notify；BackgroundWorker::drop",
+        "sha256": "8a4b46553585b0207d079577940874d760e7a40fb25473969eef74c9cc30da85"
+      },
+      {
+        "path": "src/app/page_host.rs",
+        "symbols": "DialogPage::destroy 显式销毁路径",
+        "sha256": "a518134e5c8fb5a031b98e7be3c8e248022ce63e966a8d6e5109c07d3263faf4"
+      }
+    ],
+    "property": "关闭通知入口后，不再向已销毁窗口发送新的完成通知。",
+    "sync_state": "7003888 + working-tree module migration and application fix (2026-11-09)"
+  },
+  "services": {
+    "module": "Services",
+    "title": "服务重启：只有完成停止后才允许启动",
+    "bounds": "一个服务、一次重启、最多两个未停止观察。ticks 是有限观察预算，不是 30 秒时钟证明；SCM 调用可能阻塞、开始/关闭的跨线程竞争不在成功判定性质内。",
+    "expected_tlc_exit": 0,
+    "skill": ".agents/skills/taskmgr-verify-services",
+    "sync_commit": "7003888753316de6662996112f8e3100ee470208",
+    "coverage": [
+      {
+        "path": "src/pages/services/model.rs",
+        "symbols": "restart_after_stop / stop_has_completed / classify_control_result",
+        "sha256": "eb87388571264d869c2eecf78b0c7ebdc30f72bce04c9dd52b80c41363322eea"
+      },
+      {
+        "path": "src/pages/services/sampler.rs",
+        "symbols": "restart_open_service / poll_service_stop",
+        "sha256": "ac7b45431a0d84ec0a9c977b8da64b3375e082a3fc13bd482462447078d55a2c"
+      },
+      {
+        "path": "src/pages/services.rs",
+        "symbols": "start_worker",
+        "sha256": "425232397e5cddb40f675ee1e628c732de8ea37239574af675162cc2fc1b0c5a"
+      }
+    ],
+    "property": "重启成功必须经过确认停止和发起启动两个阶段。",
+    "sync_state": "7003888 + working-tree module migration and application fix (2026-11-09)"
+  },
+  "startup": {
+    "module": "Startup",
+    "title": "启动项修改后退出：处理已接受的修改再结束进程",
+    "bounds": "最多两次已接受修改，FIFO；修改失败也算已处理并留下失败结果。假设 collector 不 panic、线程可启动、系统 API 最终返回；不承诺每个写入成功或强制关机时持久化。",
+    "expected_tlc_exit": 0,
+    "skill": ".agents/skills/taskmgr-verify-startup",
+    "sync_commit": "7003888753316de6662996112f8e3100ee470208",
+    "coverage": [
+      {
+        "path": "src/infrastructure/worker.rs",
+        "symbols": "defer_drain_until_exit / into_exit_drain / drain_before_process_exit",
+        "sha256": "8a4b46553585b0207d079577940874d760e7a40fb25473969eef74c9cc30da85"
+      },
+      {
+        "path": "src/main.rs",
+        "symbols": "main 中 UI 返回到进程退出的顺序",
+        "sha256": "edf4e251f3592768b781f9d39d56480cf3c64efdeb232832e91831e31648adf4"
+      },
+      {
+        "path": "src/pages/startup.rs",
+        "symbols": "destroy / submit",
+        "sha256": "75a4a855cec6eedd194b08419807eb196ef8919494c1c7dd41843499f6a69114"
+      },
+      {
+        "path": "src/pages/startup/model.rs",
+        "symbols": "merge_startup_requests",
+        "sha256": "2351cf0110082405e63f0c413f9bc4415d21ade0c5454b34556f2bc6d974dfbe"
+      },
+      {
+        "path": "src/pages/startup/sampler.rs",
+        "symbols": "perform 的顺序处理",
+        "sha256": "5a4d42c9c0849fb7043f167514a198f932820aab9b6aa66b7f9d4923a9c8ccba"
+      }
+    ],
+    "property": "正常退出前，按顺序处理每一个已经接受的启动项修改。",
+    "sync_state": "7003888 + working-tree module migration and application fix (2026-11-09)"
+  },
+  "sessions": {
+    "module": "Sessions",
+    "title": "用户会话：消息逐次保留，注销和断开去重",
+    "bounds": "同一会话两条独立确认的消息及一次重复破坏性命令；核对身份/执行/报告被抽象为命令终结，性质只验证消息保留，不证明 WTS 身份核对与调用之间的原子性。",
+    "expected_tlc_exit": 0,
+    "skill": ".agents/skills/taskmgr-verify-sessions",
+    "sync_commit": "7003888753316de6662996112f8e3100ee470208",
+    "coverage": [
+      {
+        "path": "src/pages/users.rs",
+        "symbols": "merge_user_requests / session_action_already_queued / queue_session_action；execute_session_command 的终结边界",
+        "sha256": "9a8676fa26e8e8ff5ca7d56854c7962b6512ddaf2a0dabf976176eb4e148e0ed"
+      }
+    ],
+    "property": "每次确认发送的消息都保留，只有重复注销或断开可以合并。",
+    "sync_state": "7003888 + working-tree module migration and application fix (2026-11-09)"
+  },
+  "processes": {
+    "module": "Processes",
+    "title": "结束进程：按创建时间核对，再使用同一已打开句柄",
+    "bounds": "一个 PID、两个创建时间、一个进程句柄、一次操作；依赖 Windows 句柄固定进程对象的语义。适用于 handle-based 操作，不证明进程树全体原子性、亲和性位宽运算或线程快照完整性。",
+    "expected_tlc_exit": 0,
+    "skill": ".agents/skills/taskmgr-verify-processes",
+    "sync_commit": "7003888753316de6662996112f8e3100ee470208",
+    "coverage": [
+      {
+        "path": "src/system/process_identity.rs",
+        "symbols": "open_process_for_identity",
+        "sha256": "bc9ada6295a9f44bd0ec3b41caa2e6968823acf69d8e77aeedfe9f0c61519bba"
+      },
+      {
+        "path": "src/pages/processes/action_worker.rs",
+        "symbols": "open_action_process / execute_end / execute_set_priority",
+        "sha256": "62b8e4ef94352d7da69774c847f251f9cbe81ebe7e8cfd8c5aafebb9c984235d"
+      },
+      {
+        "path": "src/pages/processes/actions.rs",
+        "symbols": "apply_confirmed_affinity 的已验证句柄边界",
+        "sha256": "079527e7e1e51c06e202b77f9817b09a4a5cad2239f9c679a4a0c9a0ebdfc985"
+      }
+    ],
+    "property": "只有创建时间与保存身份匹配的进程句柄才会交给操作。",
+    "sync_state": "7003888 + working-tree module migration and application fix (2026-11-09)"
+  },
+  "applications": {
+    "module": "Applications",
+    "title": "结束应用：确认后用同一已验证进程句柄",
+    "bounds": "一个保存进程身份、一个 PID 的两个创建时间、一个窗口的两个代际、一次确认与一个持有句柄。窗口复用动作保留，但不参与选取终止目标。依赖 Windows 进程句柄固定对象；多目标聚合和具体错误码由源码重放与测试补充。",
+    "expected_tlc_exit": 0,
+    "sync_commit": "7003888753316de6662996112f8e3100ee470208",
+    "coverage": [
+      {
+        "path": "src/pages/applications.rs",
+        "symbols": "confirmed_end_task_request / request_end_task / run_end_tasks / run_end_task_queue / end_task_processes / terminate_task_process",
+        "sha256": "6be73007933a934a99936ff494962aef85f340457b54652a6f1c227bc6894f06"
+      },
+      {
+        "path": "src/system/process_identity.rs",
+        "symbols": "open_process_for_identity",
+        "sha256": "bc9ada6295a9f44bd0ec3b41caa2e6968823acf69d8e77aeedfe9f0c61519bba"
+      }
+    ],
+    "property": "只有明确确认后，才能终止与保存身份匹配的进程对象；窗口变化不得改变目标。",
+    "sync_state": "7003888 + working-tree module migration and unified confirmed process termination (2026-11-09)",
+    "model_dir": "verification/formal/applications"
+  },
+  "sampling": {
+    "module": "Sampling",
+    "title": "性能采样：缺失或无效数据不得画成真实零值",
+    "bounds": "一次发布决策、四种来源、一个既有历史点。CPU valid 标志与原生计数器计算视为输入；磁盘仅抽象零间隔分支；不证明 Win32 采样数值准确或所有溢出算术。",
+    "expected_tlc_exit": 0,
+    "skill": ".agents/skills/taskmgr-verify-sampling",
+    "sync_commit": "7003888753316de6662996112f8e3100ee470208",
+    "coverage": [
+      {
+        "path": "src/pages/gpu.rs",
+        "symbols": "record_memory_history / memory_percentage",
+        "sha256": "a0230f76729be09bae65518670aca31752814843253fbfa00de9315dad68c11c"
+      },
+      {
+        "path": "src/pages/performance.rs",
+        "symbols": "apply_system_sample 的内存容量与历史门控",
+        "sha256": "832c915d6c6e01a87b31ee08414634971fcddeeca8fa20e3c8e1ee13b09657c9"
+      },
+      {
+        "path": "src/pages/cpu.rs",
+        "symbols": "apply_system_sample 对 invalid delta 的历史与 stale 决策",
+        "sha256": "a361dce6334acf5f123575ac7bebf2d3c20c03aeca21d44511b64211dc5544d3"
+      },
+      {
+        "path": "src/system/disk.rs",
+        "symbols": "零间隔成功读取仅推进基线，不发布速率",
+        "sha256": "0f1fe204a30b8496cad8ce0518c0e9474f1fccb9e2c46779f38f17a98f340f53"
+      }
+    ],
+    "property": "缺失容量、无效间隔或失败读数不能成为新增的真实零值历史点。",
+    "sync_state": "7003888 + working-tree module migration and application fix (2026-11-09)"
+  }
+}

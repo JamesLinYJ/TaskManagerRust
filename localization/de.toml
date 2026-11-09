@@ -1,4 +1,5 @@
 [text]
+EndApplicationsWarning = "Das Beenden der Aufgaben beendet die Prozesse aller ausgewählten Anwendungen einschließlich ihrer anderen Fenster. Nicht gespeicherte Daten gehen verloren. Fortfahren?"
 AppTitle = "Windows NT Task-Manager"
 RunTitle = "Ausführen"
 RunPrompt = "Geben Sie den Namen eines Programms, Ordners, Dokuments oder einer Internetressource ein, und Windows wird es für Sie öffnen."

@@ -53,6 +53,37 @@ Toolchain: Rust 1.98.1 stable; MSVC 14.51.36231; Windows SDK 10.0.26100.0. Exist
 slice loops were changed to `as_chunks` to satisfy the repository's current stable Clippy gate;
 no dependencies or registry configuration schema were changed.
 
+## Targeted module-layout and application-action validation — 2026-11-09
+
+Windows 11 Insider **29698.1000** in the Parallels ARM64 VM; Rust 1.99.0.
+Source: `7003888753316de6662996112f8e3100ee470208` plus the working-tree module migration
+and application-action changes. All 16 `mod.rs` files were moved to same-named `.rs` files.
+The VM source copy was checked against the host Rust source files with SHA-256 before testing.
+
+| Target | Automated checks | Tests |
+| --- | --- | --- |
+| ARM64 | fmt, all-target check, strict Clippy, all-target tests, release build passed | 442 passed, 5 ignored |
+| x86-64 under emulation | Same checks passed | 442 passed, 5 ignored |
+| x86 under emulation | Same checks passed | 441 passed, 5 ignored |
+
+The final implementation unifies every Applications End Task entry point behind explicit
+confirmation and termination through a retained process handle verified by creation time.
+There is no normal-close or Ctrl-only variant, and no SC_CLOSE sink in this action path.
+Cancelling submits nothing; targets are captured before the dialog; same-process windows are
+deduplicated by complete identity within each request; failures preserve later requests.
+
+Controlled native tests reject unknown/mismatched process identities and terminate only an
+owned test child through the shared default action, even without a usable HWND. Confirmation,
+selection changes, queue order, deduplication and partial failures have regression coverage.
+The ignored count includes the child fixture launched explicitly by its parent regression test.
+
+The previous HWND-close counterexample is retained as historical evidence. The current model
+still permits window reuse, but termination uses only the saved process identity and the same
+verified handle. Model and actual-function replay now pass; removing the creation-time guard
+makes both fail. These are automated VM results, not a complete manual UI checklist,
+stable-Windows coverage or physical-device acceptance. See
+[formal verification](../verification/README.md) for bounds and reproduction commands.
+
 ## GPU and driver coverage
 
 | Date | Windows build / arch | Vendor and adapter | Driver | GPU Engine | Dedicated usage | Shared usage | Metadata / temperature | UI | Status |

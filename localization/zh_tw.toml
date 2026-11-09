@@ -1,4 +1,5 @@
 [text]
+EndApplicationsWarning = "結束工作將終止所有選取應用程式所屬的處理程序，包括這些處理程序的其他視窗。未儲存的資料將遺失。是否繼續？"
 AppTitle = "Windows NT 工作管理員"
 RunTitle = "執行"
 RunPrompt = "Windows 將根據你所輸入的名稱，為你開啟相應的程式、資料夾、文件或 Internet 資源。"

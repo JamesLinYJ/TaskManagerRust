@@ -1,4 +1,5 @@
 [text]
+EndApplicationsWarning = "结束任务将终止所有选中应用所属的进程，包括这些进程的其他窗口。未保存的数据将丢失。是否继续？"
 AppTitle = "Windows NT 任务管理器"
 RunTitle = "运行"
 RunPrompt = "Windows 将根据你所输入的名称，为你打开相应的程序、文件夹、文档或 Internet 资源。"
