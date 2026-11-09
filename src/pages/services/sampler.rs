@@ -9,11 +9,15 @@
 //   作者:       OpenAI Codex
 // --------------------------------------------------------------------------
 
-//! Service Control Manager queries and start, stop, pause, and continue calls.
+//! Service Control Manager queries and start, stop, restart, pause, and continue calls.
 //!
 //! The page worker owns every SCM handle. Enumeration asks only for connect and enumerate rights.
 //! Each service is opened with query rights, and a control opens that one service with only the
-//! right the action needs plus status query so the result can be checked.
+//! rights that action needs plus status query so the result can be checked. Restart opens with
+//! stop and start on that same handle. It sends stop, then starts only after stop has completed.
+//! That completion wait is a single delay bounded by the wait hint on the status query Start and
+//! Stop already use, and it is capped so a huge hint cannot run without limit. It does not retry.
+//! Pending and unknown states are not completion.
 
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
@@ -33,7 +37,7 @@ use windows_sys::Win32::System::Services::{
     StartServiceW,
 };
 use windows_sys::Win32::System::Threading::{
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, Sleep,
 };
 
 use crate::infrastructure::native::to_wide_null;
@@ -43,12 +47,14 @@ use crate::system::process_identity::{
 
 use super::model::{
     OwningProcess, ServiceActionFailure, ServiceControlAction, ServiceRequest, ServiceRunState,
-    ServiceStartupType, classify_control_result, file_name_from_win32_path,
-    service_has_valid_process_id, startup_from_scm, state_from_scm,
+    ServiceStartupType, classify_control_result, file_name_from_win32_path, restart_after_stop,
+    service_has_valid_process_id, startup_from_scm, state_from_scm, stop_has_completed,
 };
 
 const ENUM_ATTEMPT_LIMIT: usize = 10_000;
 const CONFIG_GROW_LIMIT: usize = 8;
+/// Cap for the one stop-completion wait. The service's `dwWaitHint` is the requested bound.
+const SERVICE_STOP_WAIT_CAP_MS: u32 = 30_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ServiceRecord {
@@ -491,39 +497,100 @@ fn control_service_and_read_state(
     let access = match action {
         ServiceControlAction::Start => SERVICE_START | SERVICE_QUERY_STATUS,
         ServiceControlAction::Stop => SERVICE_STOP | SERVICE_QUERY_STATUS,
+        ServiceControlAction::Restart => SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS,
         ServiceControlAction::Pause | ServiceControlAction::Continue => {
             SERVICE_PAUSE_CONTINUE | SERVICE_QUERY_STATUS
         }
     };
     let service = open_service(manager.as_raw(), service_name, access)?;
-    let control = match action {
+    match action {
         ServiceControlAction::Start => {
-            // SAFETY: the service is open for SERVICE_START. No start arguments are supplied.
-            let success = unsafe { StartServiceW(service.as_raw(), 0, std::ptr::null()) };
-            if success == 0 {
-                return Err(last_error());
-            }
-            None
+            start_open_service(service.as_raw())?;
+            query_service_state(service.as_raw())
         }
-        ServiceControlAction::Stop => Some(SERVICE_CONTROL_STOP),
-        ServiceControlAction::Pause => Some(SERVICE_CONTROL_PAUSE),
-        ServiceControlAction::Continue => Some(SERVICE_CONTROL_CONTINUE),
-    };
-    if let Some(control) = control {
-        let mut status = unsafe { zeroed::<SERVICE_STATUS>() };
-        // SAFETY: the service is open for this one control right. `status` is a writable output
-        // of the control call and is not used as proof of the final state.
-        let success = unsafe { ControlService(service.as_raw(), control, &mut status) };
-        if success == 0 {
-            return Err(last_error());
+        ServiceControlAction::Stop => {
+            send_service_control(service.as_raw(), SERVICE_CONTROL_STOP)?;
+            query_service_state(service.as_raw())
         }
+        ServiceControlAction::Pause => {
+            send_service_control(service.as_raw(), SERVICE_CONTROL_PAUSE)?;
+            query_service_state(service.as_raw())
+        }
+        ServiceControlAction::Continue => {
+            send_service_control(service.as_raw(), SERVICE_CONTROL_CONTINUE)?;
+            query_service_state(service.as_raw())
+        }
+        ServiceControlAction::Restart => restart_open_service(service.as_raw()),
     }
-    query_service_state(service.as_raw())
+}
+
+fn restart_open_service(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+) -> Result<ServiceRunState, u32> {
+    // The stop control returns when the handler accepts it. Completion is then bounded by the
+    // wait hint on that status. Only SERVICE_STOPPED continues into start. A missing service,
+    // a rejected control, or a status query failure stays that error and does not start.
+    let stop = send_service_control(service, SERVICE_CONTROL_STOP)
+        .and_then(|_| wait_until_service_stopped(service));
+    restart_after_stop(stop, || {
+        start_open_service(service)?;
+        query_service_state(service)
+    })
+}
+
+fn wait_until_service_stopped(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+) -> Result<ServiceRunState, u32> {
+    let status = query_service_status(service)?;
+    let state = state_from_scm(status.dwCurrentState);
+    if stop_has_completed(state) || !matches!(state, ServiceRunState::StopPending) {
+        return Ok(state);
+    }
+    let bound_ms = status.dwWaitHint.min(SERVICE_STOP_WAIT_CAP_MS);
+    if bound_ms > 0 {
+        // SAFETY: Sleep delays only this SCM worker. One wait, bounded by the status hint and
+        // SERVICE_STOP_WAIT_CAP_MS. This is not a retry loop.
+        unsafe { Sleep(bound_ms) };
+    }
+    query_service_state(service)
+}
+
+fn start_open_service(service: windows_sys::Win32::System::Services::SC_HANDLE) -> Result<(), u32> {
+    // SAFETY: the service is open for SERVICE_START. No start arguments are supplied.
+    let success = unsafe { StartServiceW(service, 0, std::ptr::null()) };
+    if success == 0 {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn send_service_control(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+    control: u32,
+) -> Result<(), u32> {
+    let mut status = unsafe { zeroed::<SERVICE_STATUS>() };
+    // SAFETY: the service is open for this one control right. `status` is a writable output of
+    // the control call and is not used as proof of the final state.
+    let success = unsafe { ControlService(service, control, &mut status) };
+    if success == 0 {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn query_service_state(
     service: windows_sys::Win32::System::Services::SC_HANDLE,
 ) -> Result<ServiceRunState, u32> {
+    Ok(state_from_scm(
+        query_service_status(service)?.dwCurrentState,
+    ))
+}
+
+fn query_service_status(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+) -> Result<SERVICE_STATUS_PROCESS, u32> {
     let mut status = unsafe { zeroed::<SERVICE_STATUS_PROCESS>() };
     let mut bytes_needed = 0u32;
     // SAFETY: the service is open for SERVICE_QUERY_STATUS. The status object is writable and
@@ -540,7 +607,7 @@ fn query_service_state(
     if success == 0 {
         return Err(last_error());
     }
-    Ok(state_from_scm(status.dwCurrentState))
+    Ok(status)
 }
 
 fn open_service(

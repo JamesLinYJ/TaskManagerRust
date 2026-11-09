@@ -324,6 +324,7 @@ fn build_service_command_menu() -> MenuResult<PopupMenu> {
     let mut menu = PopupMenu::new()?;
     append_item(&mut menu, IDM_SERVICE_START, TextKey::ServiceStart)?;
     append_item(&mut menu, IDM_SERVICE_STOP, TextKey::ServiceStop)?;
+    append_item(&mut menu, IDM_SERVICE_RESTART, TextKey::ServiceRestart)?;
     append_item(&mut menu, IDM_SERVICE_PAUSE, TextKey::ServicePause)?;
     append_item(&mut menu, IDM_SERVICE_CONTINUE, TextKey::ServiceContinue)?;
     append_separator(&mut menu)?;
