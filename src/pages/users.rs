@@ -155,6 +155,9 @@ pub struct UserPageState {
     sort_column: usize,
     sort_ascending: bool,
     worker: Option<SingleFlightWorker<UserWorkerRequest, UserWorkerCompletion>>,
+    // Session commands accepted by the worker and not yet completed. A repeat of one of
+    // these is not submitted again while that worker is still busy.
+    outstanding_session_actions: Vec<UserSessionCommand>,
     last_refresh_error: Option<u32>,
     last_row_errors: Vec<UserSessionRowError>,
 }
@@ -221,6 +224,7 @@ impl UserPageState {
 
     fn stop_worker_thread(&mut self) {
         self.worker = None;
+        self.outstanding_session_actions.clear();
     }
 
     pub fn size_page(&self) {
@@ -442,6 +446,7 @@ impl UserPageState {
             });
         }
         if let Some(error) = drained.error {
+            self.outstanding_session_actions.clear();
             self.set_refresh_error(error);
         }
     }
@@ -450,6 +455,10 @@ impl UserPageState {
         match completion {
             UserWorkerCompletion::Snapshot(result) => self.apply_user_worker_result(result),
             UserWorkerCompletion::Actions(reports) => {
+                finish_outstanding_session_actions(
+                    &mut self.outstanding_session_actions,
+                    reports.len(),
+                );
                 let mut refresh = false;
                 for report in reports {
                     if let Some(error) = report.error {
@@ -956,7 +965,19 @@ impl UserPageState {
 
     fn submit_session_command(&mut self, command: UserSessionCommand) {
         let kind = command.kind;
+        let worker_busy = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_in_flight() || worker.has_pending());
+        if !queue_session_action(
+            &mut self.outstanding_session_actions,
+            command.clone(),
+            worker_busy,
+        ) {
+            return;
+        }
         if let Err(error) = self.submit_request(UserWorkerRequest::Actions(vec![command])) {
+            self.outstanding_session_actions.pop();
             self.show_action_error(kind, error);
         }
     }
@@ -1029,15 +1050,52 @@ enum UserWorkerCompletion {
 }
 
 /// Keeps a confirmed session action ahead of a coalesced refresh, and queues a later action
-/// behind one that has not started.
+/// behind one that has not started. A command whose kind and session identities are already
+/// queued is not appended again. A coalesced refresh still does not erase queued actions.
 fn merge_user_requests(pending: &mut UserWorkerRequest, incoming: UserWorkerRequest) {
     match (&mut *pending, incoming) {
         (UserWorkerRequest::Actions(queued), UserWorkerRequest::Actions(more)) => {
-            queued.extend(more);
+            for command in more {
+                if session_action_already_queued(queued, &command) {
+                    continue;
+                }
+                queued.push(command);
+            }
         }
         (UserWorkerRequest::Actions(_), UserWorkerRequest::Refresh) => {}
         (pending, incoming) => *pending = incoming,
     }
+}
+
+fn session_action_already_queued(
+    queued: &[UserSessionCommand],
+    command: &UserSessionCommand,
+) -> bool {
+    queued
+        .iter()
+        .any(|existing| existing.kind == command.kind && existing.sessions == command.sessions)
+}
+
+/// Records a session command unless the worker is busy with the same kind and identities.
+/// Returns whether the caller should submit it. An idle worker drops stale outstanding
+/// commands so a later action for that session is not blocked.
+fn queue_session_action(
+    outstanding: &mut Vec<UserSessionCommand>,
+    command: UserSessionCommand,
+    worker_busy: bool,
+) -> bool {
+    if !worker_busy {
+        outstanding.clear();
+    } else if session_action_already_queued(outstanding, &command) {
+        return false;
+    }
+    outstanding.push(command);
+    true
+}
+
+fn finish_outstanding_session_actions(outstanding: &mut Vec<UserSessionCommand>, finished: usize) {
+    let finished = finished.min(outstanding.len());
+    outstanding.drain(..finished).for_each(drop);
 }
 
 fn perform_user_request(request: UserWorkerRequest) -> UserWorkerCompletion {
@@ -1770,6 +1828,67 @@ mod tests {
         let mut pending = action.clone();
         merge_user_requests(&mut pending, UserWorkerRequest::Refresh);
         assert_eq!(pending, action);
+    }
+
+    #[test]
+    fn identical_session_actions_collapse_and_different_sessions_remain() {
+        let first = session_command(UserSessionKind::Logoff);
+        let mut other_session = session_command(UserSessionKind::Logoff);
+        other_session.sessions = vec![identity(2, 100)];
+        let mut other_logon = session_command(UserSessionKind::Logoff);
+        other_logon.sessions = vec![identity(1, 200)];
+        let mut pending = UserWorkerRequest::Actions(vec![first.clone()]);
+
+        merge_user_requests(
+            &mut pending,
+            UserWorkerRequest::Actions(vec![first.clone(), other_session.clone()]),
+        );
+        assert_eq!(
+            pending,
+            UserWorkerRequest::Actions(vec![first.clone(), other_session.clone()])
+        );
+
+        merge_user_requests(
+            &mut pending,
+            UserWorkerRequest::Actions(vec![other_logon.clone()]),
+        );
+        assert_eq!(
+            pending,
+            UserWorkerRequest::Actions(vec![first, other_session, other_logon])
+        );
+    }
+
+    #[test]
+    fn repeated_session_action_is_not_submitted_while_the_worker_is_busy() {
+        let first = session_command(UserSessionKind::Disconnect);
+        let mut other_session = session_command(UserSessionKind::Disconnect);
+        other_session.sessions = vec![identity(2, 100)];
+        let mut other_logon = session_command(UserSessionKind::Disconnect);
+        other_logon.sessions = vec![identity(1, 200)];
+        let mut outstanding = Vec::new();
+
+        assert!(queue_session_action(&mut outstanding, first.clone(), false));
+        assert!(!queue_session_action(&mut outstanding, first.clone(), true));
+        assert!(queue_session_action(
+            &mut outstanding,
+            other_session.clone(),
+            true
+        ));
+        assert!(queue_session_action(
+            &mut outstanding,
+            other_logon.clone(),
+            true
+        ));
+        assert_eq!(
+            outstanding,
+            vec![first.clone(), other_session.clone(), other_logon.clone()]
+        );
+
+        finish_outstanding_session_actions(&mut outstanding, 1);
+        assert_eq!(outstanding, vec![other_session, other_logon]);
+
+        assert!(queue_session_action(&mut outstanding, first.clone(), false));
+        assert_eq!(outstanding, vec![first]);
     }
 
     #[test]
