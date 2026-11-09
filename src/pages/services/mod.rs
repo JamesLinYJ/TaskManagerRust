@@ -360,11 +360,11 @@ impl ServicePageState {
         if self.worker.is_some() {
             return Ok(());
         }
-        self.worker = Some(SingleFlightWorker::spawn(
+        self.worker = Some(SingleFlightWorker::spawn_cancellable_initialized(
             "taskmgr-rs-service-sampler",
             PWM_SERVICE_WORKER_COMPLETE,
             merge_service_requests,
-            perform,
+            |stop| move |request| perform(request, &stop),
         )?);
         Ok(())
     }

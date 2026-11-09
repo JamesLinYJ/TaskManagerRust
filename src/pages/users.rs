@@ -1050,8 +1050,8 @@ enum UserWorkerCompletion {
 }
 
 /// Keeps a confirmed session action ahead of a coalesced refresh, and queues a later action
-/// behind one that has not started. A command whose kind and session identities are already
-/// queued is not appended again. A coalesced refresh still does not erase queued actions.
+/// behind one that has not started. Duplicate disconnect/logoff commands are coalesced;
+/// every confirmed message is retained, including an intentional repeated message.
 fn merge_user_requests(pending: &mut UserWorkerRequest, incoming: UserWorkerRequest) {
     match (&mut *pending, incoming) {
         (UserWorkerRequest::Actions(queued), UserWorkerRequest::Actions(more)) => {
@@ -1071,9 +1071,10 @@ fn session_action_already_queued(
     queued: &[UserSessionCommand],
     command: &UserSessionCommand,
 ) -> bool {
-    queued
-        .iter()
-        .any(|existing| existing.kind == command.kind && existing.sessions == command.sessions)
+    command.kind != UserSessionKind::SendMessage
+        && queued
+            .iter()
+            .any(|existing| existing.kind == command.kind && existing.sessions == command.sessions)
 }
 
 /// Records a session command unless the worker is busy with the same kind and identities.
@@ -1897,6 +1898,34 @@ mod tests {
         let mut pending = UserWorkerRequest::Refresh;
         merge_user_requests(&mut pending, action.clone());
         assert_eq!(pending, action);
+    }
+
+    #[test]
+    fn every_confirmed_message_survives_busy_and_pending_queues() {
+        let mut first = session_command(UserSessionKind::SendMessage);
+        first.title = "First".into();
+        first.body = "One".into();
+        let mut second = first.clone();
+        second.title = "Second".into();
+        second.body = "Two".into();
+        let commands = vec![first.clone(), second, first];
+        let mut outstanding = Vec::new();
+        let mut pending = UserWorkerRequest::Refresh;
+        for command in &commands {
+            assert!(queue_session_action(
+                &mut outstanding,
+                command.clone(),
+                true
+            ));
+            merge_user_requests(
+                &mut pending,
+                UserWorkerRequest::Actions(vec![command.clone()]),
+            );
+        }
+        assert_eq!(outstanding, commands);
+        assert_eq!(pending, UserWorkerRequest::Actions(commands));
+        finish_outstanding_session_actions(&mut outstanding, 3);
+        assert!(outstanding.is_empty());
     }
 
     #[test]

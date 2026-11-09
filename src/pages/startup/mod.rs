@@ -162,7 +162,9 @@ impl StartupPageState {
     }
 
     pub fn destroy(&mut self) {
-        self.worker = None;
+        if let Some(worker) = self.worker.take() {
+            worker.defer_drain_until_exit();
+        }
         self.rows.clear();
     }
 
@@ -353,13 +355,12 @@ impl StartupPageState {
         if self.worker.is_some() {
             return Ok(());
         }
-        // Asynchronous retirement closes completion posts and does not join this worker
-        // on the UI thread, including while a queued toggle is still writing.
-        self.worker = Some(SingleFlightWorker::spawn_cancellable_initialized(
+        // Final teardown closes notifications and drains accepted writes after the UI loop.
+        self.worker = Some(SingleFlightWorker::spawn(
             "taskmgr-rs-startup-sampler",
             PWM_STARTUP_WORKER_COMPLETE,
             merge_startup_requests,
-            |_stop| perform,
+            perform,
         )?);
         Ok(())
     }

@@ -16,6 +16,7 @@
 //! enable Go to Process.
 
 use crate::system::process_identity::ProcIdentity;
+use windows_sys::Win32::Foundation::ERROR_SERVICE_REQUEST_TIMEOUT;
 
 pub(crate) const SERVICE_STOPPED: u32 = 1;
 pub(crate) const SERVICE_START_PENDING: u32 = 2;
@@ -223,14 +224,15 @@ pub(crate) fn stop_has_completed(state: ServiceRunState) -> bool {
 }
 
 /// Starts a restart only after stop completed. A stop error or any other observed state is
-/// returned unchanged and `start` is not called.
+/// rejected and `start` is not called. An old Running state is never restart success.
 pub(crate) fn restart_after_stop(
     stop: Result<ServiceRunState, u32>,
     start: impl FnOnce() -> Result<ServiceRunState, u32>,
 ) -> Result<ServiceRunState, u32> {
     match stop {
         Ok(state) if stop_has_completed(state) => start(),
-        other => other,
+        Ok(_) => Err(ERROR_SERVICE_REQUEST_TIMEOUT),
+        Err(error) => Err(error),
     }
 }
 
@@ -538,7 +540,8 @@ mod tests {
                 starts += 1;
                 Ok(ServiceRunState::Running)
             });
-            assert_eq!(observed, Ok(state));
+            assert_eq!(observed, Err(ERROR_SERVICE_REQUEST_TIMEOUT));
+            assert!(classify_control_result(ServiceControlAction::Restart, observed).is_err());
         }
         assert_eq!(starts, 0);
 

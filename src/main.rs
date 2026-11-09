@@ -29,6 +29,7 @@ fn main() {
         std::process::exit(exit_code);
     }
     let exit_code = app::run();
+    infrastructure::worker::drain_before_process_exit();
     infrastructure::diagnostics::shutdown();
     std::process::exit(exit_code);
 }

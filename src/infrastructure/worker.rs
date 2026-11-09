@@ -457,6 +457,18 @@ pub(crate) struct WorkerDrain<Completion> {
 type WorkerSpawner<Request, Completion> =
     Box<dyn Fn() -> Result<BackgroundWorker<Request, Completion>, u32> + Send + Sync>;
 
+type ExitDrain = Box<dyn FnOnce() + Send>;
+static EXIT_DRAINS: Mutex<Vec<ExitDrain>> = Mutex::new(Vec::new());
+
+/// Called after the UI loop and all windows have gone, but before diagnostics/process exit.
+/// Accepted writes own their requests here and must finish before process termination.
+pub(crate) fn drain_before_process_exit() {
+    let drains = std::mem::take(&mut *EXIT_DRAINS.lock().unwrap_or_else(|e| e.into_inner()));
+    for drain in drains {
+        drain();
+    }
+}
+
 pub(crate) struct SingleFlightWorker<Request, Completion> {
     worker: Option<BackgroundWorker<Request, Completion>>,
     restart: WorkerSpawner<Request, Completion>,
@@ -756,6 +768,65 @@ where
         self.pending.is_some()
     }
 
+    /// Only for final page teardown of a writer: close its notification gate immediately,
+    /// retain the current request and coalesced commands, then finish after UI teardown.
+    /// Unlike cancellable sampling, accepted mutations must not be discarded on exit.
+    pub(crate) fn defer_drain_until_exit(self) {
+        let drain = self.into_exit_drain();
+        EXIT_DRAINS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(drain);
+    }
+
+    fn into_exit_drain(mut self) -> ExitDrain {
+        if let Some(worker) = self.worker.as_mut() {
+            worker.stop.close_notifications(false);
+            worker.retire_async = false;
+        }
+        Box::new(move || {
+            loop {
+                if self.in_flight {
+                    let event = self
+                        .worker
+                        .as_ref()
+                        .and_then(|worker| worker.completion_receiver.as_ref())
+                        .and_then(|receiver| receiver.recv().ok());
+                    self.in_flight = false;
+                    match event {
+                        Some(WorkerEvent::Completed(_)) => {}
+                        Some(WorkerEvent::CollectorPanicked { .. }) => {
+                            record_win32_error("exit drain collector panic", ERROR_GEN_FAILURE);
+                        }
+                        None => {
+                            record_win32_error("exit drain disconnected", ERROR_BROKEN_PIPE);
+                            self.worker = None;
+                        }
+                    }
+                }
+                let Some(request) = self.pending.take() else {
+                    break;
+                };
+                let operation_id = self
+                    .pending_operation_id
+                    .take()
+                    .unwrap_or_else(diagnostics::next_operation_id);
+                // No HWND survives into this phase, including when a worker must restart.
+                if let Err(error) = self.submit_request(request, std::ptr::null_mut(), operation_id)
+                {
+                    record_win32_error("exit drain pending submission", error.code);
+                    break;
+                }
+                self.in_flight = true;
+            }
+            // A restarted worker also joins here, before diagnostics and the process exit.
+            if let Some(worker) = self.worker.as_mut() {
+                worker.retire_async = false;
+                worker.stop.close_notifications(false);
+            }
+        })
+    }
+
     #[cfg(test)]
     fn disconnect(&self) {
         self.worker
@@ -790,6 +861,49 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn exit_drain_preserves_unstarted_and_pending_writes_without_waiting_on_ui() {
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let (written_tx, written_rx) = bounded(3);
+        let mut worker = SingleFlightWorker::spawn_cancellable_initialized(
+            "taskmgr-rs-exit-drain-test",
+            0,
+            |pending: &mut Vec<u32>, incoming| pending.extend(incoming),
+            move |stop| {
+                entered_tx.send(stop).unwrap();
+                release_rx.recv().unwrap();
+                let written_tx = written_tx.clone();
+                move |commands: Vec<u32>| {
+                    for value in commands {
+                        written_tx.send(value).unwrap();
+                    }
+                }
+            },
+        )
+        .unwrap();
+        worker.request(vec![1], null_mut()).unwrap();
+        let stop = entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.request(vec![2], null_mut()).unwrap();
+        worker.request(vec![3], null_mut()).unwrap();
+        let started = Instant::now();
+        worker.defer_drain_until_exit();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!stop.is_cancelled());
+        assert!(*stop.notifications_closed.lock().unwrap());
+
+        let (finished_tx, finished_rx) = bounded(1);
+        let drain = thread::spawn(move || {
+            drain_before_process_exit();
+            finished_tx.send(()).unwrap();
+        });
+        assert!(finished_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drain.join().unwrap();
+        assert_eq!(written_rx.try_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
 
     #[test]
     fn worker_delivers_completion_even_when_notification_window_is_gone() {
