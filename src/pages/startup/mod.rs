@@ -15,7 +15,10 @@ mod sampler;
 // 启动项页列出 Run 键和“启动”文件夹中的项目，并在后台 worker 上启用或禁用。
 // UI 线程只提交请求、维护列表选择和绘制。刷新保留来源加名称对应的选择、焦点和滚动位置。
 // 某个来源枚举失败时保留该来源上一轮的行，并把这些行和页面提示标成未刷新。
+// 启用和禁用按接受顺序进入同一 worker 队列。后到的刷新不会丢掉尚未执行的切换，
+// 已在等待的刷新也不会丢掉后到的切换。写入前用页面保存的身份再核对；对不上就跳过并报告原有失败。
 // 启用和禁用不删除原项；写入结果读回不一致、项目已消失或 API 失败时立即显示错误。
+// 页面销毁时不在 UI 线程上 join 这个 worker。
 
 use std::mem::zeroed;
 
@@ -159,7 +162,9 @@ impl StartupPageState {
     }
 
     pub fn destroy(&mut self) {
-        self.worker = None;
+        if let Some(worker) = self.worker.take() {
+            worker.defer_drain_until_exit();
+        }
         self.rows.clear();
     }
 
@@ -350,6 +355,7 @@ impl StartupPageState {
         if self.worker.is_some() {
             return Ok(());
         }
+        // Final teardown closes notifications and drains accepted writes after the UI loop.
         self.worker = Some(SingleFlightWorker::spawn(
             "taskmgr-rs-startup-sampler",
             PWM_STARTUP_WORKER_COMPLETE,
@@ -361,7 +367,7 @@ impl StartupPageState {
 
     fn refresh(&mut self) {
         self.drain_worker();
-        self.submit(StartupRequest::Refresh);
+        self.submit(StartupRequest::refresh());
     }
 
     fn request_toggle(&mut self, toggle: StartupToggle) {
@@ -378,14 +384,11 @@ impl StartupPageState {
             self.beep();
             return;
         }
-        self.submit(StartupRequest::SetEnabled { id, toggle });
+        self.submit(StartupRequest::toggle(id, toggle));
     }
 
     fn submit(&mut self, request: StartupRequest) {
-        let toggle = match &request {
-            StartupRequest::SetEnabled { toggle, .. } => Some(*toggle),
-            StartupRequest::Refresh => None,
-        };
+        let toggle = request.toggles.first().map(|command| command.toggle);
         let Some(worker) = self.worker.as_mut() else {
             self.report_submit_failure(StartupQueryFailure::Win32(ERROR_BROKEN_PIPE), toggle);
             return;
@@ -432,12 +435,17 @@ impl StartupPageState {
                 Ok(collection) => self.apply_collection(collection),
                 Err(failure) => self.apply_refresh_failure(failure),
             },
-            StartupWorkerCompletion::Action(report) => {
-                match report.outcome {
-                    Ok(state) => self.apply_toggled_state(&report.id, state),
-                    Err(failure) => self.show_action_failure(report.toggle, failure),
+            StartupWorkerCompletion::Actions(reports) => {
+                if reports.is_empty() {
+                    return;
                 }
-                self.submit(StartupRequest::Refresh);
+                for report in reports {
+                    match report.outcome {
+                        Ok(state) => self.apply_toggled_state(&report.id, state),
+                        Err(failure) => self.show_action_failure(report.toggle, failure),
+                    }
+                }
+                self.submit(StartupRequest::refresh());
             }
         }
     }

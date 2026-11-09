@@ -9,18 +9,23 @@
 //   作者:       OpenAI Codex
 // --------------------------------------------------------------------------
 
-//! Service Control Manager queries and start, stop, pause, and continue calls.
+//! Service Control Manager queries and start, stop, restart, pause, and continue calls.
 //!
 //! The page worker owns every SCM handle. Enumeration asks only for connect and enumerate rights.
 //! Each service is opened with query rights, and a control opens that one service with only the
-//! right the action needs plus status query so the result can be checked.
+//! rights that action needs plus status query so the result can be checked. Restart opens with
+//! stop and start on that same handle. It sends stop, then starts only after stop has completed.
+//! Stop completion follows SCM checkpoint progress with an overall deadline. Cancellation is
+//! checked between short polls, so page destruction never joins a sleeping SCM worker.
+//! Pending and unknown states are not completion.
 
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
-    GetLastError,
+    ERROR_CANCELLED, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
+    ERROR_MORE_DATA, ERROR_SERVICE_REQUEST_TIMEOUT, GetLastError,
 };
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW,
@@ -37,18 +42,21 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::infrastructure::native::to_wide_null;
+use crate::infrastructure::worker::WorkerStopSignal;
 use crate::system::process_identity::{
     ProcIdentity, open_process_for_identity, query_process_identity_for_pid,
 };
 
 use super::model::{
     OwningProcess, ServiceActionFailure, ServiceControlAction, ServiceRequest, ServiceRunState,
-    ServiceStartupType, classify_control_result, file_name_from_win32_path,
-    service_has_valid_process_id, startup_from_scm, state_from_scm,
+    ServiceStartupType, classify_control_result, file_name_from_win32_path, restart_after_stop,
+    service_has_valid_process_id, startup_from_scm, state_from_scm, stop_has_completed,
 };
 
 const ENUM_ATTEMPT_LIMIT: usize = 10_000;
 const CONFIG_GROW_LIMIT: usize = 8;
+/// Overall deadline, independent of a service repeatedly advancing its checkpoint.
+const SERVICE_STOP_WAIT_CAP_MS: u32 = 30_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ServiceRecord {
@@ -118,13 +126,13 @@ impl Drop for ScHandle {
     }
 }
 
-pub(super) fn perform(request: ServiceRequest) -> ServiceWorkerCompletion {
+pub(super) fn perform(request: ServiceRequest, stop: &WorkerStopSignal) -> ServiceWorkerCompletion {
     match request {
         ServiceRequest::Refresh => ServiceWorkerCompletion::Snapshot(collect_services()),
         ServiceRequest::Control {
             service_name,
             action,
-        } => ServiceWorkerCompletion::Action(control_service(&service_name, action)),
+        } => ServiceWorkerCompletion::Action(control_service(&service_name, action, stop)),
     }
 }
 
@@ -466,11 +474,18 @@ fn query_process_file_name(identity: ProcIdentity) -> Result<String, u32> {
     Ok(file_name_from_win32_path(&path).to_string())
 }
 
-fn control_service(service_name: &str, action: ServiceControlAction) -> ServiceActionReport {
+fn control_service(
+    service_name: &str,
+    action: ServiceControlAction,
+    stop: &WorkerStopSignal,
+) -> ServiceActionReport {
     let outcome = if service_name.is_empty() {
         Err(ServiceActionFailure::Api(ERROR_INVALID_PARAMETER))
     } else {
-        classify_control_result(action, control_service_and_read_state(service_name, action))
+        classify_control_result(
+            action,
+            control_service_and_read_state(service_name, action, stop),
+        )
     };
     ServiceActionReport {
         service_name: service_name.to_string(),
@@ -482,7 +497,11 @@ fn control_service(service_name: &str, action: ServiceControlAction) -> ServiceA
 fn control_service_and_read_state(
     service_name: &str,
     action: ServiceControlAction,
+    stop: &WorkerStopSignal,
 ) -> Result<ServiceRunState, u32> {
+    if stop.is_cancelled() {
+        return Err(ERROR_CANCELLED);
+    }
     // SAFETY: null names select the local SCM. Connect is the only manager right required to open
     // one service; the service handle itself carries the action right.
     let manager = ScHandle::new(unsafe {
@@ -491,39 +510,148 @@ fn control_service_and_read_state(
     let access = match action {
         ServiceControlAction::Start => SERVICE_START | SERVICE_QUERY_STATUS,
         ServiceControlAction::Stop => SERVICE_STOP | SERVICE_QUERY_STATUS,
+        ServiceControlAction::Restart => SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS,
         ServiceControlAction::Pause | ServiceControlAction::Continue => {
             SERVICE_PAUSE_CONTINUE | SERVICE_QUERY_STATUS
         }
     };
     let service = open_service(manager.as_raw(), service_name, access)?;
-    let control = match action {
+    match action {
         ServiceControlAction::Start => {
-            // SAFETY: the service is open for SERVICE_START. No start arguments are supplied.
-            let success = unsafe { StartServiceW(service.as_raw(), 0, std::ptr::null()) };
-            if success == 0 {
-                return Err(last_error());
-            }
-            None
+            start_open_service(service.as_raw())?;
+            query_service_state(service.as_raw())
         }
-        ServiceControlAction::Stop => Some(SERVICE_CONTROL_STOP),
-        ServiceControlAction::Pause => Some(SERVICE_CONTROL_PAUSE),
-        ServiceControlAction::Continue => Some(SERVICE_CONTROL_CONTINUE),
-    };
-    if let Some(control) = control {
-        let mut status = unsafe { zeroed::<SERVICE_STATUS>() };
-        // SAFETY: the service is open for this one control right. `status` is a writable output
-        // of the control call and is not used as proof of the final state.
-        let success = unsafe { ControlService(service.as_raw(), control, &mut status) };
-        if success == 0 {
-            return Err(last_error());
+        ServiceControlAction::Stop => {
+            send_service_control(service.as_raw(), SERVICE_CONTROL_STOP)?;
+            query_service_state(service.as_raw())
         }
+        ServiceControlAction::Pause => {
+            send_service_control(service.as_raw(), SERVICE_CONTROL_PAUSE)?;
+            query_service_state(service.as_raw())
+        }
+        ServiceControlAction::Continue => {
+            send_service_control(service.as_raw(), SERVICE_CONTROL_CONTINUE)?;
+            query_service_state(service.as_raw())
+        }
+        ServiceControlAction::Restart => restart_open_service(service.as_raw(), stop),
     }
-    query_service_state(service.as_raw())
+}
+
+fn restart_open_service(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+    cancellation: &WorkerStopSignal,
+) -> Result<ServiceRunState, u32> {
+    // Acceptance of STOP is not completion. Only an observed STOPPED state permits START.
+    let stop = send_service_control(service, SERVICE_CONTROL_STOP)
+        .and_then(|_| wait_until_service_stopped(service, cancellation));
+    restart_after_stop(stop, || {
+        if cancellation.is_cancelled() {
+            return Err(ERROR_CANCELLED);
+        }
+        start_open_service(service)?;
+        query_service_state(service)
+    })
+}
+
+fn wait_until_service_stopped(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+    cancellation: &WorkerStopSignal,
+) -> Result<ServiceRunState, u32> {
+    let started = Instant::now();
+    poll_service_stop(
+        || query_service_status(service),
+        || started.elapsed(),
+        std::thread::sleep,
+        || cancellation.is_cancelled(),
+    )
+}
+
+fn poll_service_stop(
+    mut query: impl FnMut() -> Result<SERVICE_STATUS_PROCESS, u32>,
+    elapsed: impl Fn() -> Duration,
+    mut wait: impl FnMut(Duration),
+    cancelled: impl Fn() -> bool,
+) -> Result<ServiceRunState, u32> {
+    let overall_limit = Duration::from_millis(u64::from(SERVICE_STOP_WAIT_CAP_MS));
+    let mut progress = None;
+    let mut progress_at = Duration::ZERO;
+    let mut progress_limit = overall_limit;
+    loop {
+        if cancelled() {
+            return Err(ERROR_CANCELLED);
+        }
+        if elapsed() >= overall_limit {
+            return Err(ERROR_SERVICE_REQUEST_TIMEOUT);
+        }
+        let status = query()?;
+        if cancelled() {
+            return Err(ERROR_CANCELLED);
+        }
+        let state = state_from_scm(status.dwCurrentState);
+        if stop_has_completed(state) {
+            return Ok(state);
+        }
+        let now = elapsed();
+        // The wait hint bounds the next checkpoint/state change, not the whole stop.
+        // Increasing a hint without making progress must not extend the deadline.
+        if progress.is_none_or(|(old_state, checkpoint)| {
+            status.dwCurrentState != old_state || status.dwCheckPoint > checkpoint
+        }) {
+            progress = Some((status.dwCurrentState, status.dwCheckPoint));
+            progress_at = now;
+            progress_limit = Duration::from_millis(u64::from(
+                status.dwWaitHint.clamp(1_000, SERVICE_STOP_WAIT_CAP_MS),
+            ));
+        }
+        let stalled_for = now.saturating_sub(progress_at);
+        if now >= overall_limit || stalled_for >= progress_limit {
+            return Err(ERROR_SERVICE_REQUEST_TIMEOUT);
+        }
+        // A short upper bound lets cancellation interrupt even a very large wait hint.
+        wait(
+            Duration::from_millis(100)
+                .min(overall_limit - now)
+                .min(progress_limit - stalled_for),
+        );
+    }
+}
+
+fn start_open_service(service: windows_sys::Win32::System::Services::SC_HANDLE) -> Result<(), u32> {
+    // SAFETY: the service is open for SERVICE_START. No start arguments are supplied.
+    let success = unsafe { StartServiceW(service, 0, std::ptr::null()) };
+    if success == 0 {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn send_service_control(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+    control: u32,
+) -> Result<(), u32> {
+    let mut status = unsafe { zeroed::<SERVICE_STATUS>() };
+    // SAFETY: the service is open for this one control right. `status` is a writable output of
+    // the control call and is not used as proof of the final state.
+    let success = unsafe { ControlService(service, control, &mut status) };
+    if success == 0 {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn query_service_state(
     service: windows_sys::Win32::System::Services::SC_HANDLE,
 ) -> Result<ServiceRunState, u32> {
+    Ok(state_from_scm(
+        query_service_status(service)?.dwCurrentState,
+    ))
+}
+
+fn query_service_status(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+) -> Result<SERVICE_STATUS_PROCESS, u32> {
     let mut status = unsafe { zeroed::<SERVICE_STATUS_PROCESS>() };
     let mut bytes_needed = 0u32;
     // SAFETY: the service is open for SERVICE_QUERY_STATUS. The status object is writable and
@@ -540,7 +668,7 @@ fn query_service_state(
     if success == 0 {
         return Err(last_error());
     }
-    Ok(state_from_scm(status.dwCurrentState))
+    Ok(status)
 }
 
 fn open_service(
@@ -557,4 +685,134 @@ fn last_error() -> u32 {
     // SAFETY: GetLastError is read immediately after the failing API.
     let error = unsafe { GetLastError() };
     if error == 0 { ERROR_GEN_FAILURE } else { error }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use windows_sys::Win32::System::Services::{
+        SERVICE_RUNNING, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    };
+
+    fn status(state: u32, checkpoint: u32, hint: u32) -> SERVICE_STATUS_PROCESS {
+        // SAFETY: the SCM status structure contains only integer fields.
+        let mut value = unsafe { zeroed::<SERVICE_STATUS_PROCESS>() };
+        value.dwCurrentState = state;
+        value.dwCheckPoint = checkpoint;
+        value.dwWaitHint = hint;
+        value
+    }
+
+    #[test]
+    fn restart_waits_through_old_running_state_and_checkpoint_progress() {
+        let clock = Cell::new(Duration::ZERO);
+        let stopped = poll_service_stop(
+            || {
+                let ms = clock.get().as_millis();
+                Ok(if ms < 200 {
+                    status(SERVICE_RUNNING, 0, 1_000)
+                } else if ms < 3_500 {
+                    status(SERVICE_STOP_PENDING, (ms / 800) as u32 + 1, 1_000)
+                } else {
+                    status(SERVICE_STOPPED, 0, 0)
+                })
+            },
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+            || false,
+        );
+        let starts = Cell::new(0);
+        assert_eq!(
+            restart_after_stop(stopped, || {
+                starts.set(starts.get() + 1);
+                Ok(ServiceRunState::Running)
+            }),
+            Ok(ServiceRunState::Running)
+        );
+        assert_eq!(starts.get(), 1);
+        assert_eq!(clock.get(), Duration::from_millis(3_500));
+    }
+
+    #[test]
+    fn unchanged_checkpoint_times_out_even_if_wait_hint_grows() {
+        let clock = Cell::new(Duration::ZERO);
+        let result = poll_service_stop(
+            || {
+                Ok(status(
+                    SERVICE_STOP_PENDING,
+                    1,
+                    if clock.get().is_zero() { 1_000 } else { 30_000 },
+                ))
+            },
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+            || false,
+        );
+        assert_eq!(result, Err(ERROR_SERVICE_REQUEST_TIMEOUT));
+        assert_eq!(clock.get(), Duration::from_secs(1));
+        assert!(
+            restart_after_stop(result, || panic!("start must not run after a timeout")).is_err()
+        );
+    }
+
+    #[test]
+    fn continuous_progress_still_obeys_overall_deadline() {
+        let clock = Cell::new(Duration::ZERO);
+        let result = poll_service_stop(
+            || {
+                Ok(status(
+                    SERVICE_STOP_PENDING,
+                    (clock.get().as_millis() / 100) as u32,
+                    1_000,
+                ))
+            },
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+            || false,
+        );
+        assert_eq!(result, Err(ERROR_SERVICE_REQUEST_TIMEOUT));
+        assert_eq!(
+            clock.get(),
+            Duration::from_millis(u64::from(SERVICE_STOP_WAIT_CAP_MS))
+        );
+    }
+
+    #[test]
+    fn cancellation_interrupts_large_hint_before_another_query_or_start() {
+        let stop = WorkerStopSignal::default();
+        let queries = Cell::new(0);
+        let result = poll_service_stop(
+            || {
+                queries.set(queries.get() + 1);
+                Ok(status(SERVICE_STOP_PENDING, 1, u32::MAX))
+            },
+            || Duration::ZERO,
+            |duration| {
+                assert!(duration <= Duration::from_millis(100));
+                stop.cancel();
+            },
+            || stop.is_cancelled(),
+        );
+        assert_eq!(result, Err(ERROR_CANCELLED));
+        assert_eq!(queries.get(), 1);
+        assert_eq!(
+            restart_after_stop(result, || panic!("cancelled restart must not start")),
+            Err(ERROR_CANCELLED)
+        );
+    }
+
+    #[test]
+    fn failed_status_query_is_preserved_without_retry_or_start() {
+        let result = poll_service_stop(
+            || Err(5),
+            || Duration::ZERO,
+            |_| panic!("failed query must not wait"),
+            || false,
+        );
+        assert_eq!(
+            restart_after_stop(result, || panic!("failed stop must not start")),
+            Err(5)
+        );
+    }
 }

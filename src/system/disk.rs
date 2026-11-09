@@ -22,7 +22,8 @@
 //! byte and timing counters stay on the worker. A failed read leaves those
 //! baselines in place. The first sample, a counter reset, and a rate that does
 //! not fit in `u64` replace the baseline without publishing a point. A zero
-//! query interval publishes nothing and keeps the previous baseline.
+//! query interval publishes nothing and stores the current counters, so bytes
+//! that moved while the clock was frozen are not counted on the next real tick.
 
 use std::mem::{offset_of, size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -482,7 +483,9 @@ pub(crate) fn commit_disk_readings(
                 active_percent = active_percent.max(rate.active_percent);
                 rate_indexes.push(index);
             }
-            DiskDelta::ZeroInterval => {}
+            DiskDelta::ZeroInterval => {
+                baselines[index] = Some(currents[index]);
+            }
             DiskDelta::Baseline | DiskDelta::Reset | DiskDelta::Overflow => {
                 replace_baselines(baselines, &currents);
                 return DiskActivityUpdate::NoRate;
@@ -688,7 +691,20 @@ mod tests {
     }
 
     #[test]
-    fn zero_interval_keeps_the_baseline_and_counts_bytes_later() {
+    fn zero_interval_advances_the_baseline_without_publishing_a_rate() {
+        let previous = counters(0, 0, 0, 0, 1, 1_000);
+        let mut baselines = [Some(previous), Some(previous)];
+        let first = counters(1_000, 250, 0, 0, 1, 1_000);
+        let second = counters(40, 80, 0, 0, 1, 1_000);
+        assert_eq!(
+            commit_disk_readings(&mut baselines, &[Ok(first), Ok(second)]),
+            DiskActivityUpdate::NoRate
+        );
+        assert_eq!(baselines, [Some(first), Some(second)]);
+    }
+
+    #[test]
+    fn zero_interval_bytes_are_excluded_from_the_next_real_interval() {
         let previous = counters(0, 0, 0, 0, 1, 1_000);
         let mut baselines = [Some(previous)];
         let frozen = counters(1_000, 250, 0, 0, 1, 1_000);
@@ -696,17 +712,41 @@ mod tests {
             commit_disk_readings(&mut baselines, &[Ok(frozen)]),
             DiskActivityUpdate::NoRate
         );
-        assert_eq!(baselines, [Some(previous)]);
+        assert_eq!(baselines, [Some(frozen)]);
 
-        let next = counters(1_000, 250, 0, 0, 1 + 10_000_000, 1_000 + 10_000_000);
+        let next = counters(
+            1_000 + 5_000_000,
+            250 + 2_000_000,
+            0,
+            0,
+            1 + 10_000_000,
+            1_000 + 10_000_000,
+        );
         assert_eq!(
             commit_disk_readings(&mut baselines, &[Ok(next)]),
             DiskActivityUpdate::Rate(DiskRate {
-                read_bytes_per_second: 1_000,
-                write_bytes_per_second: 250,
+                read_bytes_per_second: 5_000_000,
+                write_bytes_per_second: 2_000_000,
                 active_percent: 0,
             })
         );
+    }
+
+    #[test]
+    fn zero_interval_bytes_are_omitted_from_a_summed_rate() {
+        let previous = counters(0, 0, 0, 0, 1, 1_000);
+        let mut baselines = [Some(previous), Some(previous)];
+        let frozen = counters(4_000, 1_000, 0, 0, 1, 1_000);
+        let moving = counters(3_000_000, 500_000, 0, 0, 1 + 10_000_000, 1_000 + 10_000_000);
+        assert_eq!(
+            commit_disk_readings(&mut baselines, &[Ok(frozen), Ok(moving)]),
+            DiskActivityUpdate::Rate(DiskRate {
+                read_bytes_per_second: 3_000_000,
+                write_bytes_per_second: 500_000,
+                active_percent: 0,
+            })
+        );
+        assert_eq!(baselines, [Some(frozen), Some(moving)]);
     }
 
     #[test]

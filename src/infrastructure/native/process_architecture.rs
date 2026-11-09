@@ -111,10 +111,10 @@ fn classify_machines(
     let process_machine = match reported_machine {
         Some(machine) => machine,
         None if wow_machine != IMAGE_FILE_MACHINE_UNKNOWN => wow_machine,
-        // On ARM64, both native ARM64 and x86-64/ARM64EC can report UNKNOWN. The old API
-        // alone cannot distinguish them, including on Windows 10 preview builds.
-        None if native_machine == IMAGE_FILE_MACHINE_ARM64 => return Err(ERROR_NOT_SUPPORTED),
-        None => native_machine,
+        // IsWow64Process2 reports IMAGE_FILE_MACHINE_UNKNOWN for every non-WOW64
+        // process. That value was not observed. On ARM64 it cannot separate native
+        // ARM64 from x64/ARM64EC, and on every other host it is still not native.
+        None => return Err(ERROR_NOT_SUPPORTED),
     };
     let process_is_32_bit = machine_is_32_bit(process_machine)?;
     let mode = match (native_machine, process_machine) {
@@ -417,22 +417,22 @@ mod tests {
     }
 
     #[test]
-    fn old_api_keeps_known_bitness_but_never_guesses_arm64_native() {
-        assert_eq!(
-            classify_machines(0, IMAGE_FILE_MACHINE_ARM64, None),
-            Err(ERROR_NOT_SUPPORTED)
-        );
+    fn unknown_process_machine_is_an_error_and_reported_native_stays_native() {
+        for host in [
+            IMAGE_FILE_MACHINE_ARM64,
+            IMAGE_FILE_MACHINE_AMD64,
+            IMAGE_FILE_MACHINE_I386,
+        ] {
+            assert_eq!(
+                classify_machines(IMAGE_FILE_MACHINE_UNKNOWN, host, None),
+                Err(ERROR_NOT_SUPPORTED)
+            );
+        }
         assert_eq!(
             classify_machines(IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_ARM64, None)
                 .unwrap()
                 .mode,
             ExecutionMode::EmulatedX86
-        );
-        assert_eq!(
-            classify_machines(0, IMAGE_FILE_MACHINE_I386, None)
-                .unwrap()
-                .mode,
-            ExecutionMode::Native
         );
         assert_eq!(
             classify_machines(IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64, None)
@@ -441,7 +441,37 @@ mod tests {
             ExecutionMode::Compatibility32
         );
         assert_eq!(
-            classify_machines(0, IMAGE_FILE_MACHINE_ARM64, Some(0)),
+            classify_machines(IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_AMD64, None)
+                .unwrap()
+                .mode,
+            ExecutionMode::Native
+        );
+        assert_eq!(
+            classify_machines(
+                IMAGE_FILE_MACHINE_UNKNOWN,
+                IMAGE_FILE_MACHINE_AMD64,
+                Some(IMAGE_FILE_MACHINE_AMD64),
+            )
+            .unwrap()
+            .mode,
+            ExecutionMode::Native
+        );
+        assert_eq!(
+            classify_machines(
+                IMAGE_FILE_MACHINE_UNKNOWN,
+                IMAGE_FILE_MACHINE_ARM64,
+                Some(IMAGE_FILE_MACHINE_ARM64),
+            )
+            .unwrap()
+            .mode,
+            ExecutionMode::Native
+        );
+        assert_eq!(
+            classify_machines(
+                IMAGE_FILE_MACHINE_UNKNOWN,
+                IMAGE_FILE_MACHINE_ARM64,
+                Some(0)
+            ),
             Err(ERROR_INVALID_DATA)
         );
         assert_eq!(

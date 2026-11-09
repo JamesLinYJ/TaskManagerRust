@@ -14,8 +14,10 @@
 //! The page worker owns every registry key and find handle. Enumeration reads the native
 //! 64-bit registry view, including the explicit WOW6432Node Run key. Enable and disable rewrite
 //! only the 12-byte StartupApproved value and then read it back, keeping the 2/3 family distinct
-//! from the 6/7 family. The Run value and the Startup folder file are checked before and after
-//! that write so a missing entry is never reported as a successful change.
+//! from the 6/7 family. Queued commands run in acceptance order. Immediately before each write,
+//! the Run value or startup file is read again and compared with the identity the page stored.
+//! A missing or different entry skips that command and is [`StartupActionFailure::Missing`].
+//! The entry is checked again after the write so a disappearance is never a successful change.
 //!
 //! A source that fails to enumerate is listed in `omitted_sources` and contributes no rows.
 //! The page keeps the previous rows for that source. The snapshot is an error only when every
@@ -51,9 +53,9 @@ use crate::infrastructure::native::{to_wide_null, widestr_ptr_to_string};
 
 use super::model::{
     StartupActionFailure, StartupEnabledState, StartupEntryId, StartupSource, StartupToggle,
-    approved_blob, approved_flag, classify_startup_result, executable_candidate,
-    has_version_resource_extension, is_absolute_win32_path, registry_value_name_is_safe,
-    startup_file_name_is_safe, state_from_approved,
+    approved_blob, approved_flag, classify_startup_result, confirm_startup_identity,
+    executable_candidate, has_version_resource_extension, is_absolute_win32_path,
+    registry_value_name_is_safe, startup_file_name_is_safe, state_from_approved,
 };
 
 const VALUE_ENUM_LIMIT: u32 = 4_096;
@@ -126,7 +128,7 @@ pub(super) struct StartupRefreshFailure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum StartupWorkerCompletion {
     Snapshot(Result<StartupCollection, StartupRefreshFailure>),
-    Action(StartupActionReport),
+    Actions(Vec<StartupActionReport>),
 }
 
 struct RegKey {
@@ -185,14 +187,22 @@ impl SourcePart {
 }
 
 pub(super) fn perform(request: super::model::StartupRequest) -> StartupWorkerCompletion {
-    match request {
-        super::model::StartupRequest::Refresh => {
-            StartupWorkerCompletion::Snapshot(collect_startup_entries())
-        }
-        super::model::StartupRequest::SetEnabled { id, toggle } => {
-            StartupWorkerCompletion::Action(set_enabled(&id, toggle))
-        }
+    // Commands stay ahead of a coalesced snapshot. Each one re-checks the stored identity
+    // before it writes. The page requests the snapshot after these reports, so a refresh that
+    // arrived with the queue still runs, and the queue is not held inside enumeration.
+    if !request.toggles.is_empty() {
+        return StartupWorkerCompletion::Actions(
+            request
+                .toggles
+                .into_iter()
+                .map(|command| set_enabled(&command.id, command.toggle))
+                .collect(),
+        );
     }
+    if request.refresh {
+        return StartupWorkerCompletion::Snapshot(collect_startup_entries());
+    }
+    StartupWorkerCompletion::Actions(Vec::new())
 }
 
 fn collect_startup_entries() -> Result<StartupCollection, StartupRefreshFailure> {
@@ -424,9 +434,8 @@ fn set_registry_enabled(
     if !registry_value_name_is_safe(&id.name) {
         return Err(StartupActionFailure::Win32(ERROR_INVALID_PARAMETER));
     }
-    if !registry_entry_exists(id)? {
-        return Err(StartupActionFailure::Missing);
-    }
+    // The page stored this source and name. Re-read the Run value immediately before the write.
+    confirm_startup_identity(id, registry_entry_exists(id)?.then_some(id))?;
     let observed = write_and_read_approved(id, toggle)?;
     if !registry_entry_exists(id)? {
         return Err(StartupActionFailure::Missing);
@@ -442,9 +451,8 @@ fn set_folder_enabled(
         return Err(StartupActionFailure::Win32(ERROR_INVALID_PARAMETER));
     }
     let path = startup_file_path(id)?;
-    if !startup_file_exists(&path)? {
-        return Err(StartupActionFailure::Missing);
-    }
+    // The page stored this source and name. Re-read the startup file immediately before the write.
+    confirm_startup_identity(id, startup_file_exists(&path)?.then_some(id))?;
     let observed = write_and_read_approved(id, toggle)?;
     if !startup_file_exists(&path)? {
         return Err(StartupActionFailure::Missing);

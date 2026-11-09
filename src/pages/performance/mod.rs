@@ -372,14 +372,14 @@ impl PerformancePageState {
             self.averaged_cpu_history.push(sample.cpu_usage);
             self.averaged_kernel_history.push(sample.kernel_usage);
         }
-        let mem_percent = if sample.physical_mem_limit_kb == 0 {
-            0
-        } else {
-            ((u128::from(sample.physical_mem_usage_kb) * 100)
+        // A missing physical limit is not an empty machine. Leave the previous
+        // history point in place so the graph does not paint that sample as 0%.
+        if sample.physical_mem_limit_kb != 0 {
+            let mem_percent = ((u128::from(sample.physical_mem_usage_kb) * 100)
                 / u128::from(sample.physical_mem_limit_kb))
-            .min(100) as u8
-        };
-        self.mem_history.push(mem_percent);
+            .min(100) as u8;
+            self.mem_history.push(mem_percent);
+        }
         let disk_label_changed = apply_disk_activity(
             &mut self.disk_history,
             &mut self.disk_known,
@@ -833,11 +833,18 @@ impl PerformancePageState {
 
     pub fn draw_mem_meter(&self, hdc: HDC, rect: RECT) {
         // 内存仪表显示的是已用内存字节量文本，而不是百分比文本。
-        let mem_percent = (u128::from(self.physical_mem_usage_kb) * 100)
-            .checked_div(u128::from(self.physical_mem_limit_kb))
-            .unwrap_or(0)
+        // 缺少物理上限时沿用“不可用”文案，避免把未知样本画成 0% 成功值。
+        let (mem_usage_text, mem_percent) = if self.physical_mem_limit_kb == 0 {
+            (text(TextKey::NotAvailable).to_string(), 0)
+        } else {
+            let mem_percent = ((u128::from(self.physical_mem_usage_kb) * 100)
+                / u128::from(self.physical_mem_limit_kb))
             .min(100) as u8;
-        let mem_usage_text = format_mem_meter_text(self.physical_mem_usage_kb);
+            (
+                format_mem_meter_text(self.physical_mem_usage_kb),
+                mem_percent,
+            )
+        };
         if self.draw_strip_meter(hdc, rect, &mem_usage_text, mem_percent, 0) {
             return;
         }
@@ -1849,6 +1856,61 @@ mod tests {
             .unwrap();
         assert_eq!(page.cpu_usage, 0);
         assert_eq!(page.kernel_usage, 0);
+    }
+
+    #[test]
+    fn unknown_memory_limit_keeps_history_and_real_zero_still_records() {
+        let mut page = PerformancePageState {
+            no_title: true,
+            ..Default::default()
+        };
+        let mut sample = SystemSample {
+            processor_count: 1,
+            processor_topology: Arc::new(query_processor_topology(1)),
+            cpu_delta_valid: false,
+            cpu_usage: 0,
+            kernel_usage: 0,
+            processor_cpu_usage: vec![0],
+            processor_kernel_usage: vec![0],
+            cpu_diagnostics: Ok(CpuDiagnosticSample::default()),
+            uptime_ms: 1_000,
+            physical_mem_usage_kb: 40,
+            physical_mem_limit_kb: 100,
+            commit_total_kb: 0,
+            commit_limit_kb: 0,
+            commit_peak_kb: 0,
+            total_physical_kb: 100,
+            avail_physical_kb: 60,
+            file_cache_kb: 0,
+            kernel_total_kb: 0,
+            kernel_paged_kb: 0,
+            kernel_nonpaged_kb: 0,
+            handle_count: 0,
+            thread_count: 0,
+            process_count: 0,
+            disk: DiskActivityUpdate::NoRate,
+        };
+        page.apply_system_sample(null_mut(), &sample, false)
+            .unwrap();
+        assert_eq!(page.mem_history.value_at(0), Some(40));
+        assert_eq!(page.mem_history.value_at(1), Some(0));
+
+        // Non-zero usage with a missing limit must not be stored as 0% or shift history.
+        sample.physical_mem_usage_kb = 80;
+        sample.physical_mem_limit_kb = 0;
+        page.apply_system_sample(null_mut(), &sample, false)
+            .unwrap();
+        assert_eq!(page.physical_mem_limit_kb, 0);
+        assert_eq!(page.mem_history.value_at(0), Some(40));
+        assert_eq!(page.mem_history.value_at(1), Some(0));
+
+        // A later measured empty machine still advances history with a real 0.
+        sample.physical_mem_usage_kb = 0;
+        sample.physical_mem_limit_kb = 100;
+        page.apply_system_sample(null_mut(), &sample, false)
+            .unwrap();
+        assert_eq!(page.mem_history.value_at(0), Some(0));
+        assert_eq!(page.mem_history.value_at(1), Some(40));
     }
 }
 

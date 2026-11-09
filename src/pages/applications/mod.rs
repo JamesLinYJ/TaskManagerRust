@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 //
 // 线程模型：
 //   一个单飞 worker 枚举窗口，另一个单飞协调器驱动固定数量的长期图标线程。
+//   结束任务使用第三条长期单飞 worker：UI 线程只提交窗口身份，EndTask 在后台执行。
 //   UI 线程只提交请求和应用完整结果，采集失败不会覆盖上一轮可信列表。
 //
 // 缓存失效策略：
@@ -217,6 +218,7 @@ pub struct TaskPageState {
     pass_count: u64,
     snapshot_worker: Option<SingleFlightWorker<isize, TaskWorkerResult>>,
     icon_worker: Option<SingleFlightWorker<TaskIconBatchRequest, TaskIconCompletion>>,
+    end_task_worker: Option<SingleFlightWorker<Vec<EndTaskRequest>, Option<u32>>>,
     pending_icon_identities: HashSet<TaskIdentity>,
     icon_generation: u64,
     last_refresh_error: Option<u32>,
@@ -243,6 +245,7 @@ impl Default for TaskPageState {
             pass_count: 0,
             snapshot_worker: None,
             icon_worker: None,
+            end_task_worker: None,
             pending_icon_identities: HashSet::new(),
             icon_generation: 0,
             last_refresh_error: None,
@@ -484,26 +487,7 @@ impl TaskPageState {
                     }
                 }
                 id if id == IDM_TASK_ENDTASK || id == IDC_ENDTASK as u16 => {
-                    let force = (GetKeyState(i32::from(VK_CONTROL)) & (1 << 15)) != 0;
-                    let mut first_error = None;
-                    for hwnd in self.selected_hwnds(true) {
-                        if EndTask(hwnd, 0, if force { 1 } else { 0 }) == 0 {
-                            let error = last_error_or_gen_failure();
-                            record_win32_error("ending task", error);
-                            first_error.get_or_insert(error);
-                        }
-                    }
-                    if let Some(error) = first_error {
-                        let title = to_wide_null(text(TextKey::WarningTitle));
-                        let body =
-                            to_wide_null(&format!("{} {error}", text(TextKey::Win32ErrorPrefix)));
-                        MessageBoxW(
-                            self.hwnd_page,
-                            body.as_ptr(),
-                            title.as_ptr(),
-                            MB_OK | MB_ICONERROR,
-                        );
-                    }
+                    self.request_end_task();
                 }
                 IDM_TASK_FINDPROCESS => {
                     if let Some(identity) = self.selected_task_identities(true).first().copied()
@@ -1003,6 +987,65 @@ impl TaskPageState {
     pub fn handle_worker_completion(&mut self) {
         self.drain_worker_results();
         self.drain_icon_worker_results();
+        self.drain_end_task_results();
+    }
+
+    fn request_end_task(&mut self) {
+        // Ctrl is part of the click. GetKeyState reports this UI thread's message state, so the
+        // worker receives the flag instead of sampling the keyboard itself.
+        let force = unsafe { (GetKeyState(i32::from(VK_CONTROL)) & (1 << 15)) != 0 };
+        let targets = self.selected_task_identities(true);
+        if targets.is_empty() {
+            return;
+        }
+        let request = vec![EndTaskRequest { targets, force }];
+        let Some(worker) = self.end_task_worker.as_mut() else {
+            self.report_end_task_failure(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE);
+            return;
+        };
+        if let Err(error) = worker.request(request, self.hwnd_page) {
+            self.report_end_task_failure(error);
+        }
+    }
+
+    fn drain_end_task_results(&mut self) {
+        let drained = match self.end_task_worker.as_mut() {
+            Some(worker) => worker.drain(self.hwnd_page),
+            None => return,
+        };
+        let mut end_task_error = None;
+        for completion in drained.completions {
+            if end_task_error.is_none() {
+                end_task_error = completion.value;
+            }
+        }
+        if let Some(error) = drained.error {
+            record_win32_error("ending task", error);
+            if end_task_error.is_none() {
+                end_task_error = Some(error);
+            }
+        }
+        if let Some(error) = end_task_error {
+            self.show_end_task_warning(error);
+        }
+    }
+
+    fn report_end_task_failure(&self, error: u32) {
+        record_win32_error("ending task", error);
+        self.show_end_task_warning(error);
+    }
+
+    fn show_end_task_warning(&self, error: u32) {
+        let title = to_wide_null(text(TextKey::WarningTitle));
+        let body = to_wide_null(&format!("{} {error}", text(TextKey::Win32ErrorPrefix)));
+        unsafe {
+            MessageBoxW(
+                self.hwnd_page,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
 
     fn resort_tasks(&mut self) {
@@ -1014,7 +1057,10 @@ impl TaskPageState {
     fn start_worker_thread(&mut self) -> Result<(), u32> {
         // 顶层窗口枚举可能涉及跨窗口站和桌面切换，
         // 放到后台线程可以避免主线程在刷新时明显卡顿。
-        if self.snapshot_worker.is_some() && self.icon_worker.is_some() {
+        if self.snapshot_worker.is_some()
+            && self.icon_worker.is_some()
+            && self.end_task_worker.is_some()
+        {
             return Ok(());
         }
 
@@ -1043,12 +1089,23 @@ impl TaskPageState {
                 },
             )?);
         }
+        if self.end_task_worker.is_none() {
+            // EndTask can block inside the target window's queue. Retire this worker without
+            // joining it on the UI thread; a destroyed page drops the completion instead.
+            self.end_task_worker = Some(SingleFlightWorker::spawn_cancellable_initialized(
+                "taskmgr-rs-task-end",
+                PWM_TASK_WORKER_COMPLETE,
+                queue_end_tasks,
+                |_stop| run_end_tasks,
+            )?);
+        }
         Ok(())
     }
 
     fn stop_worker_thread(&mut self) {
         self.snapshot_worker = None;
         self.icon_worker = None;
+        self.end_task_worker = None;
         self.pending_icon_identities.clear();
     }
 
@@ -1481,6 +1538,74 @@ fn last_error_or_gen_failure() -> u32 {
     }
 }
 
+struct EndTaskRequest {
+    targets: Vec<TaskIdentity>,
+    force: bool,
+}
+
+fn queue_end_tasks(pending: &mut Vec<EndTaskRequest>, incoming: Vec<EndTaskRequest>) {
+    // An accepted End Task is not a refresh sample. Append it; do not replace an earlier command.
+    pending.extend(incoming);
+}
+
+fn run_end_tasks(requests: Vec<EndTaskRequest>) -> Option<u32> {
+    run_end_task_queue(&requests, window_matches_identity, |hwnd, force| {
+        // SAFETY: `window_matches_identity` just accepted this HWND on this thread. EndTask
+        // does not retain the handle after it returns.
+        let ended = unsafe { EndTask(hwnd, 0, if force { 1 } else { 0 }) } != 0;
+        if ended {
+            Ok(())
+        } else {
+            Err(last_error_or_gen_failure())
+        }
+    })
+}
+
+fn run_end_task_queue<Match, End>(
+    requests: &[EndTaskRequest],
+    mut matches: Match,
+    mut end_task: End,
+) -> Option<u32>
+where
+    Match: FnMut(TaskIdentity) -> bool,
+    End: FnMut(HWND, bool) -> Result<(), u32>,
+{
+    let mut first_error = None;
+    for request in requests {
+        let error =
+            end_matching_tasks(&request.targets, request.force, &mut matches, &mut end_task);
+        if first_error.is_none() {
+            first_error = error;
+        }
+    }
+    first_error
+}
+
+fn end_matching_tasks<Match, End>(
+    targets: &[TaskIdentity],
+    force: bool,
+    matches: &mut Match,
+    end_task: &mut End,
+) -> Option<u32>
+where
+    Match: FnMut(TaskIdentity) -> bool,
+    End: FnMut(HWND, bool) -> Result<(), u32>,
+{
+    let mut first_error = None;
+    for identity in targets.iter().copied() {
+        // Re-check HWND, thread id, and ProcIdentity (pid + creation time) immediately before
+        // EndTask. An unknown or reused window is skipped and is not reported as success.
+        if !matches(identity) {
+            continue;
+        }
+        if let Err(error) = end_task(identity.hwnd(), force) {
+            record_win32_error("ending task", error);
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,6 +1720,85 @@ mod tests {
         let mut store = TaskIconStore::default();
         assert_eq!(store.allocate(None, None), Ok(0));
         assert!(store.free_slots.is_empty());
+    }
+
+    #[test]
+    fn end_task_skips_a_mismatched_window_and_reports_only_the_first_failure() {
+        let skipped = TaskIdentity {
+            hwnd: 1,
+            process: ProcIdentity::pid_only(10),
+            thread_id: 2,
+        };
+        let failed = TaskIdentity {
+            hwnd: 3,
+            process: ProcIdentity::new(11, 100),
+            thread_id: 4,
+        };
+        let succeeded = TaskIdentity {
+            hwnd: 5,
+            process: ProcIdentity::new(12, 200),
+            thread_id: 6,
+        };
+        let failed_again = TaskIdentity {
+            hwnd: 7,
+            process: ProcIdentity::new(13, 300),
+            thread_id: 8,
+        };
+        let mut calls = Vec::new();
+        let error = end_matching_tasks(
+            &[skipped, failed, succeeded, failed_again],
+            true,
+            &mut |identity: TaskIdentity| identity.process.is_verified(),
+            &mut |hwnd, force| {
+                calls.push((hwnd as isize, force));
+                if hwnd as isize == failed.hwnd {
+                    Err(5)
+                } else if hwnd as isize == failed_again.hwnd {
+                    Err(9)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(
+            calls,
+            vec![
+                (failed.hwnd, true),
+                (succeeded.hwnd, true),
+                (failed_again.hwnd, true)
+            ]
+        );
+        assert_eq!(error, Some(5));
+    }
+
+    #[test]
+    fn pending_end_task_commands_run_in_submission_order() {
+        let command = |hwnd: isize, force: bool| EndTaskRequest {
+            targets: vec![TaskIdentity {
+                hwnd,
+                process: ProcIdentity::new(10, 100),
+                thread_id: 2,
+            }],
+            force,
+        };
+        let mut pending = vec![command(1, false)];
+        queue_end_tasks(&mut pending, vec![command(2, true)]);
+        queue_end_tasks(&mut pending, vec![command(3, false)]);
+
+        let mut calls = Vec::new();
+        let error = run_end_task_queue(&pending, |_| true, &mut |hwnd, force| {
+            calls.push((hwnd as isize, force));
+            if hwnd as isize == 2 {
+                Err(5)
+            } else if hwnd as isize == 3 {
+                Err(9)
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(calls, vec![(1, false), (2, true), (3, false)]);
+        assert_eq!(error, Some(5));
     }
 
     #[test]

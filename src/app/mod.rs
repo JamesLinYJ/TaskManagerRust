@@ -1180,6 +1180,7 @@ impl App {
                 .unwrap_or_default();
             self.enable_menu_item(menu, IDM_SERVICE_START, commands.start);
             self.enable_menu_item(menu, IDM_SERVICE_STOP, commands.stop);
+            self.enable_menu_item(menu, IDM_SERVICE_RESTART, commands.restart);
             self.enable_menu_item(menu, IDM_SERVICE_PAUSE, commands.pause);
             self.enable_menu_item(menu, IDM_SERVICE_CONTINUE, commands.continue_service);
             self.enable_menu_item(menu, IDM_SERVICE_GOTOPROCESS, commands.go_to_process);
@@ -2306,6 +2307,7 @@ impl App {
                 }
                 IDM_SERVICE_START
                 | IDM_SERVICE_STOP
+                | IDM_SERVICE_RESTART
                 | IDM_SERVICE_PAUSE
                 | IDM_SERVICE_CONTINUE
                 | IDM_SERVICE_GOTOPROCESS => {
